@@ -258,18 +258,16 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 	result = udp_sendto(device->udp_pcb, q, &peer->ip, peer->port);
 
 done:
-	/* Throughput-collapse diag: log every send failure with path + endpoint.
+	/* Throughput-collapse diag: log every send failure without peer key or
+	 * endpoint address; this stream may be persisted to SD.
 	 * Data-path successes stay quiet to avoid log flood; control packets
 	 * (handshake/cookie) always log their routing decision so the SD recorder
 	 * shows which branch a DERP-only peer takes + whether the DERP cb exists. */
 	if (result != ERR_OK) {
-		ESP_LOGW(TAG, "[WG_OUT_FAIL] peer=%02x%02x%02x%02x mt=%u path=%s ep=%s:%u "
+		ESP_LOGW(TAG, "[WG_OUT_FAIL] mt=%u path=%s "
 		       "len=%u derp_fn=%d force_derp=%d err=%d",
-		       peer->public_key[0], peer->public_key[1],
-		       peer->public_key[2], peer->public_key[3],
 		       wg_mt, path,
-		       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip),
-		       peer->port, (unsigned)(q ? q->tot_len : 0),
+		       (unsigned)(q ? q->tot_len : 0),
 		       device->derp_output_fn ? 1 : 0, device->force_derp_output, (int)result);
 	} else if (wg_ctrl) {
 		WG_HSLOG("[WG_OUT_OK] peer=%02x%02x%02x%02x mt=%u path=%s ep=%s:%u "
@@ -496,19 +494,15 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 	if (wireguard_process_handshake_response(device, peer, response)) {
 		// Packet is good — identify the peer
 		uint8_t wg_idx = wireguard_peer_index(device, peer);
-		ESP_LOGW(TAG, "[WG] *** HANDSHAKE COMPLETE! wg_idx=%u key=%02x%02x%02x%02x "
-		       "from=%s:%u ***",
-		       wg_idx,
-		       peer->public_key[0], peer->public_key[1],
-		       peer->public_key[2], peer->public_key[3],
-		       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
+		ESP_LOGW(TAG, "[WG] *** HANDSHAKE COMPLETE! wg_idx=%u path=%s ***",
+		       wg_idx, ip_addr_isany(addr) ? "DERP" : "direct");
 		// Update the peer location
 		update_peer_addr(peer, addr, port);
 
 		wireguard_start_session(peer, true);
 		peer->handshake_attempts = 0;  // session up, reset retry counter
-		ESP_LOGW(TAG, "[WG] Session started, sending keepalive to %s:%u",
-		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
+		ESP_LOGW(TAG, "[WG] Session started, sending keepalive wg_idx=%u path=%s",
+		       wg_idx, ip_addr_isany(&peer->ip) ? "DERP" : "direct");
 		wireguardif_send_keepalive(device, peer);
 
 		// Set the IF-UP flag on netif
@@ -1257,15 +1251,10 @@ static bool should_destroy_current_keypair(struct wireguard_peer *peer) {
 		/* Throughput-collapse diag: this is the moment encrypted traffic
 		 * actually stops flowing for a peer. Log endpoint + reason. */
 		bool by_age = wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME);
-		ESP_LOGW(TAG, "[WG_DESTROY] peer=%02x%02x%02x%02x reason=%s "
-		       "age_ms=%lu counter=%lu ep=%s:%u",
-		       peer->public_key[0], peer->public_key[1],
-		       peer->public_key[2], peer->public_key[3],
+		ESP_LOGW(TAG, "[WG_DESTROY] reason=%s age_ms=%lu counter=%lu",
 		       by_age ? "age" : "counter",
 		       (unsigned long)(wireguard_sys_now() - peer->curr_keypair.keypair_millis),
-		       (unsigned long)peer->curr_keypair.sending_counter,
-		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
-		       peer->port);
+		       (unsigned long)peer->curr_keypair.sending_counter);
 	}
 	return result;
 }
@@ -1276,15 +1265,8 @@ static bool should_reset_peer(struct wireguard_peer *peer) {
 		result = true;
 		/* Throughput-collapse diag: peer reset wipes endpoint back to connect_ip
 		 * (often 0.0.0.0 for DERP-only peers). Catch this BEFORE the wipe. */
-		ESP_LOGW(TAG, "[WG_RESET] peer=%02x%02x%02x%02x age_ms=%lu ep=%s:%u "
-		       "-> reverting to connect_ip=%s:%u",
-		       peer->public_key[0], peer->public_key[1],
-		       peer->public_key[2], peer->public_key[3],
-		       (unsigned long)(wireguard_sys_now() - peer->curr_keypair.keypair_millis),
-		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
-		       peer->port,
-		       ip_addr_isany(&peer->connect_ip) ? "DERP" : ipaddr_ntoa(&peer->connect_ip),
-		       peer->connect_port);
+		ESP_LOGW(TAG, "[WG_RESET] age_ms=%lu endpoint/path reset",
+		       (unsigned long)(wireguard_sys_now() - peer->curr_keypair.keypair_millis));
 	}
 	return result;
 }

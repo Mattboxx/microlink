@@ -555,10 +555,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                 }
             }
             if (evict_idx >= 0) {
-                char evict_ip[16];
-                microlink_ip_to_str(ml->peers[evict_idx].vpn_ip, evict_ip);
-                ESP_LOGW(TAG, "Evicting LRU peer %s (%s) for priority peer %s",
-                         ml->peers[evict_idx].hostname, evict_ip, update->hostname);
+                ESP_LOGW(TAG, "Evicting LRU peer slot %d for priority peer",
+                         evict_idx);
                 if (ml->peers[evict_idx].wg_peer_index >= 0 && ml->wg_netif) {
                     wireguardif_remove_peer((struct netif *)ml->wg_netif,
                                             ml->peers[evict_idx].wg_peer_index);
@@ -569,8 +567,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         }
 
         if (idx < 0) {
-            ESP_LOGW(TAG, "Peer table full (%d slots), cannot add %s",
-                     ML_MAX_PEERS, update->hostname);
+            ESP_LOGW(TAG, "Peer table full (%d slots), cannot add peer",
+                     ML_MAX_PEERS);
             return -1;
         }
         if (idx >= ml->peer_count) {
@@ -723,7 +721,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                  * fires. Fire one DERP handshake init right now. */
                 wireguardif_connect_derp(netif, (u8_t)wg_peer_idx);
                 p->derp_fallback_active = true;
-                ESP_LOGW(TAG, "Exit-node DERP handshake init -> %s", p->hostname);
+                ESP_LOGW(TAG, "Exit-node DERP handshake init (peer=%d)", idx);
             }
 
             /* Accept-routes companion: attach any subnet routes the peer
@@ -1037,9 +1035,11 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
             }
         }
         if (!has_udp) {
-            ESP_LOGW(TAG, "  no UDP path for %s (sock4=%d)", p->hostname, ml->disco_sock4);
+            ESP_LOGW(TAG, "  no UDP path for peer=%d (sock4=%d)",
+                     peer_idx, ml->disco_sock4);
         } else if (!direct_sent && p->endpoint_count > 0) {
-            ESP_LOGW(TAG, "  %s: %d eps but none usable (all IPv6?)", p->hostname, p->endpoint_count);
+            ESP_LOGW(TAG, "  peer=%d: %d eps but none usable (all IPv6?)",
+                     peer_idx, p->endpoint_count);
         }
     }
 
@@ -1289,15 +1289,13 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
     }
 
     if (!matched) {
-        /* Find peer by disco key for logging */
         int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
-        const char *name = peer_idx >= 0 ? ml->peers[peer_idx].hostname : "?";
         int active_count = 0;
         for (int i = 0; i < MAX_PENDING_PROBES; i++) {
             if (pending_probes[i].active) active_count++;
         }
-        ESP_LOGW(TAG, "DISCO PONG unmatched from %s (via %s) txid=%02x%02x%02x%02x, active_probes=%d",
-                 name, pkt->via_derp ? "DERP" : "direct",
+        ESP_LOGW(TAG, "DISCO PONG unmatched peer=%d via=%s txid=%02x%02x%02x%02x active_probes=%d",
+                 peer_idx, pkt->via_derp ? "DERP" : "direct",
                  txid[0], txid[1], txid[2], txid[3], active_count);
     }
 }
@@ -1330,16 +1328,9 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     if (nacl_box_open(plaintext, ciphertext, ciphertext_len, nonce,
                       sender_disco_key, ml->disco_private_key) != 0) {
-        /* Name the claimed sender (#31): the packet carries the sender's
-         * current disco pubkey — if it matches a known peer the failure is
-         * OUR stale key material; if unknown, the sender rotated or is
-         * foreign, and the prefix lets it be correlated externally. */
         int sender_idx = find_peer_by_disco_key(ml, sender_disco_key);
-        ESP_LOGW(TAG, "DISCO decrypt failed (from %s via %s, disco_key=%02x%02x%02x%02x...)",
-                 sender_idx >= 0 ? ml->peers[sender_idx].hostname : "unknown peer",
-                 pkt->via_derp ? "DERP" : "direct",
-                 sender_disco_key[0], sender_disco_key[1],
-                 sender_disco_key[2], sender_disco_key[3]);
+        ESP_LOGW(TAG, "DISCO decrypt failed (peer=%d via=%s)",
+                 sender_idx, pkt->via_derp ? "DERP" : "direct");
         free(plaintext);
         return;
     }
@@ -1561,7 +1552,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     }
 
     if (ep_count == 0) {
-        ESP_LOGW(TAG, "CMM: no endpoints available for %s", p->hostname);
+        ESP_LOGW(TAG, "CMM: no endpoints available for peer=%d", peer_idx);
         return;
     }
 
@@ -1587,7 +1578,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
     } else {
-        ESP_LOGW(TAG, "CallMeMaybe send failed for %s: %d", p->hostname, err);
+        ESP_LOGW(TAG, "CallMeMaybe send failed for peer=%d: %d", peer_idx, err);
     }
 }
 
@@ -1632,7 +1623,7 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
 
     /* Path 1: DERP (reliable fallback) */
     wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-    ESP_LOGW(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
+    ESP_LOGW(TAG, "WG handshake triggered (DERP) peer=%d", idx);
 
     /* Path 2: Direct UDP (if DISCO has a known endpoint).
      * This wakes the peer's magicsock via receiveIPv4 → noteRecvActivity.
@@ -1645,11 +1636,7 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
         wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
                                      &ep_ip, p->best_port);
         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-        ESP_LOGW(TAG, "WG handshake triggered (direct) to %s at %d.%d.%d.%d:%d",
-                 p->hostname,
-                 (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
-                 (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
-                 (int)p->best_port);
+        ESP_LOGW(TAG, "WG handshake triggered (direct) peer=%d", idx);
     }
 
     return ESP_OK;
@@ -1832,9 +1819,9 @@ static void disco_periodic_probes(microlink_t *ml) {
                 wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                 p->derp_fallback_active = true;
                 p->last_derp_attempt_ms = now;
-                ESP_LOGW(TAG, "DERP handshake %s -> %s (no WG session in %llus)",
+                ESP_LOGW(TAG, "DERP handshake %s peer=%d (no WG session in %llus)",
                          first_attempt ? "init" : "retry",
-                         p->hostname,
+                         i,
                          (unsigned long long)((now - p->peer_added_ms) / 1000));
             }
         }
@@ -1881,10 +1868,11 @@ static void disco_periodic_probes(microlink_t *ml) {
 /* ============================================================================
  * Throughput-collapse diagnostics — periodic state snapshot
  *
- * Logged every 10 s while the wg_mgr loop runs. Captures the full per-peer
+ * Logged every 10 s while the wg_mgr loop runs. Captures per-peer
  * WG session state plus the DISCO probe-pool depth so we can correlate the
  * 2-minute throughput collapse against rekey events, keypair destruction,
- * endpoint drift, and probe leakage.
+ * endpoint drift, and probe leakage. Peer hostnames and endpoint addresses
+ * are intentionally redacted because this stream can be persisted to SD.
  *
  * Output format is a single ESP_LOGW line per peer (greppable with [WG_SNAP])
  * and one summary line ([WG_SNAP_SUM]). Keep field order stable across
@@ -1932,19 +1920,16 @@ static void dump_wg_state_snapshot(microlink_t *ml) {
 
         if (wp->curr_keypair.valid || wp->prev_keypair.valid) linkup_peers++;
 
-        uint32_t ep_ip_u32 = ip_addr_isany(&wp->ip) ? 0 : ip4_addr_get_u32(ip_2_ip4(&wp->ip));
+        bool has_endpoint = !ip_addr_isany(&wp->ip) && wp->port != 0;
         uint64_t last_pong_age = p->last_pong_recv_ms ? (now_ms - p->last_pong_recv_ms) : 0;
 
         ESP_LOGW(TAG,
-            "[WG_SNAP] %s wgi=%d ep=%u.%u.%u.%u:%u "
+            "[WG_SNAP] peer=%d wgi=%d ep=%c "
             "curr=%c(age=%lums cnt=%lu) prev=%c(age=%lums) "
             "lastrx=%lums lasttx=%lums lastinit=%lums "
             "send_hs=%d hs_attempts=%u "
             "direct=%d derp_fb=%d pong_age=%llums",
-            p->hostname, wgi,
-            (unsigned)((ep_ip_u32 >> 0) & 0xFF), (unsigned)((ep_ip_u32 >> 8) & 0xFF),
-            (unsigned)((ep_ip_u32 >> 16) & 0xFF), (unsigned)((ep_ip_u32 >> 24) & 0xFF),
-            (unsigned)wp->port,
+            i, wgi, has_endpoint ? 'Y' : 'N',
             wp->curr_keypair.valid ? 'Y' : 'N', (unsigned long)curr_age,
             (unsigned long)wp->curr_keypair.sending_counter,
             wp->prev_keypair.valid ? 'Y' : 'N', (unsigned long)prev_age,

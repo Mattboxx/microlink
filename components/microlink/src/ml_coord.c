@@ -1787,7 +1787,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
 
         /* Send to wg_mgr task via queue */
         if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
-            ESP_LOGW(TAG, "Peer update queue full, dropping %s", update->hostname);
+            ESP_LOGW(TAG, "Peer update queue full, dropping peer update");
             free(update);
         }
     }

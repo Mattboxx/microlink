@@ -84,7 +84,7 @@ static cJSON *build_routable_ips_array(const char *routes)
     cJSON *arr = cJSON_CreateArray();
     if (!arr || !routes) return arr;
     /* strtok_r needs a writable copy. */
-    char buf[256];
+    char buf[512];
     strncpy(buf, routes, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     char *saveptr = NULL;

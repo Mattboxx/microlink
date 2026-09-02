@@ -655,7 +655,7 @@ struct microlink_s {
     /* Subnet routes to advertise on register (Hostinfo.RoutableIPs).
      * Newline-separated CIDR string copied from microlink_config_t.advertise_routes.
      * Empty = no routes hirdetve. */
-    char advertise_routes[256];
+    char advertise_routes[512];
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */

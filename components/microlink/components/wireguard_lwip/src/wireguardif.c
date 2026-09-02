@@ -52,6 +52,15 @@
 #include <stdio.h>
 #include <stdbool.h>
 
+/* Optional application hook. The weak declarations keep this reusable
+ * WireGuard component independent from the router application's 4via6 module. */
+extern bool fourvia6_translate_wg_input(struct pbuf *packet,
+                                        struct netif *wg_netif,
+                                        const ip_addr_t *peer_tailscale_ip)
+                                        __attribute__((weak));
+extern struct pbuf *fourvia6_translate_wg_output(struct pbuf *ipv4_packet)
+                                                 __attribute__((weak));
+
 static const char *TAG = "wg";
 
 // Per-packet verbose debug (data path, ~140 pps) - disable for production.
@@ -460,7 +469,17 @@ static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_a
 		WG_DEBUG("[WG_OUTPUT] Found peer, peer_index=%d, valid=%d\n",
 		       (int)(peer - device->peers), peer->valid);
 	
-		return wireguardif_output_to_peer(netif, q, ipaddr, peer);
+		/* A 4via6 request entered as IPv6, was forwarded/NATed as IPv4, and
+		 * its reply is routed here using the peer's Tailscale IPv4 address.
+		 * Translate the matching reply back to IPv6 immediately before
+		 * WireGuard encryption. Non-4via6 packets return NULL and follow the
+		 * original path unchanged. */
+		struct pbuf *translated = fourvia6_translate_wg_output
+		                        ? fourvia6_translate_wg_output(q) : NULL;
+		err_t result = wireguardif_output_to_peer(netif,
+		                        translated ? translated : q, ipaddr, peer);
+		if (translated) pbuf_free(translated);
+		return result;
 	} else {
 		WG_DEBUG("[WG_OUTPUT] NO PEER FOUND for %s! Dumping all peers:\n", ipaddr_ntoa(&addr));
 		for (int i = 0; i < WIREGUARD_MAX_PEERS; i++) {
@@ -643,8 +662,9 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 #endif /* LWIP_IPV4 */
 #if LWIP_IPV6
 							if (IPH_V(iphdr) == 6) {
-								// TODO: IPV6 support for route filtering
-								header_len = PP_NTOHS(IPH_LEN(iphdr));
+								/* IPv6 has a fixed 40-byte base header. 4via6 performs its
+								 * own destination-prefix and configured-LAN validation. */
+								header_len = 40;
 								dest_ok = true;
 							}
 #endif /* LWIP_IPV6 */
@@ -652,6 +672,29 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
 								if (dest_ok) {
+									/* The translator consumes matching packets. Use the peer's
+									 * primary Tailscale IPv4 (/32 in allowed-source IPs) as the
+									 * temporary IPv4 source so normal routing and optional SNAT
+									 * continue to work. */
+									bool translated_4via6 = false;
+									if (IPH_V(iphdr) == 6 && fourvia6_translate_wg_input) {
+										ip_addr_t peer_v4;
+										ip_addr_set_any(IPADDR_TYPE_V4, &peer_v4);
+										for (x = 0; x < WIREGUARD_MAX_SRC_IPS; x++) {
+											struct wireguard_allowed_ip *aip = &peer->allowed_source_ips[x];
+											if (!aip->valid || !IP_IS_V4(&aip->ip)) continue;
+											uint32_t host_ip = lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(&aip->ip)));
+											uint32_t host_mask = lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(&aip->mask)));
+											if ((host_ip & 0xffc00000UL) == 0x64400000UL
+											    && host_mask == 0xffffffffUL) {
+												ip_addr_copy(peer_v4, aip->ip);
+												break;
+											}
+										}
+										translated_4via6 = fourvia6_translate_wg_input(
+										                        pbuf, device->netif, &peer_v4);
+										if (translated_4via6) pbuf = NULL;
+									}
 									// Throughput-regression fix (2026-05-24): tcpip_input()
 									// queues to the TCPIP thread (queue alloc + context
 									// switch + sem post per packet), which on the WG RX
@@ -663,11 +706,15 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 									// Pi-ping load is a separate ICMP issue; if it
 									// re-surfaces we'll guard ip_data.current_ip4_header
 									// inside icmp_input, not at this layer.
-									WG_DEBUG("[WG_RX_IP] Direct input %u bytes\n", (unsigned)pbuf->tot_len);
-									if (device->netif->input(pbuf, device->netif) == ERR_OK) {
-										pbuf = NULL;
+									if (translated_4via6) {
+										/* Already queued to lwIP as translated IPv4. */
 									} else {
-										WG_DEBUG("[WG_RX_IP] DROPPED: input failed\n");
+										WG_DEBUG("[WG_RX_IP] Direct input %u bytes\n", (unsigned)pbuf->tot_len);
+										if (device->netif->input(pbuf, device->netif) == ERR_OK) {
+										pbuf = NULL;
+										} else {
+											WG_DEBUG("[WG_RX_IP] DROPPED: input failed\n");
+										}
 									}
 								} else {
 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");

@@ -1,5 +1,32 @@
 # MicroLink v2 — ESP32 Tailscale Client
 
+> [!IMPORTANT]
+> **Upstream credit and fork notice:** this repository is a focused fork of
+> [Csontikka/microlink](https://github.com/Csontikka/microlink), the original
+> MicroLink project by **Cameron Malone**. The original project and its
+> contributors retain full credit for MicroLink. This fork remains distributed
+> under the original [MIT License](LICENSE); it is not a new, independently
+> authored VPN implementation.
+
+## What the Mattboxx fork changes
+
+Compared with the upstream `main` branch, this fork contains only the following
+integration and privacy changes for the
+[Mattboxx ESP32 Tailscale Subnet Router](https://github.com/Mattboxx/esp32-tailscale-subnet-router):
+
+- **Privacy-hardened diagnostics:** removes peer hostnames, WireGuard/DISCO key
+  prefixes, endpoint IP addresses and endpoint ports from warning-level
+  diagnostic messages that the host firmware may persist to storage.
+- **Optional 4via6 integration hooks:** adds weak application hooks on the
+  WireGuard input and output paths so the router firmware can translate its
+  supported Tailscale 4via6 traffic. When the host application does not provide
+  these hooks, the original packet path remains in use.
+- **Longer advertised-route configuration:** expands the internal advertised
+  route buffer from 256 to 512 bytes for the router integration.
+
+Everything else below documents the original MicroLink project and is retained
+for compatibility and upstream attribution.
+
 Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G cellular support. Should work on most ESP32 variants (ESP32, ESP32-S3, ESP32-P4, etc.) — ESP32-S3 with PSRAM recommended for production.
 
 ## Features

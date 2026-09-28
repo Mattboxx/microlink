@@ -104,6 +104,13 @@ extern "C" {
 #define ML_CTRL_PORT            443
 #define ML_CTRL_PROTOCOL_VER    131
 
+/* Hostinfo.IPNVersion is supplied per-device via microlink_config_t.ipn_version
+ * (the ESPHome `ipn_version:` option). Empty/NULL => the field is omitted, so the
+ * admin console shows no client version. tailscale parses it as version.Long()
+ * ("x.y.z-t<hash>-g<hash>", version/version.go:73-82); a string missing the hash
+ * suffix is silently not displayed. Left unset it can trip "Device is too old" and
+ * block device operations - see README (Troubleshooting). */
+
 /* DISCO timing (from tailscaled - MUST match for correct behavior) */
 #define ML_DISCO_PING_INTERVAL_MS       5000
 #define ML_DISCO_HEARTBEAT_MS           3000
@@ -118,6 +125,14 @@ extern "C" {
 #define ML_DISCO_PING_TIMEOUT_MS        5000
 #define ML_DISCO_UPGRADE_INTERVAL_MS    15000
 #define ML_DISCO_SESSION_ACTIVE_MS      45000
+/* Per-peer DISCO backoff (esphome-tailscale#46, direction 3). The reference
+ * client heartbeats a peer only while it has traffic for it
+ * (sessionActiveTimeout) and never answers a CallMeMaybe with one of its own.
+ * microlink used to heartbeat every peer with a direct path every 3 s for
+ * ever and to echo every CallMeMaybe, so two microlink nodes that never
+ * completed a WireGuard session kept each other busy indefinitely. */
+#define ML_DISCO_CMM_BURST_FLOOR_MS     2500    /* min spacing of CallMeMaybe-triggered ping bursts, per peer */
+#define ML_DISCO_BEST_STICKY_MS         6500    /* keep best_ip/port while it answered this recently (trustUDPAddrDuration) */
 
 /* STUN servers (Tailscale primary, Google fallback) */
 #define ML_STUN_PRIMARY_HOST    "derp9.tailscale.com"
@@ -318,6 +333,20 @@ typedef struct {
     uint64_t trust_until_ms;        /* Direct path trusted until */
     uint64_t last_send_ms;          /* Last data sent to this peer */
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
+    uint64_t last_cmm_rx_ms;        /* Last CallMeMaybe-triggered ping burst (floor) */
+    uint64_t best_last_pong_ms;     /* Last direct PONG that came from best_ip:best_port itself */
+
+    /* DISCO shared secret with this peer (NaCl box beforenm of our disco
+     * private key and the peer's disco key), derived once and reused for
+     * every DISCO packet in both directions -- reference client:
+     * discoInfo.sharedKey. It used to be recomputed per packet: one X25519,
+     * ~16 ms on an ESP32-S3, which is what made every DISCO packet and every
+     * manager tick with two heartbeats in it expensive. disco_shared_for[]
+     * remembers the disco key it was derived from, so a rotation arriving by
+     * any netmap path re-derives it on next use. */
+    uint8_t disco_shared[32];
+    uint8_t disco_shared_for[32];
+    bool disco_shared_valid;
 
     /* Best direct path */
     uint32_t best_ip;
@@ -444,17 +473,16 @@ struct microlink_s {
      * through microlink_factory_reset. */
     bool identity_persistent;
 
-    /* Last RegisterResponse User block. Headscale returns User.ID=0 and
-     * an empty DisplayName when the supplied auth_key didn't resolve to
-     * a real user — or when the node-key was registered before but the
-     * server-side record is gone. The Register call itself returns 200
-     * in that case, so without surfacing this here the only symptom is
-     * a confusing "node not found" on the next MapRequest.
+    /* Identity from the last RegisterResponse — for display only. A failed
+     * registration is detected from RegisterResponse.Error / NodeKeyExpired /
+     * AuthURL (the fields the reference client acts on), NOT from this block:
+     * User.ID=0 is normal for auth-key and tag-owned nodes, and DisplayName is
+     * documented as an override, so empty is the usual case.
      *
      * register_user_id semantics:
      *   -1 = no RegisterResponse parsed yet this boot
-     *    0 = auth/identity is bad (the failure mode)
-     *   >0 = a real user; register_user_name holds the DisplayName */
+     *    0 = registered with no bound user (auth-key or tag-owned) — NORMAL
+     *   >0 = a real user; register_user_name holds the display name */
     int  register_user_id;
     char register_user_name[48];
 
@@ -477,6 +505,13 @@ struct microlink_s {
     TaskHandle_t derp_rx_task;
     TaskHandle_t coord_task;
     TaskHandle_t wg_mgr_task;
+    /* Tasks started by microlink_start() that have not signed off yet
+     * (ml_task_exiting). microlink_stop() waits for this to reach zero
+     * instead of sleeping a fixed 3 s and hoping: a coord task still inside
+     * poll_map_update() when microlink_destroy() freed the instance was a
+     * use-after-free PANIC on the reference router (reconnect burst). */
+    volatile int tasks_alive;
+    bool stop_incomplete;           /* a task outlived the stop wait: destroy must not free */
 
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
@@ -529,6 +564,7 @@ struct microlink_s {
     /* STUN results (written by coord, read by coord only) */
     uint32_t stun_public_ip;
     uint16_t stun_public_port;
+    uint32_t last_ep_update_hash;   /* FNV-1a of the last endpoint update sent to control; 0 = none this session */
 
     /* STUN server cache (pre-resolved IPs, host byte order) */
     uint32_t stun_primary_ip;       /* derp9.tailscale.com resolved IPv4 */
@@ -646,7 +682,7 @@ struct microlink_s {
     char ctrl_host_hdr[72];
 
     /* Noise server static public key fetched from the custom control plane
-     * via GET /key?v=88. Valid only when ctrl_noise_pubkey_valid is true;
+     * via GET /key?v=<ML_CTRL_PROTOCOL_VER>. Valid only when ctrl_noise_pubkey_valid is true;
      * otherwise ml_noise_init falls back to the hardcoded Tailscale SaaS
      * server key. */
     uint8_t ctrl_noise_pubkey[32];
@@ -678,6 +714,11 @@ void ml_derp_tx_task(void *arg);
 void ml_derp_rx_task(void *arg);
 esp_err_t ml_derp_connect(microlink_t *ml);
 void ml_derp_disconnect(microlink_t *ml);
+
+/* Every microlink task calls this as its LAST statement before
+ * vTaskDelete(NULL): after it returns the task must not touch ml again,
+ * because microlink_stop() may already be tearing the instance down. */
+void ml_task_exiting(microlink_t *ml);
 esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len);
 

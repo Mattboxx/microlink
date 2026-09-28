@@ -40,6 +40,26 @@
 
 static const char *TAG = "ml_coord";
 
+/* A failed control-plane buffer allocation used to be silent: ml_psram_malloc()
+ * returns NULL, the caller returns -1 and the state machine only logs
+ * "MapRequest failed, will retry" - indistinguishable from a network failure,
+ * except that it fires within a millisecond of the send. Real case
+ * (esphome-tailscale#45): a 2 MB-PSRAM board sharing PSRAM with an audio
+ * pipeline could never fit the two 512 KB MapResponse buffers and looped on
+ * that message forever. Say what was asked for and what is actually free, and
+ * name the knob. */
+static void log_alloc_failure(const char *what, size_t size)
+{
+    ESP_LOGE(TAG, "%s: cannot allocate %u KB - PSRAM free %u KB (largest block %u KB), "
+                  "internal free %u KB (largest %u KB). Lower CONFIG_ML_H2_BUFFER_SIZE_KB / "
+                  "CONFIG_ML_JSON_BUFFER_SIZE_KB or free the PSRAM held by other components",
+             what, (unsigned)((size + 1023) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+}
+
 /* Pin a freshly-created BSD socket to the upstream (STA) netif via
  * SO_BINDTODEVICE (lwIP -> tcp_bind_netif), so the ESP's OWN control-plane /
  * DERP TCP always egresses the physical uplink and is immune to the
@@ -240,7 +260,7 @@ static int hex_to_bytes32(const char *hex, uint8_t out[32]) {
     return 0;
 }
 
-/* Parse the /key?v=88 HTTP response (already NUL-terminated).
+/* Parse the /key?v=<ML_CTRL_PROTOCOL_VER> HTTP response (already NUL-terminated).
  * Skips HTTP headers, handles chunked transfer encoding, decodes the JSON
  * "publicKey":"mkey:<64 hex>" field, and hex-decodes the 32-byte Noise pubkey
  * into pubkey_out.  Returns 0 on success, -1 on parse/decode error. */
@@ -295,7 +315,7 @@ static int parse_pubkey_response(const char *resp, uint8_t pubkey_out[32]) {
 }
 
 /* Open a short-lived connection to host:port (plain TCP or TLS per
- * ml->use_tls), GET /key?v=88, parse the JSON body, extract publicKey,
+ * ml->use_tls), GET /key?v=<ML_CTRL_PROTOCOL_VER>, parse the JSON body, extract publicKey,
  * hex-decode into ml->ctrl_noise_pubkey.  Returns 0 on success, -1 on any
  * failure.  Closes its own socket / destroys its own transient TLS handle. */
 static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *port) {
@@ -304,7 +324,8 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
     /* The handle is local — never stored in ml.                           */
     /* ------------------------------------------------------------------ */
     if (ml->use_tls) {
-        ESP_LOGI(TAG, "Fetching Noise server pubkey from https://%s:%s/key?v=88", host, port);
+        ESP_LOGI(TAG, "Fetching Noise server pubkey from https://%s:%s/key?v=%d", host, port,
+                 ML_CTRL_PROTOCOL_VER);
 
         const esp_tls_cfg_t cfg = {
             .crt_bundle_attach = esp_crt_bundle_attach,
@@ -328,13 +349,20 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
          * (matches what the coord connection uses), falling back to host. */
         const char *host_hdr = (ml->ctrl_host_hdr[0]) ? ml->ctrl_host_hdr : host;
         char req[256];
+        /* The capability version on /key must be the same one every other
+         * request carries (ML_CTRL_PROTOCOL_VER) -- tailscaled sends its
+         * CurrentCapabilityVersion here too. It was a hardcoded 88 (Tailscale
+         * 1.62) while the MapRequest already said 131; Headscale >= 0.29
+         * drops the minimum supported version above 88 and answers
+         * "unsupported client version" (HTTP 400), so registration died at
+         * the very first step. SaaS accepted both. */
         int req_len = snprintf(req, sizeof(req),
-            "GET /key?v=88 HTTP/1.1\r\n"
+            "GET /key?v=%d HTTP/1.1\r\n"
             "Host: %s\r\n"
             "User-Agent: microlink\r\n"
             "Connection: close\r\n"
             "\r\n",
-            host_hdr);
+            ML_CTRL_PROTOCOL_VER, host_hdr);
         if (req_len <= 0 || req_len >= (int)sizeof(req)) {
             ESP_LOGE(TAG, "fetch_server_pubkey: request snprintf overflow");
             esp_tls_conn_destroy(tls);
@@ -383,7 +411,8 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
     struct addrinfo *res = NULL;
     int rc = -1;
 
-    ESP_LOGI(TAG, "Fetching Noise server pubkey from http://%s:%s/key?v=88", host, port);
+    ESP_LOGI(TAG, "Fetching Noise server pubkey from http://%s:%s/key?v=%d", host, port,
+             ML_CTRL_PROTOCOL_VER);
 
     if (ml_getaddrinfo(host, port, &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "fetch_server_pubkey: DNS resolve failed for %s", host);
@@ -410,12 +439,12 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
 
     char req[256];
     int req_len = snprintf(req, sizeof(req),
-        "GET /key?v=88 HTTP/1.1\r\n"
+        "GET /key?v=%d HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: microlink\r\n"
         "Connection: close\r\n"
         "\r\n",
-        (ml->ctrl_host_hdr[0]) ? ml->ctrl_host_hdr : host);
+        ML_CTRL_PROTOCOL_VER, (ml->ctrl_host_hdr[0]) ? ml->ctrl_host_hdr : host);
     if (req_len <= 0 || req_len >= (int)sizeof(req)) goto out;
 
     if (ml_send(sock, (uint8_t *)req, req_len, 0) != req_len) {
@@ -827,7 +856,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
      * each instance generates its own Noise keypair, so the hardcoded
      * Tailscale SaaS server pubkey in ml_noise_init would always fail the
      * ChaCha20-Poly1305 machine-key decrypt.  Fetch the real server pubkey
-     * from /key?v=88 here, once, and cache it on ml.  (ctrl_host_parsed /
+     * from /key?v=<ML_CTRL_PROTOCOL_VER> here, once, and cache it on ml.  (ctrl_host_parsed /
      * ctrl_port_str were filled by do_tcp_connect just before this state.) */
     const uint8_t *server_pubkey = NULL;
     if (ml->ctrl_host[0]) {
@@ -1243,6 +1272,41 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
  * State: REGISTER - Send RegisterRequest, parse RegisterResponse
  * ========================================================================== */
 
+/* The one Hostinfo builder. The control plane keeps the LAST Hostinfo it
+ * receives, so every message that carries one (RegisterRequest, the initial
+ * MapRequest, the long-poll MapRequest, the endpoint update) must carry the
+ * same fields -- four hand-copied blocks used to drift (IPNVersion was in two
+ * of them, which wiped the client version from the admin console after every
+ * reconnect). NetInfo lives INSIDE Hostinfo: the control plane reads
+ * Hostinfo.NetInfo.PreferredDERP to populate Node.HomeDERP for the peers.
+ * RoutableIPs are the advertised subnet routes (--advertise-routes); each
+ * still needs admin approval before traffic flows. Returns NULL on OOM. */
+static cJSON *build_hostinfo(microlink_t *ml) {
+    cJSON *hostinfo = cJSON_CreateObject();
+    if (!hostinfo) return NULL;
+    const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
+    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
+    if (ml->config.ipn_version && ml->config.ipn_version[0]) {
+        cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->config.ipn_version);
+    }
+    cJSON_AddStringToObject(hostinfo, "OS", "linux");
+    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
+    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+    if (ml->advertise_routes[0]) {
+        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
+                              build_routable_ips_array(ml->advertise_routes));
+    }
+    cJSON *netinfo = cJSON_CreateObject();
+    if (netinfo) {
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
+        if (ml->stun_nat_checked) {
+            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
+        }
+        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
+    }
+    return hostinfo;
+}
+
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
 
@@ -1267,31 +1331,11 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     /* Hostinfo */
-    cJSON *hostinfo = cJSON_CreateObject();
-    const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", "linux");
-    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-
-    /* NetInfo inside Hostinfo — control plane reads PreferredDERP from here
-     * to populate Node.HomeDERP for other peers */
     {
-        cJSON *netinfo = cJSON_CreateObject();
-        if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
-            cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-        }
+        cJSON *hostinfo = build_hostinfo(ml);
+        if (!hostinfo) { cJSON_Delete(root); return -1; }
+        cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
     }
-
-    /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
 
     /* NodeKeyChallengeResponse - prove we own the WireGuard private key
      * Server sends challenge public key in EarlyNoise; we respond with
@@ -1409,7 +1453,6 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     /* Parse H2 frames from accumulated buffer */
-    bool got_end_stream = false;
     int fpos = 0;
     while (fpos + 9 <= (int)h2_resp_len) {
         uint32_t f_len = (h2_resp[fpos] << 16) | (h2_resp[fpos + 1] << 8) | h2_resp[fpos + 2];
@@ -1435,9 +1478,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
                     memcpy(resp_buf + resp_total, h2_resp + fpos, f_len);
                     resp_total += f_len;
                 }
-                if (f_flags & 0x01) got_end_stream = true;
             }
-            if (f_type == 0x01 && (f_flags & 0x01)) got_end_stream = true;
         }
 
         fpos += f_len;
@@ -1510,40 +1551,90 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     parse_start[parse_len] = saved;
     free(resp_buf);
 
-    /* Sanity-check the User block before anything else. Headscale will
-     * still 200 the Register call when the auth_key is bogus or the
-     * node-key was previously registered but the server-side record is
-     * gone — only the JSON betrays the truth (User.ID=0, empty
-     * DisplayName). Without surfacing it here, the first user-visible
-     * symptom is a "node not found" from the next MapRequest, which
-     * reads like a generic transport problem. */
+    /* Check the RegisterResponse status fields the reference client acts on.
+     *
+     * The status fields the reference ACTS ON (direct.go:883-931) are:
+     *
+     *   resp.Error          -> fatal; "if non-empty, other status fields
+     *                          should be ignored" (tailcfg.go:1359)
+     *   resp.NodeKeyExpired -> node key must be replaced
+     *   resp.AuthURL        -> authorization pending, not yet usable
+     *   resp.User.ID        -> DISPLAY ONLY, copied into persist.UserProfile
+     *
+     * (It also handles resp.NodeKeySignature for tailnet lock, which microlink
+     * does not implement, and logs resp.MachineAuthorized.)
+     *
+     * This previously errored on `User.ID == 0 && User.DisplayName == ""`,
+     * which is not a health signal in either half:
+     *
+     *   - User.DisplayName is documented as an OVERRIDE - "if non-empty
+     *     overrides Login field" (tailcfg.go:271). Empty is the normal case;
+     *     the reference reads the real name from resp.Login.DisplayName.
+     *   - A node with no bound user is legitimate. Auth-key registrations,
+     *     and tag-owned nodes in particular, are owned by a tag rather than
+     *     a user, so User.ID == 0 is expected rather than exceptional.
+     *
+     * Observed on a healthy ESP32-S3: a tag-owned node registered by auth key
+     * logged this as ESP_LOGE on every boot while holding a valid address,
+     * exchanging map updates and passing traffic. */
     {
-        cJSON *user = cJSON_GetObjectItem(resp_json, "User");
-        int   id_val   = -1;
+        cJSON *err_j = cJSON_GetObjectItem(resp_json, "Error");
+        if (err_j && cJSON_IsString(err_j) && err_j->valuestring && *err_j->valuestring) {
+            ESP_LOGE(TAG, "RegisterResponse.Error: %s", err_j->valuestring);
+            ESP_LOGE(TAG, "  Registration was refused by the control plane. "
+                          "Check the auth_key is valid and not expired.");
+            cJSON_Delete(resp_json);
+            return -1;
+        }
+
+        cJSON *exp_j = cJSON_GetObjectItem(resp_json, "NodeKeyExpired");
+        if (exp_j && cJSON_IsTrue(exp_j)) {
+            /* The reference regenerates the node key and re-registers
+             * automatically here (direct.go:890-897 returns regen=true). We do
+             * not implement automatic regeneration, so this is fatal and needs
+             * operator action - a microlink divergence, not reference behaviour. */
+            ESP_LOGE(TAG, "RegisterResponse.NodeKeyExpired - this node key is no "
+                          "longer accepted. microlink does not regenerate keys "
+                          "automatically: run microlink_factory_reset + reboot.");
+            cJSON_Delete(resp_json);
+            return -1;
+        }
+
+        cJSON *url_j = cJSON_GetObjectItem(resp_json, "AuthURL");
+        if (url_j && cJSON_IsString(url_j) && url_j->valuestring && *url_j->valuestring) {
+            ESP_LOGW(TAG, "RegisterResponse.AuthURL set - authorization is pending. "
+                          "Approve this node at: %s", url_j->valuestring);
+        }
+
+        /* Identity, for logging only. ID from User, name from Login (with the
+         * User.DisplayName override applied if present) - as the reference does. */
+        cJSON *user  = cJSON_GetObjectItem(resp_json, "User");
+        cJSON *login = cJSON_GetObjectItem(resp_json, "Login");
+        int id_val = 0;
         const char *name_val = "";
         if (user) {
-            cJSON *id_j   = cJSON_GetObjectItem(user, "ID");
-            cJSON *name_j = cJSON_GetObjectItem(user, "DisplayName");
-            if (id_j   && cJSON_IsNumber(id_j))   id_val   = id_j->valueint;
-            if (name_j && cJSON_IsString(name_j)) name_val = name_j->valuestring;
+            cJSON *id_j = cJSON_GetObjectItem(user, "ID");
+            if (id_j && cJSON_IsNumber(id_j)) id_val = id_j->valueint;
+        }
+        if (login) {
+            cJSON *n = cJSON_GetObjectItem(login, "DisplayName");
+            if (!n || !cJSON_IsString(n) || !n->valuestring || !*n->valuestring)
+                n = cJSON_GetObjectItem(login, "LoginName");
+            if (n && cJSON_IsString(n) && n->valuestring) name_val = n->valuestring;
+        }
+        if (user) {   /* User.DisplayName overrides Login when non-empty */
+            cJSON *dn = cJSON_GetObjectItem(user, "DisplayName");
+            if (dn && cJSON_IsString(dn) && dn->valuestring && *dn->valuestring)
+                name_val = dn->valuestring;
         }
         ml->register_user_id = id_val;
-        strlcpy(ml->register_user_name, name_val ? name_val : "",
-                sizeof ml->register_user_name);
-        if (id_val == 0 && (!name_val || !*name_val)) {
-            ESP_LOGE(TAG,
-                "RegisterResponse User.ID=0 + DisplayName=\"\" — the "
-                "control plane accepted the connect but didn't bind us "
-                "to a real user.");
-            ESP_LOGE(TAG,
-                "  Most likely: the auth_key is invalid/expired, or the "
-                "node-key was previously registered and then deleted on "
-                "the server. Fix: regenerate the device identity "
-                "(microlink_factory_reset + reboot) or supply a fresh "
-                "auth_key + reauthorize the node on the control plane.");
-        } else if (id_val > 0) {
-            ESP_LOGI(TAG, "Registered as User.ID=%d \"%s\"",
-                     id_val, name_val ? name_val : "");
+        strlcpy(ml->register_user_name, name_val, sizeof ml->register_user_name);
+
+        if (id_val > 0 || *name_val) {
+            ESP_LOGI(TAG, "Registered as User.ID=%d \"%s\"", id_val, name_val);
+        } else {
+            /* Normal for auth-key and tag-owned registrations. */
+            ESP_LOGI(TAG, "Registered (no bound user - auth-key or tag-owned node)");
         }
     }
 
@@ -1837,7 +1928,11 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     }
 
 check_removed:
-    /* Handle PeersRemoved — array of nodekey strings (long-poll delta updates) */
+    /* Handle PeersRemoved (long-poll delta updates). Per tailcfg this is
+     * []NodeID — integers — and that is what both Tailscale and Headscale
+     * send ("PeersRemoved":[59]); the peer slot is resolved by node_id in
+     * wg_mgr (#42). A nodekey-string element is still accepted as a
+     * fallback, but no control plane is known to send that form. */
     cJSON *removed = cJSON_GetObjectItem(root, "PeersRemoved");
     if (removed && cJSON_IsArray(removed)) {
         int rm_count = cJSON_GetArraySize(removed);
@@ -1845,20 +1940,26 @@ check_removed:
 
         cJSON *key_item;
         cJSON_ArrayForEach(key_item, removed) {
-            if (!key_item->valuestring) continue;
+            if (!cJSON_IsNumber(key_item) && !key_item->valuestring) continue;
 
             ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
             if (!update) continue;
 
             update->action = ML_PEER_REMOVE;
 
-            const char *hex = key_item->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
-
-            ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
-                     update->public_key[0], update->public_key[1],
-                     update->public_key[2], update->public_key[3]);
+            if (cJSON_IsNumber(key_item)) {
+                update->has_node_id = true;
+                update->node_id = (uint64_t)(int64_t)key_item->valuedouble;
+                ESP_LOGI(TAG, "  Remove peer: NodeID=%llu",
+                         (unsigned long long)update->node_id);
+            } else {
+                const char *hex = key_item->valuestring;
+                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
+                hex_to_bytes(hex, update->public_key, 32);
+                ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
+                         update->public_key[0], update->public_key[1],
+                         update->public_key[2], update->public_key[3]);
+            }
 
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
@@ -2202,32 +2303,11 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");  /* Disable compression */
 
-    /* Hostinfo */
-    cJSON *hostinfo = cJSON_CreateObject();
-    const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", "linux");
-    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-    /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-
-    /* NetInfo: tell control plane our preferred DERP region and NAT type.
-     * MUST be inside Hostinfo — the control plane reads Hostinfo.NetInfo.PreferredDERP
-     * to populate Node.HomeDERP for other peers. */
-    cJSON *netinfo = cJSON_CreateObject();
-    if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
-        if (ml->stun_nat_checked) {
-            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-        }
-        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
+    /* Hostinfo (NetInfo inside it) */
+    {
+        cJSON *hostinfo = build_hostinfo(ml);
+        if (!hostinfo) { cJSON_Delete(root); return -1; }
+        cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
     }
 
     /* Include endpoints if STUN has already completed (Stream=false →
@@ -2277,12 +2357,19 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
      * This is critical because a single H2 frame can span multiple Noise frames
      * (v1 does the same with h2_buffer).
      * Smart timeout: extend to 60s for large tailnets (300+ peers = 240KB+). */
-    uint8_t *h2_recv = ml_psram_malloc(ML_H2_BUFFER_SIZE);  /* 512KB for 300+ peer tailnets */
-    if (!h2_recv) return -1;
+    uint8_t *h2_recv = ml_psram_malloc(ML_H2_BUFFER_SIZE);  /* Kconfig-sized, default 512KB for 300+ peer tailnets */
+    if (!h2_recv) {
+        log_alloc_failure("MapResponse HTTP/2 receive buffer", ML_H2_BUFFER_SIZE);
+        return -1;
+    }
     size_t h2_total = 0;
 
     uint8_t *resp_buf = ml_psram_malloc(ML_JSON_BUFFER_SIZE);
-    if (!resp_buf) { free(h2_recv); return -1; }
+    if (!resp_buf) {
+        log_alloc_failure("MapResponse JSON buffer", ML_JSON_BUFFER_SIZE);
+        free(h2_recv);
+        return -1;
+    }
     size_t json_total = 0;
 
     /* Set extended recv timeout for large MapResponse (60 seconds) */
@@ -2300,7 +2387,10 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     bool got_end_stream = false;
     for (int read_count = 0; read_count < 200; read_count++) {
         uint8_t *frame_buf = ml_psram_malloc(65536);
-        if (!frame_buf) break;
+        if (!frame_buf) {
+            log_alloc_failure("MapResponse Noise frame buffer", 65536);
+            break;
+        }
 
         int frame_len = noise_recv(ml, noise, frame_buf, 65536);
         if (frame_len <= 0) {
@@ -2704,33 +2794,10 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
 
     /* Hostinfo - REQUIRED by control plane even for Stream=true.
      * V1 includes this; without it, server may not keep us "online". */
-    cJSON *hostinfo = cJSON_CreateObject();
-    if (hostinfo) {
-        const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-        cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "linux");
-        cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-        cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-        /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-    }
-
-    /* NetInfo: tell control plane our preferred DERP region and NAT type.
-     * MUST be inside Hostinfo — the control plane reads Hostinfo.NetInfo.PreferredDERP
-     * to populate Node.HomeDERP for other peers. */
-    cJSON *netinfo = cJSON_CreateObject();
-    if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
-        if (ml->stun_nat_checked) {
-            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-        }
-        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
+    {
+        cJSON *hostinfo = build_hostinfo(ml);
+        if (!hostinfo) { cJSON_Delete(root); return -1; }
+        cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
     }
 
     /* Stream=true for long-poll, KeepAlive=true so server sends keepalives
@@ -2816,30 +2883,10 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddStringToObject(root, "Compress", "");
 
     /* Hostinfo (required — control plane reads NetInfo from here) */
-    cJSON *hostinfo = cJSON_CreateObject();
-    if (hostinfo) {
-        const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-        cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "linux");
-        cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-        cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-        /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-
-        cJSON *netinfo = cJSON_CreateObject();
-        if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
-            if (ml->stun_nat_checked) {
-                cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-            }
-            cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-        }
+    {
+        cJSON *hostinfo = build_hostinfo(ml);
+        if (!hostinfo) { cJSON_Delete(root); return -1; }
+        cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
     }
 
     /* Endpoints + EndpointTypes */
@@ -2850,6 +2897,20 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     if (!json_str) return -1;
 
     size_t json_len = strlen(json_str);
+    /* Only when something changed (reference client: magicsock setEndpoints
+     * gates the control update with endpointSetsEqual). The periodic re-STUN
+     * every 23 s used to re-send an identical update each time -- a fresh
+     * H2 stream for us and a PeersChangedPatch pushed to every peer on the
+     * tailnet -- with nothing new in it. The hash is over the whole request
+     * (endpoints, NetInfo, Hostinfo), and is reset on every (re)connect so
+     * a new map session always gets the set once. */
+    uint32_t ep_hash = 2166136261u;
+    for (size_t i = 0; i < json_len; i++) { ep_hash ^= (uint8_t)json_str[i]; ep_hash *= 16777619u; }
+    if (ep_hash == ml->last_ep_update_hash) {
+        ESP_LOGD(TAG, "Endpoint update unchanged (%d endpoints, %d bytes), not re-sent", ep_count, (int)json_len);
+        free(json_str);
+        return 0;
+    }
     ESP_LOGI(TAG, "Endpoint update: %d bytes, %d endpoints (Stream=false, OmitPeers=true)",
              (int)json_len, ep_count);
 
@@ -2887,6 +2948,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     ESP_LOGI(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
+    ml->last_ep_update_hash = ep_hash;
     /* Response body is discarded — server may send empty response or
      * we'll consume it in the next poll_map_update() iteration.
      * Only the HTTP status code matters (200 = success). */
@@ -2946,7 +3008,10 @@ static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
          * comes off the wire. */
         ml->lp_acc = ml_psram_malloc(ML_JSON_BUFFER_SIZE + 1);
         ml->lp_acc_len = 0;
-        if (!ml->lp_acc) return;
+        if (!ml->lp_acc) {
+            log_alloc_failure("long-poll accumulator", ML_JSON_BUFFER_SIZE + 1);
+            return;
+        }
     }
     if (ml->lp_acc_len + len > ML_JSON_BUFFER_SIZE) {
         ESP_LOGW(TAG, "long-poll accumulator would overflow (%u + %u) - resetting",
@@ -3237,6 +3302,7 @@ void ml_coord_task(void *arg) {
                              pdFALSE, pdFALSE, portMAX_DELAY);
         if (wb & ML_EVT_SHUTDOWN_REQUEST) {
             ESP_LOGI(TAG, "Shutdown requested before WiFi, exiting");
+            ml_task_exiting(ml);
             vTaskDelete(NULL);
             return;
         }
@@ -3310,6 +3376,7 @@ void ml_coord_task(void *arg) {
                 break;
             }
             ml->h2_next_stream_id = 7;  /* Reset H2 stream counter for new connection */
+            ml->last_ep_update_hash = 0;   /* new map session: send the endpoints once regardless */
             state = COORD_NOISE_HANDSHAKE;
             break;
 
@@ -3730,5 +3797,6 @@ void ml_coord_task(void *arg) {
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");
+    ml_task_exiting(ml);
     vTaskDelete(NULL);
 }

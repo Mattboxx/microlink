@@ -10,6 +10,16 @@
 
 ## What the Mattboxx fork changes
 
+### September 2026 upstream alignment
+
+Integrated upstream commit `7de6a93684a34991fdfa1eeb9281e08523646ef7`,
+the microlink revision used by router v0.1.27. This includes bounded DISCO/WG
+work, cached discovery shared secrets, offline-peer backoff, endpoint-update
+deduplication, consistent Hostinfo/IPNVersion, NodeID-based peer removal,
+registration-error handling and coordinated task/DERP/WireGuard teardown.
+The privacy redactions and 4via6 hooks below are retained, including in merge
+conflicts. Upstream tests do not substitute for testing this integrated build.
+
 Compared with the upstream `main` branch, this fork contains only the following
 integration and privacy changes for the
 [Mattboxx ESP32 Tailscale Subnet Router](https://github.com/Mattboxx/esp32-tailscale-subnet-router):

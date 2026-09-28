@@ -339,6 +339,7 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 		// More debug: check expiry
 		uint32_t now_ms = wireguard_sys_now();
 		uint32_t age_ms = now_ms - keypair->keypair_millis;
+		(void)age_ms;
 		bool expired = wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME);
 		WG_DEBUG("[WG_TX_DEBUG] keypair_millis=%lu, now=%lu, age_ms=%lu, expired=%d, counter=%lu\n",
 		       (unsigned long)keypair->keypair_millis, (unsigned long)now_ms,
@@ -1166,6 +1167,25 @@ void wireguardif_shutdown(struct netif *netif) {
 	sys_untimeout(wireguardif_tmr, device);
 }
 
+void wireguardif_free(struct netif *netif) {
+	if (!netif || !netif->state) {
+		return;
+	}
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	netif->state = NULL;
+
+	// Idempotent with wireguardif_shutdown: untimeout on a timer that is not
+	// armed is a no-op.
+	sys_untimeout(wireguardif_tmr, device);
+	if (device->udp_pcb) {
+		udp_remove(device->udp_pcb);
+		device->udp_pcb = NULL;
+	}
+	// The device holds the private key and every peer's session keys.
+	crypto_zero(device, sizeof(struct wireguard_device));
+	mem_free(device);
+}
+
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
@@ -1250,6 +1270,8 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t
 
 	uint32_t t2 = wireguard_sys_now();
 	WG_DEBUG("Adding peer took %ldms\r\n", (t2-t1));
+	(void)t1;
+	(void)t2;
 
 	if (peer_index) {
 		if (peer) {
@@ -1476,6 +1498,8 @@ err_t wireguardif_init(struct netif *netif) {
 					if (wireguard_device_init(device, private_key)) {
 						uint32_t t2 = wireguard_sys_now();
 						WG_DEBUG("Device init took %ldms\r\n", (t2-t1));
+						(void)t1;
+						(void)t2;
 
 #if LWIP_CHECKSUM_CTRL_PER_NETIF
 						NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_ENABLE_ALL);
@@ -1524,6 +1548,8 @@ err_t wireguardif_init(struct netif *netif) {
 							if (wireguard_device_init(device, private_key)) {
 								uint32_t t2 = wireguard_sys_now();
 								WG_DEBUG("Device init took %ldms\r\n", (t2-t1));
+								(void)t1;
+								(void)t2;
 
 #if LWIP_CHECKSUM_CTRL_PER_NETIF
 								NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_ENABLE_ALL);

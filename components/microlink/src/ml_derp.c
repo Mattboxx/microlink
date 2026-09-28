@@ -328,7 +328,7 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
     switch (frame_type) {
     case DERP_FRAME_RECV_PACKET:
         if (payload) {
-            ESP_LOGI(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
+            ESP_LOGD(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
                      (int)payload_len,
                      src_key[0], src_key[1], src_key[2], src_key[3],
                      payload_len > 0 ? payload[0] : 0xFF);
@@ -707,7 +707,7 @@ void ml_derp_tx_task(void *arg) {
                 }
                 int ret;
                 if (item.frame_type == DERP_FRAME_SEND_PACKET) {
-                    ESP_LOGI(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x",
+                    ESP_LOGD(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x",
                              (int)item.len, item.dest_pubkey[0], item.dest_pubkey[1],
                              item.dest_pubkey[2], item.dest_pubkey[3],
                              item.data[0]);
@@ -730,6 +730,7 @@ void ml_derp_tx_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "DERP I/O task exiting");
+    ml_task_exiting(ml);
     vTaskDelete(NULL);
 }
 
@@ -771,6 +772,7 @@ void ml_derp_rx_task(void *arg) {
         if (!got) vTaskDelay(pdMS_TO_TICKS(10));   /* idle: don't hot-spin (O_NONBLOCK) */
     }
     ESP_LOGI(TAG, "DERP RX task exiting");
+    ml_task_exiting(ml);
     vTaskDelete(NULL);
 }
 

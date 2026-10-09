@@ -70,6 +70,9 @@ typedef struct {
      * NULL/empty = no routes advertised. Internally clipped to 255 chars. */
     const char *advertise_routes;
 
+    /* Application-provided PeerAPI DNS HTTP listener; 0 = not provided. */
+    uint16_t peer_api_port;
+
     /* Netcheck override policy.
      *   netcheck_override_enabled = false → always trust the configured
      *     default region, even when netcheck measured a faster one.
@@ -229,6 +232,18 @@ int64_t microlink_get_key_expiry(const microlink_t *ml);
  */
 struct netif;
 esp_err_t microlink_pin_wg_output_netif(microlink_t *ml, struct netif *upstream);
+
+/**
+ * @brief Is this IPv4 address a tailnet peer programmed into the WireGuard netif?
+ *
+ * True when a peer owns the address as a /32 allowed IP. For route hooks that
+ * must tell a tailnet node from an unrelated host in 100.64.0.0/10 (an uplink
+ * can live in that range too). Read-only; call it from the TCP/IP thread.
+ *
+ * @param wg_netif The WireGuard lwIP netif (may be NULL -> false)
+ * @param ip_nbo   Address, network byte order
+ */
+bool microlink_wg_has_peer_ip(struct netif *wg_netif, uint32_t ip_nbo);
 
 /**
  * @brief Get number of known peers

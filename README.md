@@ -10,6 +10,25 @@
 
 ## What the Mattboxx fork changes
 
+### October 2026 upstream v0.1.31 alignment
+
+Ported all dependency changes from upstream `7de6a93684a34991fdfa1eeb9281e08523646ef7`
+through `17a8c9c0b9f6d7871fd1430f800383c87b99caa2`, the revision used by
+router v0.1.31. Credit remains with Csontikka and upstream contributors,
+including **5queezer** for the PeerAPI DNS integration.
+
+- Bound netcheck shutdown waits and clear the incomplete-stop marker after
+  all workers stop, so later destruction can complete cleanup.
+- Expose exact WireGuard host-route membership for CGNAT uplink exceptions.
+- Allocate received IPv4 tunnel UDP packets in PSRAM to protect internal RAM.
+- Add an optional PeerAPI port to config and announce the DNS proxy services
+  in Hostinfo only when the host application supplies that port.
+
+Existing diagnostic redactions, optional bidirectional 4via6 hooks, PSRAM
+outgoing pbuf handling and fail-closed IPv6 policy are preserved. The host
+firmware owns DNS authorization/server startup; this dependency does not
+enable an HTTP listener or external telemetry by itself.
+
 ### September 2026 upstream alignment
 
 Integrated upstream commit `7de6a93684a34991fdfa1eeb9281e08523646ef7`,

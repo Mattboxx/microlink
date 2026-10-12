@@ -129,6 +129,18 @@ static void *cjson_psram_malloc(size_t size) {
     return ml_psram_malloc(size);
 }
 
+static portMUX_TYPE s_json_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_json_ready;
+void microlink_json_memory_init(void) {
+    taskENTER_CRITICAL(&s_json_lock);
+    if (!s_json_ready) {
+        cJSON_Hooks hooks = {.malloc_fn = cjson_psram_malloc, .free_fn = free};
+        cJSON_InitHooks(&hooks);
+        s_json_ready = true;
+    }
+    taskEXIT_CRITICAL(&s_json_lock);
+}
+
 /* ============================================================================
  * Factory Reset
  * ========================================================================== */
@@ -165,12 +177,9 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         return NULL;
     }
 
-    /* Route cJSON to PSRAM */
-    cJSON_Hooks hooks = {
-        .malloc_fn = cjson_psram_malloc,
-        .free_fn = free
-    };
-    cJSON_InitHooks(&hooks);
+    /* Standalone clients retain the existing allocator; the router calls
+     * this once before other services, so retries never reset live hooks. */
+    microlink_json_memory_init();
 
     /* Allocate context from PSRAM */
     microlink_t *ml = ml_psram_calloc(1, sizeof(microlink_t));

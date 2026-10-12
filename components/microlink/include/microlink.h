@@ -155,6 +155,9 @@ esp_err_t microlink_factory_reset(void);
  * Does NOT start connecting - call microlink_start() for that.
  */
 microlink_t *microlink_init(const microlink_config_t *config);
+/* Process-wide JSON allocator: call once before any application JSON workers.
+ * Prefers PSRAM and keeps the existing internal fallback without PSRAM. */
+void microlink_json_memory_init(void);
 
 /**
  * @brief Start connecting to Tailscale

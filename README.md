@@ -19,8 +19,10 @@
   before returning a retryable memory error. Incomplete cleanup is not retryable.
 - Treat a zero/uninitialized STUN baseline port as unknown, not evidence of
   symmetric NAT. Keep ordinary equal/different-port detection.
+- Initialize the existing process-wide PSRAM JSON allocator once, with an
+  explicit pre-worker entry point, rather than resetting live hooks on retries.
 
-The router owns bounded startup retries, coalesced AP policy and user-visible
+The router owns bounded startup retries, a reserved/coalesced AP worker and user-visible
 error reporting. These changes preserve upstream credits, routing behavior,
 keys and configured services; no external logging is introduced.
 

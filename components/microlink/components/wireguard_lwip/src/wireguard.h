@@ -180,6 +180,8 @@ struct wireguard_peer {
 	// last_tx and last_rx of data packets
 	uint32_t last_tx;
 	uint32_t last_rx;
+	// Last authenticated direct-path packet, distinct from DERP activity.
+	uint32_t last_direct_rx;
 
 	// We set this flag on RX/TX of packets if we think that we should initiate a new handshake
 	bool send_handshake;

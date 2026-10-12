@@ -115,12 +115,19 @@ bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len) {
 
 
 static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
-	// Don't overwrite a valid endpoint with 0.0.0.0 (DERP-injected packets have no real source)
-	// This bug was causing DERP routing to break after receiving the first packet
+	/* Called only after authentication. Relay RX is not proof that a saved
+	 * direct endpoint still works. Preserve a recently authenticated direct
+	 * path, otherwise reply through the relay that delivered this packet.
+	 * DISCO can continue probing for a direct upgrade without a new session. */
+	uint32_t now = wireguard_sys_now();
 	if (ip_addr_isany(addr)) {
-		WG_DEBUG("[WG] update_peer_addr: skipping DERP (0.0.0.0)\n");
-		return;  // Skip updating endpoint for DERP packets
+		if (!peer->last_direct_rx || (uint32_t)(now - peer->last_direct_rx) >= 30000u) {
+			ip_addr_set_any(false, &peer->ip);
+			peer->port = 0;
+		}
+		return;
 	}
+	peer->last_direct_rx = now;
 	WG_DEBUG("[WG] update_peer_addr: %s:%u\n", ipaddr_ntoa(addr), port);
 	peer->ip = *addr;
 	peer->port = port;

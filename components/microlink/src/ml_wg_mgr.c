@@ -1869,9 +1869,9 @@ static void disco_periodic_probes(microlink_t *ml) {
                 struct wireguard_device *dev = (struct wireguard_device *)netif->state;
                 if (dev) {
                     struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
-                    if (wp->last_rx) {
+                    if (wp->last_direct_rx) {
                         uint32_t now_wg = wireguard_sys_now();
-                        uint32_t age = now_wg - wp->last_rx;
+                        uint32_t age = now_wg - wp->last_direct_rx;
                         /* Saturate against the unsigned wrap that fires
                          * when last_rx is updated mid-read. */
                         last_rx_age_ms = (age > 0x7FFFFFFFu) ? 0 : age;

@@ -445,20 +445,13 @@ skip_bsd_socket:
     /* Create tasks */
     BaseType_t ret;
 
-    /* Reserve the tunnel manager before any registration/TLS work can
-     * fragment internal memory. Coordination waits on TASKS_READY below. */
-    ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
-                                   ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
+    /* Largest stacks first: enough total free bytes can still leave no
+     * 12KB hole if 6/8/10KB stacks are allocated first. The ready barrier
+     * prevents the coordinator from allocating TLS data during this phase. */
+    ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
+                                   ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create wg_mgr task");
-        goto start_failed;
-    }
-    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
-
-    ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
-                                   ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create net_io task");
+        ESP_LOGE(TAG, "Failed to create coord task");
         goto start_failed;
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
@@ -471,10 +464,6 @@ skip_bsd_socket:
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
-    /* DERP reader: split out from the unified I/O task so RX (mbedtls_ssl_read)
-     * and TX (mbedtls_ssl_write) run concurrently on the same ssl context (one
-     * reader + one writer = the documented mbedtls threading model). Same
-     * stack/prio/core as the writer so the two time-slice predictably on core 0. */
     ret = xTaskCreatePinnedToCore(ml_derp_rx_task, "ml_derp_rx", ML_TASK_DERP_TX_STACK,
                                    ml, ML_TASK_DERP_TX_PRIO, &ml->derp_rx_task, ML_TASK_DERP_TX_CORE);
     if (ret != pdPASS) {
@@ -483,10 +472,18 @@ skip_bsd_socket:
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
-    ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
-                                   ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
+    ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
+                                   ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create coord task");
+        ESP_LOGE(TAG, "Failed to create wg_mgr task");
+        goto start_failed;
+    }
+    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
+
+    ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
+                                   ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create net_io task");
         goto start_failed;
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);

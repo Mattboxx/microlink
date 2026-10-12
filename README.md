@@ -12,8 +12,8 @@
 
 ### October 12, 2026: startup allocation recovery
 
-- Reserve the WireGuard manager stack before coordination, without shrinking
-  the existing stacks. Coordination and peer-cache loading wait for an explicit
+- Reserve worker stacks in decreasing size order, without shrinking the
+  existing stacks. Coordination and peer-cache loading wait for an explicit
   all-workers-ready barrier, so TLS cannot fragment RAM during worker creation.
 - On a partial startup failure, stop the created workers and close their sockets
   before returning a retryable memory error. Incomplete cleanup is not retryable.

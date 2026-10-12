@@ -21,10 +21,10 @@
   symmetric NAT. Keep ordinary equal/different-port detection.
 - Initialize the existing process-wide PSRAM JSON allocator once, with an
   explicit pre-worker entry point, rather than resetting live hooks on retries.
-- Distinguish authenticated direct traffic from relay activity. Relay reception
-  no longer keeps a stale direct endpoint alive indefinitely; replies can use
-  DERP without discarding the existing session. Recently working direct paths
-  are retained, and direct probing/upgrades continue.
+- Distinguish authenticated direct traffic from relay activity. Nonempty relay
+  packets immediately select relay replies, including asymmetric paths. Empty
+  relay keepalives retain recently working direct paths. Existing sessions and
+  direct probing/upgrades are preserved; stale endpoints cannot trap replies.
 
 The router owns bounded startup retries, a reserved/coalesced AP worker and user-visible
 error reporting. These changes preserve upstream credits, routing behavior,

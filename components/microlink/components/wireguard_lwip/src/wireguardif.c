@@ -114,14 +114,14 @@ bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len) {
 }
 
 
-static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
+static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port, bool reply_via_relay) {
 	/* Called only after authentication. Relay RX is not proof that a saved
 	 * direct endpoint still works. Preserve a recently authenticated direct
 	 * path, otherwise reply through the relay that delivered this packet.
 	 * DISCO can continue probing for a direct upgrade without a new session. */
 	uint32_t now = wireguard_sys_now();
 	if (ip_addr_isany(addr)) {
-		if (!peer->last_direct_rx || (uint32_t)(now - peer->last_direct_rx) >= 30000u) {
+		if (reply_via_relay || !peer->last_direct_rx || (uint32_t)(now - peer->last_direct_rx) >= 30000u) {
 			ip_addr_set_any(false, &peer->ip);
 			peer->port = 0;
 		}
@@ -540,7 +540,7 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		ESP_LOGW(TAG, "[WG] *** HANDSHAKE COMPLETE! wg_idx=%u path=%s ***",
 		       wg_idx, ip_addr_isany(addr) ? "DERP" : "direct");
 		// Update the peer location
-		update_peer_addr(peer, addr, port);
+		update_peer_addr(peer, addr, port, false);
 
 		wireguard_start_session(peer, true);
 		peer->handshake_attempts = 0;  // session up, reset retry counter
@@ -625,7 +625,10 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 					// 3. Since the packet has authenticated correctly, the source IP of the outer UDP/IP packet is used to update the endpoint for peer TrMv...WXX0.
 					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					/* A real relay-delivered request needs its reply on the same
+					 * usable path immediately, even with one-way direct traffic.
+					 * Empty relay keepalives alone need not demote healthy UDP. */
+					update_peer_addr(peer, addr, port, pbuf->tot_len > 0);
 
 					now = wireguard_sys_now();
 					keypair->last_rx = now;
@@ -975,7 +978,7 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 				if (peer) {
 					ESP_LOGW(TAG, "[WG_RX] Initiation processed OK, sending response");
 					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					update_peer_addr(peer, addr, port, false);
 
 					// If initiation arrived via DERP (addr=0.0.0.0), send response
 					// via DERP too by temporarily clearing the peer endpoint.
@@ -1035,7 +1038,7 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 			if (peer) {
 				if (wireguard_process_cookie_message(device, peer, msg_cookie)) {
 					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					update_peer_addr(peer, addr, port, false);
 
 					// Don't send anything out - we stay quiet until the next initiation message
 				}

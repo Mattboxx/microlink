@@ -370,6 +370,7 @@ esp_err_t microlink_start(microlink_t *ml) {
     }
 
     ml->state = ML_STATE_WIFI_WAIT;
+    xEventGroupClearBits(ml->events, ML_EVT_TASKS_READY | ML_EVT_SHUTDOWN_REQUEST);
 
     /* Set WiFi TX power if configured */
     if (ml->config.wifi_tx_power_dbm > 0) {
@@ -435,11 +436,21 @@ skip_bsd_socket:
     /* Create tasks */
     BaseType_t ret;
 
+    /* Reserve the tunnel manager before any registration/TLS work can
+     * fragment internal memory. Coordination waits on TASKS_READY below. */
+    ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
+                                   ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create wg_mgr task");
+        goto start_failed;
+    }
+    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
+
     ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
                                    ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create net_io task");
-        return ESP_FAIL;
+        goto start_failed;
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
@@ -447,7 +458,7 @@ skip_bsd_socket:
                                    ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create derp_tx task");
-        return ESP_FAIL;
+        goto start_failed;
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
@@ -459,7 +470,7 @@ skip_bsd_socket:
                                    ml, ML_TASK_DERP_TX_PRIO, &ml->derp_rx_task, ML_TASK_DERP_TX_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create derp_rx task");
-        return ESP_FAIL;
+        goto start_failed;
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
@@ -467,21 +478,13 @@ skip_bsd_socket:
                                    ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create coord task");
-        return ESP_FAIL;
-    }
-    __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
-
-    ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
-                                   ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create wg_mgr task");
-        return ESP_FAIL;
+        goto start_failed;
     }
     __atomic_add_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
 
     /* WiFi is expected to be connected before microlink_start() is called.
      * Signal the event so coord/wg_mgr tasks proceed immediately. */
-    xEventGroupSetBits(ml->events, ML_EVT_WIFI_CONNECTED);
+    xEventGroupSetBits(ml->events, ML_EVT_WIFI_CONNECTED | ML_EVT_TASKS_READY);
 
     /* Signal coord task to start connecting */
     ml_coord_cmd_t cmd = ML_CMD_CONNECT;
@@ -494,6 +497,12 @@ skip_bsd_socket:
 
     ESP_LOGI(TAG, "All tasks started");
     return ESP_OK;
+
+start_failed:
+    /* Roll back partially created workers/sockets before exposing failure.
+     * A caller can retry a transient shortage without retaining half a node. */
+    microlink_stop(ml);
+    return ml->stop_incomplete ? ESP_ERR_INVALID_STATE : ESP_ERR_NO_MEM;
 }
 
 esp_err_t microlink_stop(microlink_t *ml) {

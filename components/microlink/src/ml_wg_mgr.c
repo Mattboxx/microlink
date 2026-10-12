@@ -2125,6 +2125,13 @@ static void dump_wg_state_snapshot(microlink_t *ml) {
 
 void ml_wg_mgr_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
+    EventBits_t startup = xEventGroupWaitBits(ml->events,
+        ML_EVT_TASKS_READY | ML_EVT_SHUTDOWN_REQUEST, pdFALSE, pdFALSE, portMAX_DELAY);
+    if (startup & ML_EVT_SHUTDOWN_REQUEST) {
+        ml_task_exiting(ml);
+        vTaskDelete(NULL);
+        return;
+    }
     ESP_LOGI(TAG, "WG Manager task started (Core %d)", xPortGetCoreID());
 
     /* Initialize probe tracking */

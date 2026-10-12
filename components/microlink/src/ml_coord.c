@@ -3301,6 +3301,13 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 
 void ml_coord_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
+    EventBits_t startup = xEventGroupWaitBits(ml->events,
+        ML_EVT_TASKS_READY | ML_EVT_SHUTDOWN_REQUEST, pdFALSE, pdFALSE, portMAX_DELAY);
+    if (startup & ML_EVT_SHUTDOWN_REQUEST) {
+        ml_task_exiting(ml);
+        vTaskDelete(NULL);
+        return;
+    }
     ESP_LOGI(TAG, "Coord task started (Core %d)", xPortGetCoreID());
 
     coord_state_t state = COORD_IDLE;
@@ -3568,7 +3575,7 @@ void ml_coord_task(void *arg) {
                     /* Try IPv4 parse first */
                     if (ml_stun_parse_response(stun_pkt.data, stun_pkt.len,
                                                 &pub_ip, &pub_port)) {
-                        if (ml->stun_public_ip == 0) {
+                        if (ml->stun_public_ip == 0 || ml->stun_public_port == 0) {
                             /* First STUN result (primary server) */
                             ml->stun_public_ip = pub_ip;
                             ml->stun_public_port = pub_port;

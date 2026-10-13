@@ -10,6 +10,16 @@
 
 ## What the Mattboxx fork changes
 
+### October 13, 2026: upstream v0.1.32 dependency fixes
+
+Port the three upstream changes through `2c796e3b14872b94fb2c54102affaacb1cc4a77b`:
+move per-packet WireGuard logs to DEBUG and the ten-second snapshot to INFO,
+allow a stop request to wake coordination during its DERP connection wait,
+and guard a missing DERP TX queue during partial-initialization cleanup.
+Credit remains with Csontikka and contributors. Keep this fork's redacted
+snapshot fields, startup barrier/rollback, relay-reply recovery and existing
+protocol extensions. No external logging or listener is added.
+
 ### October 12, 2026: startup allocation recovery
 
 - Reserve worker stacks in decreasing size order, without shrinking the

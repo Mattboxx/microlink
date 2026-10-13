@@ -3488,8 +3488,14 @@ void ml_coord_task(void *arg) {
                     xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
                     /* Wait for DERP to connect (up to 15s) before continuing */
                     ESP_LOGI(TAG, "Waiting for DERP I/O task to connect...");
-                    xEventGroupWaitBits(ml->events, ML_EVT_DERP_CONNECTED,
-                                        pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
+                    /* Wake immediately for shutdown, not after the stop deadline. */
+                    EventBits_t derp_wb = xEventGroupWaitBits(ml->events,
+                        ML_EVT_DERP_CONNECTED | ML_EVT_SHUTDOWN_REQUEST,
+                        pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+                    if (derp_wb & ML_EVT_SHUTDOWN_REQUEST) {
+                        ESP_LOGI(TAG, "Stop requested while waiting for DERP");
+                        break;
+                    }
                 }
 
                 /* Start streaming long-poll for incremental updates */

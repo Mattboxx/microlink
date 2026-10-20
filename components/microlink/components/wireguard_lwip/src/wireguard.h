@@ -89,6 +89,16 @@ typedef err_t (*wireguard_derp_output_fn)(const uint8_t *peer_public_key, const 
 // Returns: ERR_OK on success, error code on failure
 typedef err_t (*wireguard_udp_output_fn)(uint32_t dest_ip, uint16_t dest_port, const uint8_t *data, size_t len, void *ctx);
 
+// Optional pair for magicsock mode that avoids the per-packet copies:
+//  tx_pbuf_alloc_fn: a contiguous pbuf of `len` bytes with PBUF_TRANSPORT headroom; the
+//    transport packet is built and encrypted in place in it. NULL -> the caller falls back
+//    to pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM).
+//  udp_pbuf_output_fn: send that pbuf as it is (udp_sendto prepends the headers into the
+//    headroom). The callback must not free or keep it; the caller frees it afterwards, so
+//    a driver that keeps a reference must take its own (pbuf_ref), as lwIP's do.
+typedef struct pbuf *(*wireguard_tx_pbuf_alloc_fn)(u16_t len, void *ctx);
+typedef err_t (*wireguard_udp_pbuf_output_fn)(uint32_t dest_ip, uint16_t dest_port, struct pbuf *p, void *ctx);
+
 struct wireguard_keypair {
 	bool valid;
 	bool initiator; // Did we initiate this session (send the initiation packet rather than sending the response packet)
@@ -112,6 +122,7 @@ struct wireguard_keypair {
 };
 
 struct wireguard_handshake {
+	uint32_t created_millis;   /* wireguard_sys_now() when the handshake state was created; expires after REJECT_AFTER_TIME*3 */
 	bool valid;
 	bool initiator;
 	uint32_t local_index;
@@ -182,6 +193,10 @@ struct wireguard_peer {
 	uint32_t last_rx;
 	// Last authenticated direct-path packet, distinct from DERP activity.
 	uint32_t last_direct_rx;
+	// First data packet sent since the last authenticated packet arrived, 0 = nothing
+	// unanswered. wireguard-go's timerNewHandshake: armed by data (not keepalives),
+	// disarmed by anything authenticated from the peer, fires after 15 s.
+	uint32_t last_data_tx;
 
 	// We set this flag on RX/TX of packets if we think that we should initiate a new handshake
 	bool send_handshake;
@@ -219,6 +234,11 @@ struct wireguard_device {
 	// UDP output callback for magicsock mode (external unified socket)
 	wireguard_udp_output_fn udp_output_fn;
 	void *udp_output_ctx;
+
+	// Copy-free variant (see the typedefs): both or neither
+	wireguard_tx_pbuf_alloc_fn tx_pbuf_alloc_fn;
+	wireguard_udp_pbuf_output_fn udp_pbuf_output_fn;
+	void *tx_pbuf_ctx;
 
 	// Force all peer output through DERP relay (cellular mode)
 	bool force_derp_output;
@@ -288,10 +308,19 @@ struct wireguard_peer *peer_lookup_by_peer_index(struct wireguard_device *device
 struct wireguard_peer *peer_lookup_by_receiver(struct wireguard_device *device, uint32_t receiver);
 struct wireguard_peer *peer_lookup_by_handshake(struct wireguard_device *device, uint32_t receiver);
 
-void wireguard_start_session(struct wireguard_peer *peer, bool initiator);
+/* false when the handshake state is gone (expired or never completed); nothing is changed then. */
+bool wireguard_start_session(struct wireguard_peer *peer, bool initiator);
 
-void keypair_update(struct wireguard_peer *peer, struct wireguard_keypair *received_keypair);
+/* Returns the keypair the caller should keep using: the promoted current one when the
+ * received key was 'next', otherwise the received one. */
+struct wireguard_keypair *keypair_update(struct wireguard_peer *peer, struct wireguard_keypair *received_keypair);
 void keypair_destroy(struct wireguard_keypair *keypair);
+bool wireguard_keypair_expired(const struct wireguard_keypair *keypair);
+/* Expire the handshake and each of the three transport keypairs independently (WireGuard 6.2: a key
+ * is unusable after REJECT_AFTER_TIME or REJECT_AFTER_MESSAGES; unfinished handshake state after 3x). */
+void wireguard_expire_keys(struct wireguard_peer *peer);
+void wireguard_destroy_handshake(struct wireguard_peer *peer);
+void wireguard_expire_handshake(struct wireguard_peer *peer);
 
 struct wireguard_keypair *get_peer_keypair_for_idx(struct wireguard_peer *peer, uint32_t idx);
 bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq);
@@ -313,6 +342,8 @@ bool wireguard_check_mac2(struct wireguard_device *device, const uint8_t *data, 
 bool wireguard_expired(uint32_t created_millis, uint32_t valid_seconds);
 
 void wireguard_encrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, struct wireguard_keypair *keypair);
+/* Authenticates, then runs the anti-replay window; false for a forged, replayed, too-short or
+ * counter-exhausted packet. Keepalives (empty payload) go through the same checks. */
 bool wireguard_decrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, uint64_t counter, struct wireguard_keypair *keypair);
 
 bool wireguard_base64_decode(const char *str, uint8_t *out, size_t *outlen);

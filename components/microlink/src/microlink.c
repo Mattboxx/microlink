@@ -241,19 +241,27 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         uint64_t base_seconds = 0;
         time_t wallclock = 0;
         time(&wallclock);
-        if (wallclock > 1700000000) {
-            base_seconds = (uint64_t)wallclock;
-        } else {
-            nvs_handle_t h;
-            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-                uint64_t prev = 0;
-                size_t sz = sizeof(prev);
-                nvs_get_blob(h, "wg_tai_base", &prev, &sz);
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+            uint64_t prev = 0;
+            size_t sz = sizeof(prev);
+            nvs_get_blob(h, "wg_tai_base", &prev, &sz);
+            if (wallclock > 1700000000) {
+                /* Synced: real time, but never below what an earlier boot may have emitted. */
+                base_seconds = (uint64_t)wallclock > prev ? (uint64_t)wallclock : prev + 1;
+            } else {
                 base_seconds = prev + 86400ULL; /* +1 day per boot */
+            }
+            /* Persist on synced boots too. An unsynced boot after a synced one used to start from
+             * a counter far below the real-time stamps the peers had already seen, and every
+             * handshake we initiated was dropped as a replay until SNTP caught up. */
+            if (base_seconds > prev) {
                 nvs_set_blob(h, "wg_tai_base", &base_seconds, sizeof(base_seconds));
                 nvs_commit(h);
-                nvs_close(h);
             }
+            nvs_close(h);
+        } else if (wallclock > 1700000000) {
+            base_seconds = (uint64_t)wallclock;
         }
         wireguard_set_tai64n_base_seconds(base_seconds);
         ESP_LOGI(TAG, "TAI64N base seconds set to %llu (wallclock=%lld)",
@@ -599,6 +607,14 @@ esp_err_t microlink_stop(microlink_t *ml) {
     if (ml->stun_sock >= 0) { ml_close_sock(ml->stun_sock); ml->stun_sock = -1; }
     if (ml->stun_sock6 >= 0) { ml_close_sock(ml->stun_sock6); ml->stun_sock6 = -1; }
 
+    if (ml->stop_incomplete) {
+        /* A task still runs on this instance. IDLE would let microlink_start
+         * build a second set of tasks on top of it; ERROR keeps it out of
+         * service until microlink_destroy's second stop finds it quiescent. */
+        ml->state = ML_STATE_ERROR;
+        ESP_LOGE(TAG, "Stopped with a task still running: instance out of service");
+        return ESP_ERR_TIMEOUT;
+    }
     ml->state = ML_STATE_IDLE;
     ESP_LOGI(TAG, "Stopped");
     return ESP_OK;
@@ -808,6 +824,9 @@ const char *microlink_get_derp_region_name(const microlink_t *ml, uint16_t regio
     }
     return NULL;
 }
+
+esp_err_t microlink_set_wg_tx_copyfree(microlink_t *ml, bool on) { return ml_wg_set_tx_copyfree(ml, on); }
+bool microlink_get_wg_tx_copyfree(const microlink_t *ml) { return ml ? ml->wg_tx_copyfree : false; }
 
 int microlink_get_derp_rtts(const microlink_t *ml, microlink_derp_rtt_t *out, int max) {
     if (!ml || !out || max <= 0) return 0;

@@ -46,12 +46,57 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force);
 /* lwIP requires netif state changes to happen in tcpip_thread context.
  * ESP-IDF v5.5+ asserts this strictly (LWIP_ASSERT_CORE_LOCKED). With
  * CONFIG_LWIP_TCPIP_CORE_LOCKING=n we cannot LOCK_TCPIP_CORE() the
- * wg_mgr task, so route the bring-up calls through tcpip_callback_with_block. */
+ * wg_mgr task, so route the bring-up calls through wg_tcpip_sync (below). */
+/* Run fn(arg) on the TCPIP thread and wait for it to finish. NOT
+ * tcpip_callback_with_block(): that only blocks on posting the message, so the
+ * caller used to go on (and free the netif) while the TCPIP thread had not yet
+ * unlinked it from netif_list -- a use-after-free seen as heap corruption in
+ * ip4_route / dhcp_coarse_tmr / nd6_tmr on uplink roams (2026-10-20). */
+struct wg_tcpip_call { void (*fn)(void *); void *arg; };
+static esp_err_t wg_tcpip_exec_wrap(void *ctx)
+{
+    struct wg_tcpip_call *c = (struct wg_tcpip_call *)ctx;
+    c->fn(c->arg);
+    return ESP_OK;
+}
+static void wg_tcpip_sync(void (*fn)(void *), void *arg)
+{
+    struct wg_tcpip_call c = { .fn = fn, .arg = arg };
+    esp_err_t e = esp_netif_tcpip_exec(wg_tcpip_exec_wrap, &c);
+    if (e != ESP_OK) ESP_LOGE(TAG, "esp_netif_tcpip_exec failed: %s", esp_err_to_name(e));
+}
+
 static void wg_netif_bring_up_cb(void *ctx)
 {
     struct netif *netif = (struct netif *)ctx;
+    /* Join lwIP's netif list here, on the TCPIP thread, which walks that
+     * list for every forwarded packet. (netif_add is bypassed because it
+     * wants an init callback; the list link is the part of it we need.) */
+    netif->next = netif_list;
+    netif_list = netif;
     netif_set_up(netif);
     netif_set_link_up(netif);
+}
+
+/* wireguardif_init creates and binds the device's UDP PCB and arms the
+ * periodic timer: PCB and timeout list are TCPIP-thread state too. */
+struct wg_init_ctx { struct netif *netif; err_t err; };
+static void wg_netif_init_cb(void *ctx)
+{
+    struct wg_init_ctx *c = (struct wg_init_ctx *)ctx;
+    c->err = wireguardif_init(c->netif);
+}
+
+/* Teardown mirror of the above: link down, down, out of the list, and the
+ * WireGuard device (its UDP PCB included, its timer disarmed) released, all
+ * on the TCPIP thread. */
+static void wg_netif_take_down_cb(void *ctx)
+{
+    struct netif *netif = (struct netif *)ctx;
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    netif_remove(netif);
+    wireguardif_free(netif);
 }
 
 /* Same TCPIP-context rule applies to udp_new() and any UDP-PCB field writes.
@@ -260,6 +305,91 @@ static void ml_spiram_pbuf_free_fn(struct pbuf *p) {
     heap_caps_free(wrap);
 }
 
+/* A contiguous pbuf of `len` payload bytes with PBUF_TRANSPORT headroom: payload in
+ * SPIRAM, the ~32 B wrapper on the internal heap (see ml_spiram_pbuf_t). */
+static struct pbuf *ml_spiram_pbuf_new(u16_t len) {
+    const u16_t hdr_offset = (u16_t)LWIP_MEM_ALIGN_SIZE((u16_t)PBUF_TRANSPORT);
+    const u16_t total_len = (u16_t)(hdr_offset + len);
+    ml_spiram_pbuf_t *wrap = heap_caps_malloc(sizeof(*wrap), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!wrap) return NULL;
+    wrap->data_spiram = heap_caps_malloc(total_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wrap->data_spiram) { heap_caps_free(wrap); return NULL; }
+    wrap->pc.custom_free_function = ml_spiram_pbuf_free_fn;
+    struct pbuf *p = pbuf_alloced_custom(PBUF_TRANSPORT, len, PBUF_REF, &wrap->pc, wrap->data_spiram, total_len);
+    if (!p) { heap_caps_free(wrap->data_spiram); heap_caps_free(wrap); return NULL; }
+    return p;
+}
+
+/* Handshake packets (type 1/2/3) also go over the relay: tailscale "send both"
+ * (wgengine/magicsock/endpoint.go send). DERP is the bootstrap path that always
+ * works; direct is the opportunistic upgrade. Without this a peer behind an
+ * aggressive symmetric NAT (per-packet source-port remap) never completes the
+ * handshake. Bulk data (type 4) is not duplicated: the direct path + the 30 s
+ * DERP fallback carry it once the session is up. Peer found by dest address
+ * (host-order endpoints vs network-order dest_ip). */
+static void wg_send_both_relay(microlink_t *ml, uint32_t dest_ip, const uint8_t *data, size_t len) {
+    if (len < 1 || !(data[0] == 0x01 || data[0] == 0x02 || data[0] == 0x03)) return;
+    for (int pi = 0; pi < ml->peer_count; pi++) {
+        ml_peer_t *pr = &ml->peers[pi];
+        bool match = (pr->best_ip && htonl(pr->best_ip) == dest_ip);
+        if (!match) {
+            for (int e = 0; e < pr->endpoint_count && e < ML_MAX_ENDPOINTS; e++) {
+                if (!pr->endpoints[e].is_ipv6 && pr->endpoints[e].ip &&
+                    htonl(pr->endpoints[e].ip) == dest_ip) { match = true; break; }
+            }
+        }
+        if (match) {
+            ml_derp_queue_send(ml, pr->public_key, data, len);
+            ESP_LOGI(TAG, "WG send-both: handshake type=%d also relayed via DERP to %s",
+                     (int)data[0], pr->hostname);
+            break;
+        }
+    }
+}
+
+/* Runtime switch for the copy-free path (A/B on a live device). Either value of
+ * the two hook pointers is safe mid-packet: a hook pbuf sent by the copying path
+ * is linearised like any other, a PBUF_RAM sent by the pbuf path is contiguous. */
+esp_err_t ml_wg_set_tx_copyfree(microlink_t *ml, bool on);
+static struct pbuf *wg_tx_pbuf_alloc_cb(u16_t len, void *ctx);
+static err_t wg_udp_pbuf_output_cb(uint32_t dest_ip, uint16_t dest_port, struct pbuf *p, void *ctx);
+void microlink_get_wg_tx_profile(uint32_t *pkts, uint64_t *us, bool reset) { wireguardif_tx_profile(pkts, us, reset); }
+
+esp_err_t ml_wg_set_tx_copyfree(microlink_t *ml, bool on) {
+    if (!ml || !ml->wg_netif) return ESP_ERR_INVALID_STATE;
+    wireguardif_set_tx_pbuf_output((struct netif *)ml->wg_netif,
+                                   on ? wg_tx_pbuf_alloc_cb : NULL, on ? wg_udp_pbuf_output_cb : NULL, ml);
+    ml->wg_tx_copyfree = on;
+    ESP_LOGW(TAG, "WG TX copy-free path %s", on ? "ON" : "OFF (copying path)");
+    return ESP_OK;
+}
+
+/* Copy-free TX hooks (wireguardif_set_tx_pbuf_output): the transport packet is
+ * built and encrypted in place in a SPIRAM pbuf from wg_tx_pbuf_alloc_cb and
+ * sent as it is. Per packet this replaces an internal PBUF_RAM (~1.3 KB), a
+ * SPIRAM linearise buffer, a second SPIRAM buffer and two copies with one
+ * SPIRAM buffer and no copy; the internal heap sees only the 32 B wrapper. */
+static struct pbuf *wg_tx_pbuf_alloc_cb(u16_t len, void *ctx) {
+    (void)ctx;
+    return ml_spiram_pbuf_new(len);
+}
+
+static err_t wg_udp_pbuf_output_cb(uint32_t dest_ip, uint16_t dest_port, struct pbuf *p, void *ctx) {
+    microlink_t *ml = (microlink_t *)ctx;
+    if (!ml || !s_wg_output_pcb || !p) return ERR_CONN;
+    /* udp_sendto prepends UDP/IP/Ethernet headers into the headroom and leaves
+     * payload/len on them; the packet bytes stay where they are, so keep the
+     * pointer for the relay copy below. The caller frees p after we return. */
+    const uint8_t *data = (const uint8_t *)p->payload;
+    size_t len = p->tot_len;
+    ip_addr_t dst;
+    IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
+    ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
+    err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+    wg_send_both_relay(ml, dest_ip, data, len);
+    return err;
+}
+
 static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
                                 const uint8_t *data, size_t len, void *ctx) {
     microlink_t *ml = (microlink_t *)ctx;
@@ -297,25 +427,9 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
      * attempt used the raw layer value and shipped corrupted data
      * because the aligned offset was 2 B off — fixed here by using the
      * same LWIP_MEM_ALIGN_SIZE macro for both sides). */
-    const u16_t hdr_offset = (u16_t)LWIP_MEM_ALIGN_SIZE((u16_t)PBUF_TRANSPORT);
-    const u16_t total_len = (u16_t)(hdr_offset + len);
-    ml_spiram_pbuf_t *wrap = heap_caps_malloc(sizeof(*wrap),
-                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!wrap) return ERR_MEM;
-    wrap->data_spiram = heap_caps_malloc(total_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!wrap->data_spiram) {
-        heap_caps_free(wrap);
-        return ERR_MEM;
-    }
-    memcpy((uint8_t *)wrap->data_spiram + hdr_offset, data, len);
-    wrap->pc.custom_free_function = ml_spiram_pbuf_free_fn;
-    struct pbuf *p = pbuf_alloced_custom(PBUF_TRANSPORT, (u16_t)len, PBUF_REF,
-                                          &wrap->pc, wrap->data_spiram, total_len);
-    if (!p) {
-        heap_caps_free(wrap->data_spiram);
-        heap_caps_free(wrap);
-        return ERR_MEM;
-    }
+    struct pbuf *p = ml_spiram_pbuf_new((u16_t)len);
+    if (!p) return ERR_MEM;
+    memcpy(p->payload, data, len);
 
     ip_addr_t dst;
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
@@ -324,37 +438,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
     err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
     pbuf_free(p);
 
-    /* tailscale "send both" (wgengine/magicsock/endpoint.go send): a WireGuard
-     * HANDSHAKE packet (type 0x01 init / 0x02 response / 0x03 cookie) is ALSO
-     * relayed via DERP, not only sent to the direct endpoint. DERP is the
-     * reliable bootstrap path that always works (both peers hold a home-DERP
-     * connection); direct is an opportunistic upgrade. Without this, a peer
-     * behind an aggressive symmetric NAT (per-packet source-port remap) never
-     * completes the handshake: the direct copy goes to a port the peer no longer
-     * uses and is silently dropped, and microlink's exclusive direct-OR-DERP
-     * flip never reliably lands the init on DERP. Bulk data (type 0x04) is NOT
-     * duplicated here -- the existing direct path + 30s DERP-fallback carry it
-     * once the session is up. Peer found by dest address (host-order endpoints
-     * vs network-order dest_ip). */
-    if (len >= 1 && (data[0] == 0x01 || data[0] == 0x02 || data[0] == 0x03)) {
-        for (int pi = 0; pi < ml->peer_count; pi++) {
-            ml_peer_t *pr = &ml->peers[pi];
-            bool match = (pr->best_ip && htonl(pr->best_ip) == dest_ip);
-            if (!match) {
-                for (int e = 0; e < pr->endpoint_count && e < ML_MAX_ENDPOINTS; e++) {
-                    if (!pr->endpoints[e].is_ipv6 && pr->endpoints[e].ip &&
-                        htonl(pr->endpoints[e].ip) == dest_ip) { match = true; break; }
-                }
-            }
-            if (match) {
-                ml_derp_queue_send(ml, pr->public_key, data, len);
-                ESP_LOGI(TAG, "WG send-both: handshake type=%d also relayed via DERP to %s",
-                         (int)data[0], pr->hostname);
-                break;
-            }
-        }
-    }
-
+    wg_send_both_relay(ml, dest_ip, data, len);
     return err;
 }
 
@@ -385,7 +469,9 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
 
     /* Initialize WireGuard netif */
     netif->state = &wg_init;
-    err_t err = wireguardif_init(netif);
+    struct wg_init_ctx init_ctx = { .netif = netif, .err = ERR_VAL };
+    wg_tcpip_sync(wg_netif_init_cb, &init_ctx);
+    err_t err = init_ctx.err;
     if (err != ERR_OK) {
         ESP_LOGE(TAG, "wireguardif_init failed: %d", err);
         free(netif);
@@ -411,12 +497,8 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
      * callback uses raw udp_sendto (not BSD sendto) to avoid deadlock. */
     netif->input = tcpip_input;
 
-    /* Add to lwIP netif list (bypass netif_add which wants init callback) */
-    netif->next = netif_list;
-    netif_list = netif;
-
-    /* Bring interface up via tcpip_thread (see wg_netif_bring_up_cb above) */
-    tcpip_callback_with_block(wg_netif_bring_up_cb, netif, 1);
+    /* List link + bring-up on tcpip_thread (see wg_netif_bring_up_cb above) */
+    wg_tcpip_sync(wg_netif_bring_up_cb, netif);
 
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
      * thread).  Bind to port 51820 to match the DISCO socket source port.
@@ -426,12 +508,14 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
         /* Allocate + configure on tcpip_thread (see wg_udp_pcb_create_cb above).
          * Avoiding udp_bind keeps WG responses on the DISCO BSD socket;
          * udp_sendto only needs local_port set on the PCB. */
-        tcpip_callback_with_block(wg_udp_pcb_create_cb, &s_wg_output_pcb, 1);
+        wg_tcpip_sync(wg_udp_pcb_create_cb, &s_wg_output_pcb);
     }
 
     /* Register output callbacks for magicsock mode */
     wireguardif_set_derp_output(netif, wg_derp_output_cb, ml);
     wireguardif_set_udp_output(netif, wg_udp_output_cb, ml);
+    ml->wg_tx_copyfree = true;
+    wireguardif_set_tx_pbuf_output(netif, wg_tx_pbuf_alloc_cb, wg_udp_pbuf_output_cb, ml);
 
     /* On cellular AT socket bridge, force all WG output through DERP relay.
      * AT sockets are TCP-only, so direct UDP is impossible.
@@ -680,18 +764,19 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         IP4_ADDR(&wg_peer.allowed_ip.u_addr.ip4, ip_a, ip_b, ip_c, ip_d);
         IP4_ADDR(&wg_peer.allowed_mask.u_addr.ip4, 255, 255, 255, 255);
 
-        /* Set endpoint if available, otherwise leave blank for DERP-only */
-        if (p->endpoint_count > 0 && p->endpoints[0].ip != 0) {
-            uint8_t ea = (p->endpoints[0].ip >> 24) & 0xFF;
-            uint8_t eb = (p->endpoints[0].ip >> 16) & 0xFF;
-            uint8_t ec = (p->endpoints[0].ip >> 8) & 0xFF;
-            uint8_t ed = p->endpoints[0].ip & 0xFF;
-            IP4_ADDR(&wg_peer.endpoint_ip.u_addr.ip4, ea, eb, ec, ed);
-            wg_peer.endport_port = p->endpoints[0].port;
-        } else {
-            ip_addr_set_any(false, &wg_peer.endpoint_ip);
-            wg_peer.endport_port = 0;
-        }
+        /* No WireGuard endpoint until DISCO has confirmed one (2026-10-13).
+         * The netmap's first endpoint used to be copied here, so WireGuard
+         * packets went to an address nobody had verified: a peer's LAN or
+         * container address, or a port the peer's NAT no longer maps. The
+         * official client sends WireGuard only to the DISCO-confirmed best
+         * address, and over the relay until there is one; a blank endpoint
+         * here means exactly that (wireguardif routes to DERP while
+         * peer->ip is unset). A direct PONG sets the endpoint through
+         * wireguardif_update_endpoint(), which also becomes the address a
+         * stale-session reset falls back to. The netmap endpoints are still
+         * used, as DISCO probe targets. */
+        ip_addr_set_any(false, &wg_peer.endpoint_ip);
+        wg_peer.endport_port = 0;
 
         wg_peer.keep_alive = 25;
 
@@ -2356,15 +2441,12 @@ void ml_wg_mgr_task(void *arg) {
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
         ml->wg_netif = NULL;
-        wireguardif_shutdown(netif);
-        netif_set_link_down(netif);
-        netif_set_down(netif);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        netif_remove(netif);
-        /* The struct wireguard_device behind netif->state (every peer's
-         * keypairs; ~14.7 KB on the S3 build) was never released: only the
-         * netif around it was, so each stop/start cycle leaked it. */
-        wireguardif_free(netif);
+        /* Down, out of the netif list and the WireGuard device freed (every
+         * peer's keypairs; ~14.7 KB on the S3 build, once leaked here) — on
+         * the TCPIP thread, the only one that may touch the list and the
+         * UDP PCB with core locking off. Blocking: nothing refers to the
+         * netif once the callback has run. */
+        wg_tcpip_sync(wg_netif_take_down_cb, netif);
         free(netif);
     }
 

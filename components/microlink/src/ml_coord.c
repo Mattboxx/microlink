@@ -150,15 +150,27 @@ static void bytes_to_hex(const uint8_t *bytes, size_t len, char *hex) {
     hex[len * 2] = '\0';
 }
 
-static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
-    size_t hex_len = strlen(hex);
-    if (hex_len % 2 != 0 || hex_len / 2 > max_len) return -1;
-    for (size_t i = 0; i < hex_len / 2; i++) {
-        unsigned int val;
-        if (sscanf(hex + i * 2, "%2x", &val) != 1) return -1;
-        bytes[i] = (uint8_t)val;
+static int hex_nybble_early(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode exactly one 32-byte key from 64 hex chars. Returns 32, or -1 with the
+ * destination untouched: a short or malformed key used to leave a half-decoded
+ * buffer behind (sscanf stopped early), which then went into peer comparisons. */
+static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t length) {
+    if (!hex || !bytes || length != 32 || strlen(hex) != 64) return -1;
+    uint8_t decoded[32];
+    for (size_t i = 0; i < 32; ++i) {
+        int hi = hex_nybble_early(hex[i * 2]);
+        int lo = hex_nybble_early(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        decoded[i] = (uint8_t)((hi << 4) | lo);
     }
-    return hex_len / 2;
+    memcpy(bytes, decoded, sizeof(decoded));
+    return 32;
 }
 
 /* ============================================================================
@@ -596,22 +608,44 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
     return 0;
 }
 
+/* A read that stalls after part of a frame has been consumed is given this
+ * long by the clock. The receive timeout on the socket is 60 s on the long
+ * poll (2 s during the handshake), so a retry counter measured wall time in
+ * multiples of that: the old 300 retries were hours, with the coord task
+ * (and the 120 s stream watchdog it drives) stuck in here the whole time. */
+#define ML_COORD_PARTIAL_READ_MS 5000
+
 static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
     size_t recvd = 0;
-    int retries = 0;
+    int64_t partial_since_us = 0;
     while (recvd < len) {
         int n = ml_conn_read(ml, buf + recvd, len - recvd);
-        if (n <= 0) {
+        if (n == 0) {
+            /* Orderly close by the server. recv() leaves errno alone here, so a
+             * stale EAGAIN from an earlier timeout would read as "no data yet"
+             * and the long-poll would keep polling a dead socket until the
+             * 120 s watchdog. */
+            ESP_LOGW(TAG, "coord_recv: connection closed by the server (recvd %d/%d)", (int)recvd, (int)len);
+            errno = ENOTCONN;
+            return -1;
+        }
+        if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (recvd == 0) {
                     /* No data consumed yet — timeout is fine, caller can retry */
                     return -1;
                 }
                 /* Partial data consumed — we MUST finish this read or the
-                 * Noise frame stream will be misaligned. Retry with backoff. */
-                if (++retries > 300) {  /* ~3 seconds */
-                    ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes",
-                             (int)recvd, (int)len);
+                 * Noise frame stream will be misaligned. Retry briefly; then
+                 * give up with an errno the callers treat as a transport
+                 * error. EAGAIN here used to read as "no data yet", and the
+                 * long poll kept polling a stream it could no longer parse. */
+                int64_t now_us = esp_timer_get_time();
+                if (partial_since_us == 0) partial_since_us = now_us;
+                if (now_us - partial_since_us >= (int64_t)ML_COORD_PARTIAL_READ_MS * 1000) {
+                    ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes after %d ms",
+                             (int)recvd, (int)len, (int)((now_us - partial_since_us) / 1000));
+                    errno = ETIMEDOUT;
                     return -1;
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -622,7 +656,7 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
             return -1;
         }
         recvd += n;
-        retries = 0;  /* Reset on successful read */
+        partial_since_us = 0;  /* progress: the stall clock restarts */
     }
     return 0;
 }
@@ -680,16 +714,21 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
     if (!ciphertext) return -1;
 
     /* Header already consumed — payload read MUST complete or stream
-     * alignment is permanently lost. Retry EAGAIN (coord_recv returns -1
-     * with errno==EAGAIN if recvd==0 on first byte). */
-    int payload_retries = 0;
+     * alignment is permanently lost. coord_recv returns -1 with EAGAIN only
+     * when it consumed nothing (the socket timeout passed before the first
+     * payload byte); a stall after a partial read comes back as ETIMEDOUT.
+     * Both are bounded by the clock: the same 5 s as inside coord_recv, so a
+     * server that dies between header and payload costs seconds, not the
+     * hours the old 300-retry counter spent on a 60 s socket timeout. */
+    int64_t payload_since_us = esp_timer_get_time();
     while (coord_recv(ml, ciphertext, ct_len) < 0) {
-        if ((errno == EAGAIN || errno == EWOULDBLOCK) && ++payload_retries <= 300) {
+        if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+            esp_timer_get_time() - payload_since_us < (int64_t)ML_COORD_PARTIAL_READ_MS * 1000) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d retries=%d errno=%d",
-                 ct_len, payload_retries, errno);
+        if (errno == EAGAIN || errno == EWOULDBLOCK) errno = ETIMEDOUT;   /* a header with no payload is not "no data yet" */
+        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d errno=%d", ct_len, errno);
         free(ciphertext);
         return -1;
     }
@@ -954,7 +993,9 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int body_buf_len = 0;
 
     if (body_len > 0) {
-        body_buf = ml_psram_malloc(body_len);
+        /* The header read below writes up to 3 bytes into this buffer, and the
+         * payload read grows it; never allocate less than it may receive. */
+        body_buf = ml_psram_malloc(body_len < 512 ? 512 : body_len);
         if (body_buf) {
             memcpy(body_buf, body_start, body_len);
             body_buf_len = body_len;
@@ -986,6 +1027,14 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
     if (msg_type != 0x02) {
         ESP_LOGE(TAG, "Unexpected Noise msg type: 0x%02x (expected 0x02)", msg_type);
+        free(body_buf);
+        return -1;
+    }
+
+    /* Noise IK msg2 is exactly the 32-byte ephemeral key plus the 16-byte
+     * tag; anything else is not a coordinator we understand. */
+    if (payload_len != 48) {
+        ESP_LOGE(TAG, "Unexpected Noise msg2 length: %d (expected 48)", payload_len);
         free(body_buf);
         return -1;
     }
@@ -1190,8 +1239,7 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
                     /* Parse "chalpub:hex..." format (v1 lines 1402-1424) */
                     if (strncmp(chal_str, "chalpub:", 8) == 0) {
                         const char *hex = chal_str + 8;
-                        if (strlen(hex) >= 64) {
-                            hex_to_bytes(hex, s_node_key_challenge, 32);
+                        if (hex_to_bytes(hex, s_node_key_challenge, 32) == 32) {
                             s_has_node_key_challenge = true;
                             ESP_LOGI(TAG, "NodeKeyChallenge decoded (32 bytes)");
                         }
@@ -1315,7 +1363,13 @@ static cJSON *build_hostinfo(microlink_t *ml) {
     }
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
+        /* The region we actually sit on. Peers reach us through the region the
+         * control plane advertises for us, and that is this value echoed back
+         * as Node.HomeDERP: reporting the configured default while the relay
+         * connection follows the netcheck pick (the default since 2026-10-13)
+         * sent peers to a relay we were not connected to. */
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP",
+                                ml->derp_home_region ? ml->derp_home_region : ml->derp_region_default);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1783,10 +1837,12 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
 
         /* NodeKey: "nodekey:HEX..." */
         cJSON *key = cJSON_GetObjectItem(peer, "Key");
-        if (key && key->valuestring) {
-            const char *hex = key->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
+        const char *node_hex = (key && key->valuestring) ? key->valuestring : NULL;
+        if (node_hex && strncmp(node_hex, "nodekey:", 8) == 0) node_hex += 8;
+        if (hex_to_bytes(node_hex, update->public_key, 32) != 32) {
+            ESP_LOGW(TAG, "peer with malformed node key skipped");
+            free(update);
+            continue;
         }
 
         /* DiscoKey: "discokey:HEX..." */
@@ -1794,7 +1850,11 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         if (disco && disco->valuestring) {
             const char *hex = disco->valuestring;
             if (strncmp(hex, "discokey:", 9) == 0) hex += 9;
-            hex_to_bytes(hex, update->disco_key, 32);
+            if (hex_to_bytes(hex, update->disco_key, 32) != 32) {
+                ESP_LOGW(TAG, "peer with malformed disco key skipped");
+                free(update);
+                continue;
+            }
         }
 
         /* VPN IP from Addresses */
@@ -1919,7 +1979,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
                 const char *hex = k->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
                 uint8_t key[32];
-                hex_to_bytes(hex, key, 32);
+                if (hex_to_bytes(hex, key, 32) != 32) continue;
                 if (memcmp(key, ml->peers[i].public_key, 32) == 0) {
                     present = true;
                     break;
@@ -1972,7 +2032,10 @@ check_removed:
             } else {
                 const char *hex = key_item->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                hex_to_bytes(hex, update->public_key, 32);
+                if (hex_to_bytes(hex, update->public_key, 32) != 32) {
+                    free(update);
+                    continue;
+                }
                 ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
                          update->public_key[0], update->public_key[1],
                          update->public_key[2], update->public_key[3]);
@@ -2012,7 +2075,10 @@ check_removed:
             if (key_item && key_item->valuestring) {
                 const char *hex = key_item->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                hex_to_bytes(hex, update->public_key, 32);
+                if (hex_to_bytes(hex, update->public_key, 32) != 32) {
+                    free(update);
+                    continue;
+                }
             }
 
             /* DERP region. */
@@ -2205,6 +2271,16 @@ static bool parse_derp_map_from_response(microlink_t *ml, cJSON *map_json) {
                 cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
                 if (so && cJSON_IsTrue(so)) n->stun_only = true;
 
+                /* tailcfg.DERPNode: CertName overrides the name the relay's TLS
+                 * certificate is verified against; InsecureForTests disables the
+                 * verification (derphttp_client.go, tlsClient). */
+                cJSON *cn = cJSON_GetObjectItem(node_obj, "CertName");
+                if (cn && cn->valuestring) {
+                    strncpy(n->cert_name, cn->valuestring, sizeof(n->cert_name) - 1);
+                }
+                cJSON *ift = cJSON_GetObjectItem(node_obj, "InsecureForTests");
+                if (ift && cJSON_IsTrue(ift)) n->insecure_for_tests = true;
+
                 r->node_count++;
             }
         }
@@ -2238,28 +2314,43 @@ static bool parse_derp_map_from_response(microlink_t *ml, cJSON *map_json) {
     if (ml->derp_region_count > 0) {
         uint16_t measured = ml_netcheck_pick_best_derp(ml);
         uint16_t cp = ml->derp_region_default;
+        /* The comparison is against the region we are on NOW (or the configured
+         * default before the first pick), not against the default every time:
+         * the netcheck runs on every netmap fetch, and two regions that both
+         * beat the default by more than the threshold used to be picked
+         * alternately from run to run, each pick a relay reconnect. */
+        uint16_t cur = ml->derp_home_region ? ml->derp_home_region : cp;
 
         if (!ml->config.netcheck_override_enabled) {
             ESP_LOGI(TAG, "Netcheck override disabled by config — using control-plane DERP %u", cp);
-        } else if (measured > 0 && measured != cp) {
+        } else if (measured > 0 && measured != cur) {
             /* Look up RTTs from ml->derp_rtt_ms (aligned with derp_regions[]). */
-            uint16_t measured_rtt = 0, cp_rtt = 0;
+            uint16_t measured_rtt = 0, cur_rtt = 0;
             for (int r = 0; r < ml->derp_region_count; r++) {
                 if (ml->derp_regions[r].region_id == measured) measured_rtt = ml->derp_rtt_ms[r];
-                if (ml->derp_regions[r].region_id == cp) cp_rtt = ml->derp_rtt_ms[r];
+                if (ml->derp_regions[r].region_id == cur) cur_rtt = ml->derp_rtt_ms[r];
             }
-            bool cp_has_rtt = (cp != 0 && cp_rtt > 0);
-            int32_t improvement = cp_has_rtt ? (int32_t)cp_rtt - (int32_t)measured_rtt : INT32_MAX;
+            bool cur_has_rtt = (cur != 0 && cur_rtt > 0);
+            int32_t improvement = cur_has_rtt ? (int32_t)cur_rtt - (int32_t)measured_rtt : INT32_MAX;
             int32_t thresh = (int32_t)ml->config.netcheck_override_threshold_ms;
             if (improvement >= thresh) {
                 ESP_LOGI(TAG, "Netcheck override: %u (%ums) -> %u (%ums), improvement %ldms >= %ldms threshold",
-                         cp, cp_rtt, measured, measured_rtt, (long)improvement, (long)thresh);
+                         cur, cur_rtt, measured, measured_rtt, (long)improvement, (long)thresh);
                 ml->derp_home_region = measured;
+                /* The control plane learns the new home with the next Hostinfo
+                 * (endpoint update), and the relay connection follows: the
+                 * home relay is where peers send to us, so sitting on the old
+                 * one would lose relayed traffic until the next reconnect. */
+                ml->netinfo_dirty = true;
+                if (ml->derp.connected) {
+                    ESP_LOGW(TAG, "Home relay region %u -> %u: reconnecting the relay", cur, measured);
+                    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+                }
             } else {
-                ESP_LOGI(TAG, "Netcheck found %u (%ums) faster than CP %u (%ums) but improvement %ldms < %ldms threshold — staying on CP",
-                         measured, measured_rtt, cp, cp_rtt, (long)improvement, (long)thresh);
+                ESP_LOGI(TAG, "Netcheck found %u (%ums) faster than current %u (%ums) but improvement %ldms < %ldms threshold — staying",
+                         measured, measured_rtt, cur, cur_rtt, (long)improvement, (long)thresh);
             }
-        } else if (measured > 0 && measured == cp) {
+        } else if (measured > 0 && measured == cur) {
             ml->derp_home_region = measured;
         }
     }
@@ -2703,10 +2794,13 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
             }
             /* Parse self-node DERP region — try modern HomeDERP (int) first,
              * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
+            /* Node.HomeDERP is the control plane's echo of the PreferredDERP we
+             * sent (tailscale Go semantics), so it only seeds a region we do not
+             * have yet; a measured pick (parse_derp_map_from_response) stays. */
             cJSON *home_derp = cJSON_GetObjectItem(node, "HomeDERP");
             if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
-                ml->derp_home_region = (uint16_t)home_derp->valueint;
-                ESP_LOGI(TAG, "Home DERP region: %d (from server, HomeDERP)", ml->derp_home_region);
+                if (ml->derp_home_region == 0) ml->derp_home_region = (uint16_t)home_derp->valueint;
+                ESP_LOGI(TAG, "Home DERP region: %d (server echo %d)", ml->derp_home_region, home_derp->valueint);
             } else {
                 cJSON *self_derp = cJSON_GetObjectItem(node, "DERP");
                 if (self_derp && self_derp->valuestring) {
@@ -2715,8 +2809,8 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
                     if (colon) {
                         int region = atoi(colon + 1);
                         if (region > 0) {
-                            ml->derp_home_region = (uint16_t)region;
-                            ESP_LOGI(TAG, "Home DERP region: %d (from server, legacy DERP)", region);
+                            if (ml->derp_home_region == 0) ml->derp_home_region = (uint16_t)region;
+                            ESP_LOGI(TAG, "Home DERP region: %d (server legacy echo %d)", ml->derp_home_region, region);
                         }
                     }
                 }
@@ -2928,6 +3022,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
         free(json_str);
         return 0;
     }
+    ml->netinfo_dirty = false;
     ESP_LOGI(TAG, "Endpoint update: %d bytes, %d endpoints (Stream=false, OmitPeers=true)",
              (int)json_len, ep_count);
 
@@ -3175,6 +3270,12 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 data_stream_id = f_stream;
                 /* Append EVERY stream-5 DATA frame - see lp_acc_append(). */
                 lp_acc_append(ml, frame_buf + pos, f_len);
+                if (f_flags & 0x01) {
+                    /* END_STREAM: the server finished the map session. Nothing
+                     * more will ever arrive on this stream; open a new one. */
+                    ESP_LOGW(TAG, "H2 END_STREAM on the long-poll - the server closed the map session, reconnecting");
+                    proto_err = true;
+                }
             } else if (f_len > 0) {
                 /* Endpoint update response (stream 7+) — discard body */
                 ESP_LOGD(TAG, "H2 stream %lu DATA: %lu bytes (discarded)",
@@ -3189,6 +3290,25 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             memcpy(pong + 9, frame_buf + pos, 8);
             noise_send(ml, noise, pong, sizeof(pong));
             ESP_LOGI(TAG, "Sent HTTP/2 PONG in response to server PING");
+        } else if (f_type == 0x07) {
+            /* GOAWAY: the server is shutting this connection down (deploys and
+             * idle timeouts do this). Until 2026-10-13 it was skipped like any
+             * unknown frame and the dead session was noticed only by the
+             * 120 s watchdog; the admin console showed the node offline for
+             * up to two minutes each time. */
+            uint32_t last_sid = f_len >= 4 ? (((uint32_t)(frame_buf[pos] & 0x7F) << 24) | ((uint32_t)frame_buf[pos + 1] << 16) |
+                                              ((uint32_t)frame_buf[pos + 2] << 8) | frame_buf[pos + 3]) : 0;
+            uint32_t err_code = f_len >= 8 ? (((uint32_t)frame_buf[pos + 4] << 24) | ((uint32_t)frame_buf[pos + 5] << 16) |
+                                              ((uint32_t)frame_buf[pos + 6] << 8) | frame_buf[pos + 7]) : 0;
+            ESP_LOGW(TAG, "H2 GOAWAY from the control server (last stream %lu, error %lu) - reconnecting",
+                     (unsigned long)last_sid, (unsigned long)err_code);
+            proto_err = true;
+        } else if (f_type == 0x03 && f_stream == 5) {
+            /* RST_STREAM on the long-poll: the map session is gone. */
+            uint32_t err_code = f_len >= 4 ? (((uint32_t)frame_buf[pos] << 24) | ((uint32_t)frame_buf[pos + 1] << 16) |
+                                              ((uint32_t)frame_buf[pos + 2] << 8) | frame_buf[pos + 3]) : 0;
+            ESP_LOGW(TAG, "H2 RST_STREAM on the long-poll (error %lu) - reconnecting", (unsigned long)err_code);
+            proto_err = true;
         } else if (f_type == 0x04 && !(f_flags & 0x01)) {
             /* HTTP/2 SETTINGS from server — respond with SETTINGS ACK */
             uint8_t settings_ack[9] = {0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00};
@@ -3279,6 +3399,11 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             if (update_json) {
                 apply_long_poll_map(ml, update_json);
                 cJSON_Delete(update_json);
+                /* A home-region change made from a streamed DERPMap: the
+                 * control plane gets the new NetInfo now, not at the next
+                 * reconnect. (The full-netmap path is followed by the
+                 * initial endpoint update anyway.) */
+                if (ml->netinfo_dirty) do_send_endpoint_update(ml, noise);
             } else {
                 ESP_LOGW(TAG, "long-poll: %lu-byte message failed to parse", (unsigned long)size);
             }

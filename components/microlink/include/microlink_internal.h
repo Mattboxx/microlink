@@ -410,6 +410,8 @@ typedef struct {
     uint16_t stun_port;     /* 0 = default 3478 */
     uint16_t derp_port;     /* 0 = default 443 */
     bool stun_only;         /* true if node only serves STUN, not DERP */
+    char cert_name[64];     /* DERPNode.CertName: name the TLS cert is checked against (default HostName) */
+    bool insecure_for_tests;/* DERPNode.InsecureForTests: skip TLS verification (Go does the same) */
 } ml_derp_node_t;
 
 typedef struct {
@@ -595,6 +597,8 @@ struct microlink_s {
     /* Most recent netcheck RTT measurements per derp_regions[] slot.
      * Same index as derp_regions; 0 = no measurement / timed out. */
     uint16_t derp_rtt_ms[ML_MAX_DERP_REGIONS];
+    bool netinfo_dirty;            /* derp_home_region changed since the last Hostinfo the control plane saw */
+    bool wg_tx_copyfree;           /* WireGuard TX: encrypt in place in the outgoing SPIRAM pbuf (true) or copy (false) */
 
     /* ml_get_time_ms() value when state transitioned to CONNECTED. 0 means
      * not currently connected. Used for the GUI tailnet uptime row. */
@@ -714,6 +718,7 @@ void ml_net_io_task(void *arg);
 void ml_derp_tx_task(void *arg);
 void ml_derp_rx_task(void *arg);
 esp_err_t ml_derp_connect(microlink_t *ml);
+esp_err_t ml_wg_set_tx_copyfree(microlink_t *ml, bool on);
 void ml_derp_disconnect(microlink_t *ml);
 
 /* Every microlink task calls this as its LAST statement before

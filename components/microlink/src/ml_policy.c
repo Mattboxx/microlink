@@ -66,7 +66,7 @@ typedef struct {
 typedef struct {
     tuple reverse;
     uint8_t key[32];
-    uint32_t epoch, touched;
+    uint32_t epoch, touched, replied; /* replied: last admitted reply, 0 = none */
     bool used;
 } flow;
 typedef struct {
@@ -575,6 +575,18 @@ static bool ready(const policy *p) {
     return enabled && p && p->filters_known && p->peers_known && p->local_known
         && (!p->expires || (now>=1700000000 && now<p->expires));
 }
+bool ml_policy_reply_age(uint8_t protocol,const uint8_t remote_ip4[4],uint16_t remote_port,uint32_t *age_ms) {
+    if(!remote_ip4||!age_ms)return false;
+    policy *p=acquire();if(!p)return false;
+    bool found=false;uint32_t now=NOW(),best=0;LOCK();
+    if(current==p&&!suspended)for(unsigned i=0;i<FLOWS;i++){
+        const flow *f=&p->flows[i];
+        if(!f->used||!f->replied||f->epoch!=p->epoch||f->reverse.family!=4||f->reverse.protocol!=protocol
+            ||f->reverse.sport!=remote_port||memcmp(f->reverse.src,remote_ip4,4))continue;
+        uint32_t age=now-f->replied;if(!found||age<best){best=age;found=true;}
+    }
+    UNLOCK();release(p);if(found)*age_ms=best;return found;
+}
 void ml_policy_get_status(ml_policy_status_t *out) {
     if(!out)return;
     memset(out,0,sizeof *out);policy *p=acquire();
@@ -618,7 +630,7 @@ int ml_policy_peer_key(uint64_t id,uint8_t key[32]) {
     }
     LOCK();if(current!=p||suspended)status=-1;UNLOCK();release(p);return status;
 }
-static bool flow_allowed(policy *p,const tuple *t,const uint8_t key[32]) {
+static bool flow_allowed(policy *p,const tuple *t,const uint8_t key[32],bool reply) {
     if (t->protocol==6 && (t->flags&0x02) && !(t->flags&0x10)) return false;
     if ((t->protocol==1 && t->icmp!=0)||(t->protocol==58 && t->icmp!=129)) return false;
     bool ok=false; uint32_t now=NOW();
@@ -626,7 +638,7 @@ static bool flow_allowed(policy *p,const tuple *t,const uint8_t key[32]) {
     if (current==p&&!suspended) for (unsigned i=0;i<FLOWS;i++) {
         flow *f=&p->flows[i]; uint32_t limit=t->protocol==6?120000:t->protocol==17?30000:10000;
         if (f->used && f->epoch==p->epoch && now-f->touched<=limit && !memcmp(f->key,key,32) && same(&f->reverse,t)) {
-            f->touched=now;ok=true;break;
+            f->touched=now;if(reply)f->replied=now?now:1;ok=true;break;
         }
     }
     UNLOCK();return ok;
@@ -673,7 +685,7 @@ static bool related_error(policy *p,const struct pbuf *packet,const tuple *outer
     if (!decode_at(packet,off+8,end,true,&quote,NULL) || quote.family!=outer->family
         || memcmp(outer->dst,quote.src,16)) return false;
     if (!inbound) return peer_owns(p,key,quote.src,quote.family) && local_owns(p,quote.dst,quote.family)
-                         && (rule_allowed(p,&quote) || flow_allowed(p,&quote,key));
+                         && (rule_allowed(p,&quote) || flow_allowed(p,&quote,key,false));
     if (!local_owns(p,quote.src,quote.family) || !peer_owns(p,key,quote.dst,quote.family)) return false;
     tuple reverse=quote;memcpy(reverse.src,quote.dst,16);memcpy(reverse.dst,quote.src,16);
     reverse.sport=quote.dport;reverse.dport=quote.sport;
@@ -693,7 +705,7 @@ bool ml_policy_rx(const struct pbuf *packet,const uint8_t key[32]) {
     if (!ready(p)||!peer_owns(p,key,t.src,t.family)) goto done;
     if (!local_owns(p,t.dst,t.family)) goto done;
     if (error_tuple(&t)) {ok=related_error(p,packet,&t,key,true);goto done;}
-    if (flow_allowed(p,&t,key)) {ok=true;goto done;}
+    if (flow_allowed(p,&t,key,true)) {ok=true;goto done;}
     ok=rule_allowed(p,&t);
 done:
     /* A concurrently revoked snapshot cannot grant a new packet. Admission is
@@ -729,7 +741,8 @@ void ml_policy_sent_epoch(const struct pbuf *packet,const uint8_t key[32],uint32
         }
         bool existing=slot>=0 && p->flows[slot].used && same(&p->flows[slot].reverse,&reverse) && !memcmp(p->flows[slot].key,key,32);
         if (slot>=0 && (initiate || existing)) {
-            flow *f=&p->flows[slot];f->reverse=reverse;memcpy(f->key,key,32);f->epoch=p->epoch;f->touched=now;f->used=true;
+            flow *f=&p->flows[slot];if(!existing)f->replied=0;
+            f->reverse=reverse;memcpy(f->key,key,32);f->epoch=p->epoch;f->touched=now;f->used=true;
         }
     }
     UNLOCK();release(p);

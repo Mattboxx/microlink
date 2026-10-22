@@ -305,6 +305,7 @@ typedef struct {
      * peer slot. has_node_id distinguishes "not parsed" from "parsed as 0". */
     bool has_node_id;
     uint64_t node_id;
+    bool has_endpoints,has_derp_region; /* Explicit empty/zero differs from omission. */
 } ml_peer_update_t;
 
 /* ============================================================================

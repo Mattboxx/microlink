@@ -23,6 +23,8 @@
 
 #include <ctype.h>
 #include "microlink_internal.h"
+#include "ml_policy.h"
+#include "ml_peer_sync.h"
 #include "ml_x25519.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -568,6 +570,9 @@ static int ml_conn_sockfd(microlink_t *ml) {
  * neither is currently held.  After this function returns, ml->coord_tls
  * is NULL and ml->coord_sock is -1. */
 static void ml_conn_close(microlink_t *ml) {
+    /* Transport close blocks data immediately. Only a complete fresh map may
+     * resume identical authority; cached peers/WG keys alone cannot resume. */
+    ml_policy_suspend();
     if (ml->coord_tls) {
         esp_tls_conn_destroy(ml->coord_tls);
         ml->coord_tls = NULL;
@@ -1775,20 +1780,19 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
  * ========================================================================== */
 
 /* Defined below with the long-poll reader; both map paths share one framed stream. */
-static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len);
+static bool lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len);
 
-static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
+static bool parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"KeepAlive"))) return true;
     /* Try all field names used by Tailscale (copied from v1 lines 3176-3184):
      *   "Peers"        - Full peer list (initial Stream=false response)
      *   "PeersChanged" - Incremental updates (Stream=true long-poll)
      *   "peers"        - Lowercase fallback */
-    /* A full "Peers" list is authoritative: the control plane expresses ACL
-     * revocation by OMITTING a peer, never by sending PeersRemoved (#32).
-     * "PeersChanged" is incremental — present entries only, no omission
-     * semantics — so it must not trigger the sweep below. */
-    bool authoritative = false;
     cJSON *peers = cJSON_GetObjectItem(root, "Peers");
-    if (peers) authoritative = true;
+    bool full_peers=cJSON_IsArray(peers) && cJSON_GetArraySize(peers)>0;
+    /* Missing/null/empty Peers may accompany genuine deltas. Empty standalone
+     * authority is reconciled by wg_mgr directly from ml_policy, without jobs. */
+    if (!full_peers) peers=NULL;
     if (!peers) {
         peers = cJSON_GetObjectItem(root, "PeersChanged");
         if (peers) ESP_LOGI(TAG, "Using 'PeersChanged' field for peer list");
@@ -1796,7 +1800,6 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     if (!peers) {
         peers = cJSON_GetObjectItem(root, "peers");
         if (peers) {
-            authoritative = true;
             ESP_LOGI(TAG, "Using 'peers' (lowercase) field for peer list");
         }
     }
@@ -1812,9 +1815,10 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     cJSON_ArrayForEach(peer, peers) {
         /* Allocate peer update (freed by wg_mgr after processing) */
         ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-        if (!update) continue;
+        if (!update) return false;
 
         update->action = ML_PEER_ADD;
+        update->has_endpoints=update->has_derp_region=true;
 
         /* NodeID — Tailscale int64 wire ID. Needed so PeersChangedPatch
          * deltas (which key off ID, not nodekey) can find the peer slot. */
@@ -1842,7 +1846,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         if (hex_to_bytes(node_hex, update->public_key, 32) != 32) {
             ESP_LOGW(TAG, "peer with malformed node key skipped");
             free(update);
-            continue;
+            return false;
         }
 
         /* DiscoKey: "discokey:HEX..." */
@@ -1853,7 +1857,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
             if (hex_to_bytes(hex, update->disco_key, 32) != 32) {
                 ESP_LOGW(TAG, "peer with malformed disco key skipped");
                 free(update);
-                continue;
+                return false;
             }
         }
 
@@ -1954,55 +1958,17 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
                  update->endpoint_count, update->is_exit_node);
 
         /* Send to wg_mgr task via queue */
+        if(!ml_peer_sync_record(update)){free(update);return false;}
         if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "Peer update queue full, dropping peer update");
             free(update);
+            return false;
         }
     }
 
-    /* #32 sweep: any table entry whose nodekey is absent from an
-     * authoritative list gets queued for removal. This is what makes ACL
-     * revocation (and any other silent omission — e.g. NVS-cached peers
-     * from a previous control plane) actually reach the device. Queued
-     * AFTER the adds above, so listed peers are updated first and only
-     * true leftovers are removed. */
-    if (authoritative) {
-        int swept = 0;
-        for (int i = 0; i < ML_MAX_PEERS; i++) {
-            if (!ml->peers[i].active) continue;
-
-            bool present = false;
-            cJSON *pj;
-            cJSON_ArrayForEach(pj, peers) {
-                cJSON *k = cJSON_GetObjectItem(pj, "Key");
-                if (!k || !k->valuestring) continue;
-                const char *hex = k->valuestring;
-                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                uint8_t key[32];
-                if (hex_to_bytes(hex, key, 32) != 32) continue;
-                if (memcmp(key, ml->peers[i].public_key, 32) == 0) {
-                    present = true;
-                    break;
-                }
-            }
-            if (present) continue;
-
-            ml_peer_update_t *rm = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-            if (!rm) continue;
-            rm->action = ML_PEER_REMOVE;
-            memcpy(rm->public_key, ml->peers[i].public_key, 32);
-            ESP_LOGI(TAG, "Peer sweep: %s not in authoritative netmap — removing",
-                     ml->peers[i].hostname);
-            if (xQueueSend(ml->peer_update_queue, &rm, pdMS_TO_TICKS(100)) != pdTRUE) {
-                free(rm);
-            } else {
-                swept++;
-            }
-        }
-        if (swept > 0) {
-            ESP_LOGI(TAG, "Peer sweep: %d stale peer(s) removed", swept);
-        }
-    }
+    /* Reconcile in the owning WG task, before adds. Nonempty full Peers
+     * precludes peer deltas; do not apply contradictory Removed/Patch data. */
+    if (full_peers) return true;
 
 check_removed:
     /* Handle PeersRemoved (long-poll delta updates). Per tailcfg this is
@@ -2020,7 +1986,7 @@ check_removed:
             if (!cJSON_IsNumber(key_item) && !key_item->valuestring) continue;
 
             ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-            if (!update) continue;
+            if (!update) return false;
 
             update->action = ML_PEER_REMOVE;
 
@@ -2034,7 +2000,7 @@ check_removed:
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
                 if (hex_to_bytes(hex, update->public_key, 32) != 32) {
                     free(update);
-                    continue;
+                    return false;
                 }
                 ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
                          update->public_key[0], update->public_key[1],
@@ -2043,6 +2009,7 @@ check_removed:
 
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
+                return false;
             }
         }
     }
@@ -2060,7 +2027,7 @@ check_removed:
             if (!cJSON_IsObject(patch)) continue;
 
             ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-            if (!update) continue;
+            if (!update) return false;
             update->action = ML_PEER_UPDATE_ENDPOINT;
 
             /* NodeID is the primary peer key in PeersChangedPatch. */
@@ -2077,19 +2044,21 @@ check_removed:
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
                 if (hex_to_bytes(hex, update->public_key, 32) != 32) {
                     free(update);
-                    continue;
+                    return false;
                 }
             }
 
             /* DERP region. */
             cJSON *patch_derp_region = cJSON_GetObjectItem(patch, "DERPRegion");
-            if (patch_derp_region && cJSON_IsNumber(patch_derp_region) && patch_derp_region->valueint > 0) {
+            if (patch_derp_region && cJSON_IsNumber(patch_derp_region) && patch_derp_region->valueint >= 0) {
+                update->has_derp_region=true;
                 update->derp_region = (uint16_t)patch_derp_region->valueint;
             }
 
             /* Endpoints — netip.AddrPort array, rendered as "ip:port" strings. */
             cJSON *endpoints = cJSON_GetObjectItem(patch, "Endpoints");
             if (endpoints && cJSON_IsArray(endpoints)) {
+                update->has_endpoints=true;
                 int ep_count = 0;
                 cJSON *ep;
                 cJSON_ArrayForEach(ep, endpoints) {
@@ -2121,11 +2090,25 @@ check_removed:
                      update->derp_region,
                      update->has_online ? (update->online ? "true" : "false") : "-");
 
+            if(!ml_peer_sync_record(update)){free(update);return false;}
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
+                return false;
             }
         }
     }
+    return true;
+}
+
+/* One owner/writer for both map paths. A partial peer installation request
+ * must cause a blocked full refresh, not a falsely successful control update. */
+static bool apply_peer_map(microlink_t *ml,cJSON *map) {
+    if (!ml_policy_apply(map) || !parse_peers_from_map_response(ml,map)) {
+        ml_policy_reset();
+        ESP_LOGE(TAG,"Authorization/peer update needs a full refresh; tunnel data blocked");
+        return false;
+    }
+    return true;
 }
 
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
@@ -2717,7 +2700,10 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
                 /* Tail belongs to the NEXT message - carry it, do not drop it. */
                 ESP_LOGI(TAG, "MapResponse: %lu-byte message, %u trailing byte(s) carried to long-poll",
                          (unsigned long)size, (unsigned)(json_total - rest_off));
-                lp_acc_append(ml, resp_buf + rest_off, json_total - rest_off);
+                if (!lp_acc_append(ml, resp_buf + rest_off, json_total - rest_off)) {
+                    free(resp_buf);
+                    return -1;
+                }
             }
         } else {
             /* No usable prefix. Fall back to the old '{' sniff so a control plane that
@@ -2864,7 +2850,11 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     }
 
     /* Parse peers */
-    parse_peers_from_map_response(ml, map_json);
+    if (!apply_peer_map(ml,map_json)) {
+        cJSON_Delete(map_json);
+        free(resp_buf);
+        return -1;
+    }
 
     /* Parse the DERPMap (regions + nodes) and refresh the netcheck /
      * home-region policy — logic shared with the streaming long-poll path
@@ -2889,6 +2879,8 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
 
 /* Send MapRequest with Stream=true to start long-poll on H2 stream 5 */
 static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
+    /* Require a complete fresh stream map, not sticky pre-session deltas. */
+    ml_policy_suspend();
     cJSON *root = cJSON_CreateObject();
     if (!root) return -1;
 
@@ -3071,8 +3063,12 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 /* Apply one fully-decoded MapResponse from the long-poll stream.
  * Extracted from poll_map_update so the caller can drive it once per COMPLETE message rather than
  * once per socket read. See the reassembly note on microlink_t::lp_acc. */
-static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
+static bool apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
     ESP_LOGI(TAG, "Long-poll MapResponse update received");
+    if (!apply_peer_map(ml,update_json)) {
+        return false;
+    }
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(update_json,"KeepAlive"))) return true;
 
     /* Update VPN IP if present */
     cJSON *node = cJSON_GetObjectItem(update_json, "Node");
@@ -3093,9 +3089,6 @@ static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
         }
     }
 
-    /* Parse peer updates */
-    parse_peers_from_map_response(ml, update_json);
-
     /* The DERPMap can arrive on the stream too - Headscale >= 0.26 delivers the ENTIRE initial
      * netmap here (the non-streaming fetch returns an empty body, see do_map_exchange). Parse it
      * and kick the DERP I/O task if it has not connected yet. */
@@ -3103,6 +3096,7 @@ static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
         ESP_LOGI(TAG, "DERPMap arrived via long-poll - signaling DERP connect");
         xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
     }
+    return true;
 }
 
 /* Append one stream-5 DATA payload to the long-poll reassembly buffer.
@@ -3111,8 +3105,8 @@ static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
  * accumulator starting mid-message, which then mis-reads JSON bytes as a length
  * prefix. (Observed on hardware: "implausible message size 808333626" - that is
  * the ASCII ":1.0" read as a little-endian uint32.) */
-static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
-    if (!data || len == 0) return;
+static bool lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
+    if (!data || len == 0) return true;
     if (!ml->lp_acc) {
         /* +1: the drain loop NUL-terminates in place at ps[size], which is one
          * past the last message byte. A message ending exactly at the buffer
@@ -3122,18 +3116,22 @@ static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
         ml->lp_acc_len = 0;
         if (!ml->lp_acc) {
             log_alloc_failure("long-poll accumulator", ML_JSON_BUFFER_SIZE + 1);
-            return;
+            ml_policy_reset();
+            return false;
         }
     }
     if (ml->lp_acc_len + len > ML_JSON_BUFFER_SIZE) {
         ESP_LOGW(TAG, "long-poll accumulator would overflow (%u + %u) - resetting",
                  (unsigned)ml->lp_acc_len, (unsigned)len);
         ml->lp_acc_len = 0;
+        ml_policy_reset();
+        return false;
     }
     if (ml->lp_acc_len + len <= ML_JSON_BUFFER_SIZE) {
         memcpy(ml->lp_acc + ml->lp_acc_len, data, len);
         ml->lp_acc_len += len;
     }
+    return true;
 }
 
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
@@ -3269,7 +3267,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 ml->ctrl_stream_rx_ms = ml_get_time_ms();
                 data_stream_id = f_stream;
                 /* Append EVERY stream-5 DATA frame - see lp_acc_append(). */
-                lp_acc_append(ml, frame_buf + pos, f_len);
+                if (!lp_acc_append(ml, frame_buf + pos, f_len)) proto_err = true;
                 if (f_flags & 0x01) {
                     /* END_STREAM: the server finished the map session. Nothing
                      * more will ever arrive on this stream; open a new one. */
@@ -3357,7 +3355,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
      * SILENTLY - with ctrl_stream_rx_ms already stamped above, so every liveness signal stayed green
      * while netmap updates were lost. Compression is disabled (Compress: ""), so responses arrive at
      * full size and spanning is the normal case for anything but a keepalive. */
-    if (ml->lp_acc && ml->lp_acc_len >= 4) {
+    if (!proto_err && ml->lp_acc && ml->lp_acc_len >= 4) {
         size_t consumed = 0;
         for (;;) {
             size_t avail = ml->lp_acc_len - consumed;
@@ -3397,8 +3395,9 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             cJSON *update_json = cJSON_Parse(ps);
             ps[size] = saved;
             if (update_json) {
-                apply_long_poll_map(ml, update_json);
+                bool authorized = apply_long_poll_map(ml, update_json);
                 cJSON_Delete(update_json);
+                if (!authorized) { proto_err = true; break; }
                 /* A home-region change made from a streamed DERPMap: the
                  * control plane gets the new NetInfo now, not at the next
                  * reconnect. (The full-netmap path is followed by the
@@ -3406,6 +3405,9 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 if (ml->netinfo_dirty) do_send_endpoint_update(ml, noise);
             } else {
                 ESP_LOGW(TAG, "long-poll: %lu-byte message failed to parse", (unsigned long)size);
+                ml_policy_reset();
+                proto_err = true;
+                break;
             }
             consumed += 4 + size;
         }
@@ -3416,7 +3418,10 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     free(frame_buf);
-    if (proto_err) return -1;   /* caller closes the connection and reconnects */
+    if (proto_err) {
+        ml_policy_reset();
+        return -1;   /* caller closes the connection and reconnects */
+    }
     return 1;
 }
 
@@ -3468,6 +3473,7 @@ void ml_coord_task(void *arg) {
                 }
                 break;
             case ML_CMD_DISCONNECT:
+                ml_policy_reset(); /* Explicit disconnect is revocation. */
                 ml_conn_close(ml);
                 state = COORD_IDLE;
                 ml->state = ML_STATE_IDLE;
@@ -3915,6 +3921,7 @@ void ml_coord_task(void *arg) {
 
         case COORD_RECONNECTING:
             {
+                ml_policy_suspend(); /* Block before backoff, not after it. */
                 uint32_t backoff_ms = 1000 << (reconnect_attempts > 4 ? 4 : reconnect_attempts);
                 if (backoff_ms > ML_CTRL_BACKOFF_MAX_MS) backoff_ms = ML_CTRL_BACKOFF_MAX_MS;
 
@@ -3927,6 +3934,7 @@ void ml_coord_task(void *arg) {
                 ml_coord_cmd_t wake_cmd;
                 if (xQueueReceive(ml->coord_cmd_queue, &wake_cmd, pdMS_TO_TICKS(backoff_ms)) == pdTRUE) {
                     if (wake_cmd == ML_CMD_DISCONNECT) {
+                        ml_policy_reset();
                         state = COORD_IDLE;
                         ml->state = ML_STATE_IDLE;
                         break;
@@ -3948,6 +3956,7 @@ void ml_coord_task(void *arg) {
     }
 
     /* Cleanup */
+    ml_policy_reset();
     ml_conn_close(ml);
     memset(&noise, 0, sizeof(noise));
 

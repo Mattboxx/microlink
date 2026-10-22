@@ -403,10 +403,14 @@ static bool group_apply(policy *p,const char *name,const cJSON *rules) {
     }
     return true;
 }
+/* Last rejection reason: a static code for diagnostics, never map content. */
+static const char *s_reject="none";
+const char *ml_policy_last_reject(void) {return s_reject;}
 bool ml_policy_apply(const cJSON *map) {
-    if (!cJSON_IsObject(map)||!unique(map)||!exact_auth_fields(map)) {ml_policy_reset();return false;}
+    s_reject="none";
+    if (!cJSON_IsObject(map)||!unique(map)||!exact_auth_fields(map)) {s_reject=!cJSON_IsObject(map)?"not-object":!unique(map)?"duplicate-key":"auth-field-shape";ml_policy_reset();return false;}
     const cJSON *keepalive=get(map,"KeepAlive");
-    if (keepalive && !cJSON_IsNull(keepalive) && !cJSON_IsBool(keepalive)) {ml_policy_reset();return false;}
+    if (keepalive && !cJSON_IsNull(keepalive) && !cJSON_IsBool(keepalive)) {s_reject="keepalive-type";ml_policy_reset();return false;}
     if (cJSON_IsTrue(keepalive)) return true; /* Not a policy/netmap update. */
     const char *keys[]={"PacketFilter","PacketFilters","Peers","PeersChanged","PeersRemoved","PeersChangedPatch","Node"};
     bool changed=false;
@@ -416,7 +420,7 @@ bool ml_policy_apply(const cJSON *map) {
     }
     if (!changed) return true; /* Keepalive/omitted/null fields retain same-session state. */
     policy *next=ALLOC(sizeof *next);
-    if (!next) {ml_policy_reset();return false;}
+    if (!next) {s_reject="no-memory";ml_policy_reset();return false;}
     memset(next,0,sizeof *next);
     policy *old=acquire();
     LOCK();bool resuming=suspended;uint32_t outage=NOW()-suspended_at;UNLOCK();
@@ -424,9 +428,10 @@ bool ml_policy_apply(const cJSON *map) {
      * map is built from empty state, never the saved pre-outage filters. */
     bool complete=cJSON_IsArray(get(map,"Peers")) && cJSON_IsObject(get(map,"Node"))
         && (cJSON_IsArray(get(map,"PacketFilter")) || cJSON_IsObject(get(map,"PacketFilters")));
-    if(resuming&&!complete){release(old);free(next);ml_policy_reset();return false;}
+    if(resuming&&!complete){s_reject="delta-while-suspended";release(old);free(next);ml_policy_reset();return false;}
     if (old&&!resuming) memcpy(next,old,offsetof(policy,flows));
     bool valid=peer_updates(next,map);
+    if(!valid)s_reject="peer-update";
     const cJSON *base=get(map,"PacketFilter"), *groups=get(map,"PacketFilters");
     bool replace_base=base && !cJSON_IsNull(base);
     if (replace_base) valid=valid && cJSON_IsArray(base);
@@ -456,7 +461,7 @@ bool ml_policy_apply(const cJSON *map) {
     if (groups && !cJSON_IsNull(groups)) for (const cJSON *g=groups->child;valid && g;g=g->next) {
         if (strcmp(g->string,"*") && !cJSON_IsNull(g)) valid=group_apply(next,g->string,g);
     }
-    if (!valid) {release(old);free(next);ml_policy_reset();return false;}
+    if (!valid) {if(strcmp(s_reject,"peer-update"))s_reject="packet-filter";release(old);free(next);ml_policy_reset();return false;}
     /* Endpoint/Online patches and identical refreshes are not revocations.
      * Do not tear down return traffic on every normal map heartbeat. */
     bool same_authority=old && (!resuming||outage<RESUME_WINDOW_MS)
@@ -586,6 +591,9 @@ bool ml_policy_reply_age(uint8_t protocol,const uint8_t remote_ip4[4],uint16_t r
         uint32_t age=now-f->replied;if(!found||age<best){best=age;found=true;}
     }
     UNLOCK();release(p);if(found)*age_ms=best;return found;
+}
+bool ml_policy_authority_active(void) {
+    policy *p=acquire();bool ok=p&&ready(p);release(p);return ok;
 }
 void ml_policy_get_status(ml_policy_status_t *out) {
     if(!out)return;

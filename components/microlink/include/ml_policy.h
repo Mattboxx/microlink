@@ -11,6 +11,10 @@ typedef struct {
 } ml_policy_status_t;
 /* Non-identifying diagnostic counts; readiness is NOT a port grant. */
 void ml_policy_get_status(ml_policy_status_t *out);
+/* Age of the newest reply ADMITTED from remote ip:port (IPv4, network-order
+ * bytes) on a flow this node sent, current epoch only. Evidence that the
+ * service answered recently; never a grant and not per-LAN-client. */
+bool ml_policy_reply_age(uint8_t protocol,const uint8_t remote_ip4[4],uint16_t remote_port,uint32_t *age_ms);
 /* Single control-session writer; packet readers may run concurrently. */
 bool ml_policy_apply(const cJSON *map);
 void ml_policy_reset(void);

@@ -52,6 +52,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+/* Optional for the generic WireGuard component; MicroLink links the strong
+ * policy implementation through ml_coord.c. Keep both hooks before any
+ * address translation. Authentication/replay validation precedes RX policy. */
+extern bool ml_policy_rx(const struct pbuf *, const uint8_t[32]) __attribute__((weak));
+extern bool ml_policy_tx(const struct pbuf *, const uint8_t[32]) __attribute__((weak));
+extern void ml_policy_sent(const struct pbuf *, const uint8_t[32]) __attribute__((weak));
+extern struct pbuf *ml_reassemble_rx(struct pbuf *, const uint8_t[32]) __attribute__((weak));
+extern int ml_fragment_tx_check(const struct pbuf *,const uint8_t[32]) __attribute__((weak));
+extern void ml_fragment_tx_result(const struct pbuf *,const uint8_t[32],bool) __attribute__((weak));
+
 /* Transport-data packets are encrypted from two tasks: the TCP/IP thread
  * (netif output) and the WireGuard manager task (keepalives from the
  * receive path and from wireguardif_periodic()). The send counter is the
@@ -370,6 +380,8 @@ static err_t wireguardif_device_output(struct wireguard_device *device, struct p
 }
 
 static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr, struct wireguard_peer *peer) {
+    int fragment_kind=q && ml_fragment_tx_check?ml_fragment_tx_check(q,peer->public_key):0;
+    if (q && (fragment_kind<0 || (!fragment_kind && ml_policy_tx && !ml_policy_tx(q, peer->public_key)))) return ERR_RTE;
 	// The LWIP IP layer wants to send an IP packet out over the interface - we need to encrypt and send it to the peer
 	struct message_transport_data *hdr;
 	struct pbuf *pbuf;
@@ -527,6 +539,8 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 		}
 		result = ERR_CONN;
 	}
+	if (q && fragment_kind>0 && ml_fragment_tx_result) ml_fragment_tx_result(q,peer->public_key,result==ERR_OK);
+	else if (q && result == ERR_OK && ml_policy_sent) ml_policy_sent(q, peer->public_key);
 	return result;
 }
 
@@ -701,7 +715,13 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 					if (pbuf->tot_len > 0) {
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
-						iphdr = (struct ip_hdr *)pbuf->payload;
+                        /* Decrypted input belongs to this function. Fragment
+                         * hook consumes it; NULL is pending/refused, never a
+                         * policy grant. Completed datagrams pass normal key,
+                         * source and original-address/port policy checks. */
+                        if (ml_reassemble_rx) pbuf = ml_reassemble_rx(pbuf, peer->public_key);
+                        if (pbuf) {
+                        iphdr = (struct ip_hdr *)pbuf->payload;
 						// Replay was checked inside wireguard_decrypt_packet; require a complete header before reading it
 						if (pbuf->tot_len >= sizeof(struct ip_hdr)) {
 
@@ -752,7 +772,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 							if (header_len <= pbuf->tot_len) {
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
-								if (dest_ok) {
+								if (dest_ok && (!ml_policy_rx || ml_policy_rx(pbuf, peer->public_key))) {
 									/* The translator consumes matching packets. Use the peer's
 									 * primary Tailscale IPv4 (/32 in allowed-source IPs) as the
 									 * temporary IPv4 source so normal routing and optional SNAT
@@ -808,6 +828,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 						} else {
 							// The decrypted packet is too short for an IP header
 						}
+						} /* Non-NULL result from the consuming reassembly hook. */
 					} else {
 						// This was a keep-alive packet
 					}

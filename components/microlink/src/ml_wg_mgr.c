@@ -13,6 +13,9 @@
  */
 
 #include "microlink_internal.h"
+#include "ml_policy.h"
+#include "ml_reassembly.h"
+#include "ml_peer_sync.h"
 #include "ml_config_httpd.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -447,6 +450,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
  * ========================================================================== */
 
 static esp_err_t wg_init_interface(microlink_t *ml) {
+    ml_reassembly_clear();
     /* Convert our WG private key to base64 */
     char privkey_b64[64];
     key_to_base64(ml->wg_private_key, privkey_b64, sizeof(privkey_b64));
@@ -946,18 +950,37 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
     }
 }
 
+/* Only this task mutates/reads the WG peer table for reconciliation. Consult
+ * the immutable current authority, not an allocation-dependent removal queue
+ * or the coordinator reading a concurrently changing table. */
+static void prune_peer_cache(microlink_t *ml) {
+    for (int i=0;i<ML_MAX_PEERS;i++) {
+        if (!ml->peers[i].active || ml_policy_peer_status(ml->peers[i].public_key)!=0) continue;
+        ml_peer_update_t removal={0};
+        memcpy(removal.public_key,ml->peers[i].public_key,32);
+        remove_peer(ml,&removal);
+    }
+}
+
 static void process_peer_updates(microlink_t *ml) {
+    prune_peer_cache(ml); /* Also reconciles a known-empty map with no jobs. */
     ml_peer_update_t *update;
     while (xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
         if (!update) continue;
         switch (update->action) {
         case ML_PEER_ADD:
-            add_peer(ml, update);
+            prune_peer_cache(ml); /* Authority can change while draining. */
+            if (ml_policy_peer_status(update->public_key)!=0&&ml_peer_sync_resolve(update)) add_peer(ml, update);
             break;
-        case ML_PEER_REMOVE:
-            remove_peer(ml, update);
+        case ML_PEER_REMOVE: {
+            int idx=update->has_node_id ? find_peer_by_node_id(ml,update->node_id)
+                                        : find_peer_by_key(ml,update->public_key);
+            /* A delayed old remove must not evict a currently re-added peer. */
+            if (idx<0 || ml_policy_peer_status(ml->peers[idx].public_key)!=1) remove_peer(ml, update);
             break;
+        }
         case ML_PEER_UPDATE_ENDPOINT:
+            if(!ml_peer_sync_resolve(update))break;
             /* Delta from PeersChangedPatch. Look up by NodeID first (the
              * canonical key in PeerChange), fall back to nodekey when the
              * patch carried a key rotation. is_exit_node is NOT touched
@@ -977,7 +1000,7 @@ static void process_peer_updates(microlink_t *ml) {
                 }
                 if (idx >= 0) {
                     ml_peer_t *p = &ml->peers[idx];
-                    if (update->endpoint_count > 0) {
+                    if (update->has_endpoints) {
                         p->endpoint_count = update->endpoint_count;
                         for (int i = 0; i < update->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
                             p->endpoints[i].ip = update->endpoints[i].ip;
@@ -985,7 +1008,7 @@ static void process_peer_updates(microlink_t *ml) {
                             p->endpoints[i].is_ipv6 = update->endpoints[i].is_ipv6;
                         }
                     }
-                    if (update->derp_region > 0) {
+                    if (update->has_derp_region) {
                         p->derp_region = update->derp_region;
                     }
                     if (update->has_online) {

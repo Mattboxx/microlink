@@ -2920,7 +2920,10 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddBoolToObject(root, "Stream", true);
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");    /* Disable compression */
-    cJSON_AddBoolToObject(root, "OmitPeers", true);   /* Already have peers */
+    /* Cached peers are not authority after a transport loss. If the initial
+     * non-streaming response was empty, this stream must request a full map.
+     * Otherwise OmitPeers can leave a live transport permanently suspended. */
+    cJSON_AddBoolToObject(root, "OmitPeers", ml_policy_authority_active());
 
     /* NOTE: With Version >= 68, the control plane IGNORES Endpoints and
      * Hostinfo in Stream=true MapRequests. Endpoints are sent via separate
@@ -3610,10 +3613,23 @@ void ml_coord_task(void *arg) {
                     }
                     lp_started = true;
                     if (do_map_exchange(ml, &noise, false) < 0) {
-                        /* Not fatal: poll_map_update may still pick up
-                         * (small) updates from the stream. */
-                        ESP_LOGW(TAG, "No initial netmap on the long-poll stream yet");
+                        ESP_LOGW(TAG, "Initial streaming netmap unavailable; retrying connection");
+                        ml_conn_close(ml);
+                        state = COORD_RECONNECTING;
+                        break;
                     }
+                }
+
+                /* Neither keepalives nor a surviving peer cache can complete
+                 * registration. Retry with bounded coordinator backoff rather
+                 * than declaring CONNECTED with a permanently closed policy
+                 * gate. This also covers an initial response containing only
+                 * deltas or incomplete authority. No permission is inferred. */
+                if (!ml_policy_authority_active()) {
+                    ESP_LOGW(TAG, "Initial policy authority incomplete; retrying connection");
+                    ml_conn_close(ml);
+                    state = COORD_RECONNECTING;
+                    break;
                 }
 
                 /* Signal registration only now — the wg_mgr task wakes on

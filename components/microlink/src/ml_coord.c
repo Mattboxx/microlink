@@ -2103,9 +2103,16 @@ check_removed:
 /* One owner/writer for both map paths. A partial peer installation request
  * must cause a blocked full refresh, not a falsely successful control update. */
 static bool apply_peer_map(microlink_t *ml,cJSON *map) {
-    if (!ml_policy_apply(map) || !parse_peers_from_map_response(ml,map)) {
+    bool policy_ok=ml_policy_apply(map);
+    bool peers_ok=policy_ok && parse_peers_from_map_response(ml,map);
+    if (!peers_ok) {
+        /* Key names and reason codes only: never values, keys or addresses. */
+        char keys[160]="";size_t used=0;
+        for(const cJSON *k=map?map->child:NULL;k&&used<sizeof keys-24;k=k->next)
+            used+=snprintf(keys+used,sizeof keys-used,"%s%s",used?",":"",k->string?k->string:"?");
         ml_policy_reset();
-        ESP_LOGE(TAG,"Authorization/peer update needs a full refresh; tunnel data blocked");
+        ESP_LOGE(TAG,"Authorization/peer update needs a full refresh; tunnel data blocked (stage=%s reason=%s keys=%s)",
+                 policy_ok?"peers":"policy",policy_ok?"peer-parse":ml_policy_last_reject(),keys);
         return false;
     }
     return true;
@@ -2879,8 +2886,13 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
 
 /* Send MapRequest with Stream=true to start long-poll on H2 stream 5 */
 static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
-    /* Require a complete fresh stream map, not sticky pre-session deltas. */
-    ml_policy_suspend();
+    /* Hosted Tailscale sends the complete netmap on the non-streaming request
+     * and then only deltas (PeersChanged) on this stream; Headscale >= 0.26
+     * sends the complete map here. Keep authority a complete map of THIS
+     * connection already established (ml_conn_close suspends on every loss);
+     * otherwise require the stream's own complete map. Verified on hardware
+     * 2026-10-22: the unconditional barrier blocked data on every delta. */
+    if (!ml_policy_authority_active()) ml_policy_suspend();
     cJSON *root = cJSON_CreateObject();
     if (!root) return -1;
 

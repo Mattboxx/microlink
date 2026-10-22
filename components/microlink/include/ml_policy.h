@@ -17,10 +17,16 @@ void ml_policy_get_status(ml_policy_status_t *out);
 bool ml_policy_reply_age(uint8_t protocol,const uint8_t remote_ip4[4],uint16_t remote_port,uint32_t *age_ms);
 /* Single control-session writer; packet readers may run concurrently. */
 bool ml_policy_apply(const cJSON *map);
+/* Static reason code of the last rejection (diagnostics only). */
+const char *ml_policy_last_reject(void);
 void ml_policy_reset(void);
 /* Transport interruption: block all data now, retain bounded return state
  * only for comparison with a fresh COMPLETE map. This is not offline access. */
 void ml_policy_suspend(void);
+/* True when complete authority was established after the last suspension or
+ * reset (not just cached). Used so a stream continuing that same session can
+ * apply deltas, while a transport loss still requires a fresh complete map. */
+bool ml_policy_authority_active(void);
 /* Cache reconciliation only: -1 unknown/changing authority, 0 obsolete, 1
  * currently visible key. Visibility NEVER grants a protocol/port permission. */
 int ml_policy_peer_status(const uint8_t peer_key[32]);

@@ -1,4 +1,5 @@
 // Taken from https://github.com/floodyberry/poly1305-donna - public domain or MIT
+#include "wg_hotloop.h"
 /*
 	poly1305 implementation using 32 bit * 32 bit = 64 bit multiplication and 64 bit addition
 */
@@ -70,7 +71,7 @@ poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
 	st->final = 0;
 }
 
-static void
+static void WG_HOT_LOOP
 poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t bytes) {
 	const unsigned long hibit = (st->final) ? 0 : (1UL << 24); /* 1 << 128 */
 	unsigned long r0,r1,r2,r3,r4;

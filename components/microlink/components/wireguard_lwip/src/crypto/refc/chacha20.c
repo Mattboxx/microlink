@@ -40,6 +40,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "../../crypto.h"
+#include "wg_hotloop.h"
 
 // 2.3.  The ChaCha20 Block Function
 // The first four words (0-3) are constants: 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574
@@ -65,7 +66,7 @@ static const uint32_t CHACHA20_CONSTANT_4 = 0x6b206574;
     a += b;  d ^= a;  d = ROTL32(d,  8);  \
     c += d;  b ^= c;  b = ROTL32(b,  7)
 
-static inline void INNER_BLOCK(uint32_t *block) {
+static inline void WG_HOT_LOOP INNER_BLOCK(uint32_t *block) {
 	QUARTERROUND(block[0], block[4], block[ 8], block[12]); // column 0
 	QUARTERROUND(block[1], block[5], block[ 9], block[13]); // column 1
 	QUARTERROUND(block[2], block[6], block[10], block[14]); // column 2

@@ -66,7 +66,8 @@ static const uint32_t CHACHA20_CONSTANT_4 = 0x6b206574;
     a += b;  d ^= a;  d = ROTL32(d,  8);  \
     c += d;  b ^= c;  b = ROTL32(b,  7)
 
-static inline void WG_HOT_LOOP INNER_BLOCK(uint32_t *block) {
+// Used by HChaCha20 (handshake only); the data path below keeps the state in locals.
+static inline void INNER_BLOCK(uint32_t *block) {
 	QUARTERROUND(block[0], block[4], block[ 8], block[12]); // column 0
 	QUARTERROUND(block[1], block[5], block[ 9], block[13]); // column 1
 	QUARTERROUND(block[2], block[6], block[10], block[14]); // column 2
@@ -100,43 +101,70 @@ static inline void WG_HOT_LOOP INNER_BLOCK(uint32_t *block) {
 //	state += working_state
 //	return serialize(state)
 // end
-static void chacha20_block(struct chacha20_ctx *ctx, uint8_t *stream) {
-	uint32_t working_state[16];
-	int i;
+//
+// Mattboxx performance work (2026-10-31): the block function and the XOR are
+// fused. The working state lives in sixteen locals instead of a memory array
+// rewritten by ten calls per block, and on little-endian targets a whole
+// 64-byte block of 4-byte-aligned input/output (the normal WireGuard packet
+// case) is combined a 32-bit word at a time instead of serialising the key
+// stream byte by byte. Same algorithm and output; other lengths/alignments
+// use the byte path. In-place (out == in) is supported as before.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define CHACHA20_WORD_XOR 1
+typedef uint32_t __attribute__((may_alias)) chacha20_word_t;
+#else
+#define CHACHA20_WORD_XOR 0
+#endif
 
-	for (i = 0; i < 16; ++i) {
-		working_state[i] = ctx->state[i];
-	}
+void WG_HOT_LOOP chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
+	const uint32_t *s = ctx->state;
 
-	TWENTY_ROUNDS(working_state);
+	while (len) {
+		uint32_t x0 = s[0], x1 = s[1], x2 = s[2], x3 = s[3];
+		uint32_t x4 = s[4], x5 = s[5], x6 = s[6], x7 = s[7];
+		uint32_t x8 = s[8], x9 = s[9], x10 = s[10], x11 = s[11];
+		uint32_t x12 = s[12], x13 = s[13], x14 = s[14], x15 = s[15];
+		uint32_t n = len < CHACHA20_BLOCK_SIZE ? len : CHACHA20_BLOCK_SIZE;
+		int i;
 
-	for (i = 0; i < 16; ++i) {
-		U32TO8_LITTLE(stream + (4 * i), PLUS(working_state[i], ctx->state[i]));
-	}
-}
-
-void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
-	uint8_t output[CHACHA20_BLOCK_SIZE];
-	int i;
-
-	if (len) {
-		for (;;) {
-			chacha20_block(ctx, output);
-			// Word 12 is a block counter
-			ctx->state[12] = PLUSONE(ctx->state[12]);
-			if (len <= 64) {
-				for (i = 0;i < len;++i) {
-					out[i] = in[i] ^ output[i];
-			    }
-			    return;
-			}
-			for (i = 0;i < 64;++i) {
-				out[i] = in[i] ^ output[i];
-			}
-			len -= 64;
-			out += 64;
-			in += 64;
+		for (i = 0; i < 10; i++) {
+			QUARTERROUND(x0, x4, x8, x12);  // column 0
+			QUARTERROUND(x1, x5, x9, x13);  // column 1
+			QUARTERROUND(x2, x6, x10, x14); // column 2
+			QUARTERROUND(x3, x7, x11, x15); // column 3
+			QUARTERROUND(x0, x5, x10, x15); // diagonal 1
+			QUARTERROUND(x1, x6, x11, x12); // diagonal 2
+			QUARTERROUND(x2, x7, x8, x13);  // diagonal 3
+			QUARTERROUND(x3, x4, x9, x14);  // diagonal 4
 		}
+		x0 += s[0];   x1 += s[1];   x2 += s[2];   x3 += s[3];
+		x4 += s[4];   x5 += s[5];   x6 += s[6];   x7 += s[7];
+		x8 += s[8];   x9 += s[9];   x10 += s[10]; x11 += s[11];
+		x12 += s[12]; x13 += s[13]; x14 += s[14]; x15 += s[15];
+		// Word 12 is a block counter
+		ctx->state[12] = PLUSONE(ctx->state[12]);
+
+#if CHACHA20_WORD_XOR
+		if (n == CHACHA20_BLOCK_SIZE && !(((uintptr_t)in | (uintptr_t)out) & 3)) {
+			const chacha20_word_t *w = (const chacha20_word_t *)in;
+			chacha20_word_t *o = (chacha20_word_t *)out;
+			o[0] = w[0] ^ x0;   o[1] = w[1] ^ x1;   o[2] = w[2] ^ x2;   o[3] = w[3] ^ x3;
+			o[4] = w[4] ^ x4;   o[5] = w[5] ^ x5;   o[6] = w[6] ^ x6;   o[7] = w[7] ^ x7;
+			o[8] = w[8] ^ x8;   o[9] = w[9] ^ x9;   o[10] = w[10] ^ x10; o[11] = w[11] ^ x11;
+			o[12] = w[12] ^ x12; o[13] = w[13] ^ x13; o[14] = w[14] ^ x14; o[15] = w[15] ^ x15;
+		} else
+#endif
+		{
+			const uint32_t ks[16] = { x0, x1, x2, x3, x4, x5, x6, x7,
+			                          x8, x9, x10, x11, x12, x13, x14, x15 };
+			uint32_t j;
+			for (j = 0; j < n; j++) {
+				out[j] = in[j] ^ (uint8_t)(ks[j >> 2] >> (8 * (j & 3)));
+			}
+		}
+		len -= n;
+		out += n;
+		in += n;
 	}
 }
 

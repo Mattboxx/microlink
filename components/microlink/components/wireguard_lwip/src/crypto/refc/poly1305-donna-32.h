@@ -1,6 +1,26 @@
 // Taken from https://github.com/floodyberry/poly1305-donna - public domain or MIT
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "wg_hotloop.h"
+
+/* ESP32-S3: poly1305_blocks() runs the hand-written Xtensa block function in
+ * poly1305_xtensa.S (same arithmetic, no register spills) once it has matched
+ * the C code below on fixed inputs; the C code then stays in flash as the
+ * fallback. Other targets and host builds use the C code only. */
+#ifndef POLY1305_XTENSA_ASM /* host tests may set it to drive the dispatcher with a stub */
+#if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3) && CONFIG_IDF_TARGET_ESP32S3
+#define POLY1305_XTENSA_ASM 1
+#else
+#define POLY1305_XTENSA_ASM 0
+#endif
+#endif
+#if POLY1305_XTENSA_ASM
+#define POLY1305_C_LOOP __attribute__((noinline)) /* flash; must not be inlined into the IRAM dispatcher */
+#include "esp_log.h"
+#else
+#define POLY1305_C_LOOP WG_HOT_LOOP
+#endif
 
 /* Mattboxx performance work (2026-10-31): each 16-byte block is read as four
  * little-endian words (one 32-bit load each when aligned on a little-endian
@@ -84,8 +104,8 @@ poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
 	st->final = 0;
 }
 
-static void WG_HOT_LOOP
-poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t bytes) {
+static void POLY1305_C_LOOP
+poly1305_blocks_c(poly1305_state_internal_t *st, const unsigned char *m, size_t bytes) {
 	const unsigned long hibit = (st->final) ? 0 : (1UL << 24); /* 1 << 128 */
 	unsigned long r0,r1,r2,r3,r4;
 	unsigned long s1,s2,s3,s4;
@@ -157,6 +177,91 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
 	st->h[2] = h2;
 	st->h[3] = h3;
 	st->h[4] = h4;
+}
+
+#if POLY1305_XTENSA_ASM
+/* poly1305_xtensa.S reads r and h at fixed offsets and needs a 4-byte aligned
+ * message whose length is a multiple of 16 (at least 16). */
+void poly1305_blocks_xtensa(poly1305_state_internal_t *st, const unsigned char *m, size_t bytes, unsigned long hibit);
+#if defined(__XTENSA__)
+_Static_assert(offsetof(poly1305_state_internal_t, r) == 0 && offsetof(poly1305_state_internal_t, h) == 20 &&
+               sizeof(unsigned long) == 4, "poly1305_xtensa.S state layout");
+#endif
+
+static int poly1305_asm_state; /* 0 unchecked, 1 verified, -1 rejected (C from then on) */
+
+static uint32_t
+poly1305_xorshift(uint32_t *x) {
+	*x ^= *x << 13; *x ^= *x >> 17; *x ^= *x << 5;
+	return *x;
+}
+
+/* Compare the assembly with poly1305_blocks_c() before its first use: all-ones
+ * inputs, then pseudo-random full 32-bit and clamped/real-sized limbs, both
+ * hibit values and 1-4 blocks. Both cores may run this at the same time; they
+ * compute and store the same result. */
+static POLY1305_NOINLINE int
+poly1305_asm_check(void) {
+	static const unsigned long clamp[5] = { 0x3ffffff, 0x3ffff03, 0x3ffc0ff, 0x3f03fff, 0x00fffff };
+	uint32_t x = 0x9e3779b9u, msg[16];
+	int ok = 1;
+	for (int round = 0; round < 64 && ok; round++) {
+		poly1305_state_internal_t a, b;
+		memset(&a, 0, sizeof(a));
+		for (int i = 0; i < 5; i++) {
+			uint32_t r = poly1305_xorshift(&x), h = poly1305_xorshift(&x);
+			a.r[i] = round == 0 ? 0xffffffffUL : (round & 1) ? (r & clamp[i]) : r;
+			a.h[i] = round == 0 ? 0xffffffffUL : (round & 1) ? (h & 0x7ffffff) : h;
+		}
+		for (int i = 0; i < 16; i++)
+			msg[i] = round == 0 ? 0xffffffffu : poly1305_xorshift(&x);
+		a.final = (unsigned char)((round >> 1) & 1);
+		b = a;
+		size_t bytes = poly1305_block_size * (size_t)(1 + (round >> 2) % 4);
+		poly1305_blocks_c(&a, (const unsigned char *)msg, bytes);
+		poly1305_blocks_xtensa(&b, (const unsigned char *)msg, bytes, b.final ? 0 : (1UL << 24));
+		ok = memcmp(a.h, b.h, sizeof(a.h)) == 0;
+	}
+	if (!ok)
+		ESP_LOGE("poly1305", "assembly block function disagrees with C; using C");
+	poly1305_asm_state = ok ? 1 : -1;
+	return poly1305_asm_state;
+}
+#endif
+
+static void WG_HOT_LOOP
+poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t bytes) {
+#if POLY1305_XTENSA_ASM
+	int state = poly1305_asm_state;
+	if (state == 0)
+		state = poly1305_asm_check();
+	if (state > 0) {
+		const unsigned long hibit = (st->final) ? 0 : (1UL << 24); /* 1 << 128 */
+		if (!((uintptr_t)m & 3)) {
+			if (bytes >= poly1305_block_size)
+				poly1305_blocks_xtensa(st, m, bytes & ~(size_t)(poly1305_block_size - 1), hibit);
+		} else {
+			uint32_t block[4]; /* unaligned input: one aligned copy per block */
+			for (; bytes >= poly1305_block_size; m += poly1305_block_size, bytes -= poly1305_block_size) {
+				memcpy(block, m, poly1305_block_size);
+				poly1305_blocks_xtensa(st, (const unsigned char *)block, poly1305_block_size, hibit);
+			}
+		}
+		return;
+	}
+#endif
+	poly1305_blocks_c(st, m, bytes);
+}
+
+/* 1: the Xtensa assembly is in use, -1: it was rejected by its check,
+ * 0: not checked yet or not built for this target. */
+int
+poly1305_asm_status(void) {
+#if POLY1305_XTENSA_ASM
+	return poly1305_asm_state;
+#else
+	return 0;
+#endif
 }
 
 POLY1305_NOINLINE void

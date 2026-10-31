@@ -4,6 +4,12 @@ set(ML_PERF_SRCS)
 if("$ENV{TSR_PERF_PROFILE}" STREQUAL "1")
     set(ML_PERF_SRCS "src/ml_perf.c")
 endif()
+# ESP32-S3 Poly1305 block function in assembly (checked against the C code
+# before first use; see poly1305-donna-32.h).
+set(WG_ASM_SRCS)
+if(IDF_TARGET STREQUAL "esp32s3")
+    set(WG_ASM_SRCS "src/crypto/refc/poly1305_xtensa.S")
+endif()
 
 idf_component_register(
     SRCS
@@ -16,6 +22,7 @@ idf_component_register(
         "src/crypto/refc/chacha20.c"
         "src/crypto/refc/chacha20poly1305.c"
         "src/crypto/refc/poly1305-donna.c"
+        ${WG_ASM_SRCS}
         "src/crypto/refc/x25519.c"
     INCLUDE_DIRS
         "src"

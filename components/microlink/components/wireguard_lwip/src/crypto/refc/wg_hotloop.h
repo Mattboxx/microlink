@@ -11,7 +11,10 @@
 #include "esp_attr.h"
 #endif
 
-#if defined(CONFIG_IDF_TARGET_ESP32S3) && CONFIG_IDF_TARGET_ESP32S3
+/* TSR_CRYPTO_IN_FLASH=1 (test builds only) keeps the loops in flash to
+ * measure what the IRAM placement is worth against its internal RAM. */
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && CONFIG_IDF_TARGET_ESP32S3 \
+	&& !(defined(TSR_CRYPTO_IN_FLASH) && TSR_CRYPTO_IN_FLASH)
 #define WG_HOT_LOOP IRAM_ATTR
 #else
 #define WG_HOT_LOOP

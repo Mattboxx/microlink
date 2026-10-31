@@ -19,6 +19,9 @@
 #include "lwip/netdb.h"
 #include <string.h>
 #include <errno.h>
+#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
+#include "esp_timer.h"
+#endif
 
 static const char *TAG = "ml_net_io";
 
@@ -71,6 +74,9 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
         .via_derp = false,
     };
 
+#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
+    pkt.enq_us = esp_timer_get_time();
+#endif
     switch (type) {
     case PKT_STUN:
         if (xQueueSend(ml->stun_rx_queue, &pkt, 0) != pdTRUE) {

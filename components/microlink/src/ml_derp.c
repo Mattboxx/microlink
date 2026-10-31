@@ -309,6 +309,9 @@ static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
         .via_derp = true,
     };
     memcpy(pkt.src_pubkey, src_pubkey, 32);
+#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
+    pkt.enq_us = esp_timer_get_time();
+#endif
 
     QueueHandle_t target = (type == PKT_DISCO) ? ml->disco_rx_queue : ml->wg_rx_queue;
     if (xQueueSend(target, &pkt, 0) != pdTRUE) {

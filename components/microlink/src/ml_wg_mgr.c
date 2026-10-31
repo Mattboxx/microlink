@@ -32,6 +32,7 @@
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
+#include "ml_perf.h"
 #include "mbedtls/base64.h"
 #include <string.h>
 #include <errno.h>
@@ -357,6 +358,18 @@ esp_err_t ml_wg_set_tx_copyfree(microlink_t *ml, bool on);
 static struct pbuf *wg_tx_pbuf_alloc_cb(u16_t len, void *ctx);
 static err_t wg_udp_pbuf_output_cb(uint32_t dest_ip, uint16_t dest_port, struct pbuf *p, void *ctx);
 void microlink_get_wg_tx_profile(uint32_t *pkts, uint64_t *us, bool reset) { wireguardif_tx_profile(pkts, us, reset); }
+#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
+size_t microlink_perf_profile(microlink_perf_stage_t *out, size_t max) {
+    ml_perf_counter_t c[ML_PERF_STAGES];
+    ml_perf_snapshot(c, 0);
+    size_t n = max < ML_PERF_STAGES ? max : ML_PERF_STAGES;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (microlink_perf_stage_t){ ml_perf_stage_names[i], c[i].total, c[i].bytes,
+                                           c[i].count, c[i].max, c[i].migrated };
+    }
+    return n;
+}
+#endif
 
 esp_err_t ml_wg_set_tx_copyfree(microlink_t *ml, bool on) {
     if (!ml || !ml->wg_netif) return ESP_ERR_INVALID_STATE;
@@ -1681,6 +1694,8 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * ========================================================================== */
 
 static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
+    ML_PERF_US(ML_PERF_RX_QUEUE_US, ML_PERF_NOW_US() - pkt->enq_us);
+    ML_PERF_BEGIN(perf_total);
     ESP_LOGD(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
              (int)pkt->len, pkt->via_derp,
              pkt->len >= 4 ? pkt->data[0] : -1,
@@ -1702,6 +1717,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
      * calls ip_input → tcpip_input which posts to the TCPIP thread.
      * With PBUF_REF the backing data would be freed before the TCPIP
      * thread processes the packet. */
+    ML_PERF_BEGIN(perf_copy);
     struct pbuf *p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
     if (!p) {
         free(pkt->data);
@@ -1709,6 +1725,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     }
     pbuf_take(p, pkt->data, pkt->len);
     free(pkt->data);  /* Original data no longer needed — pbuf has its own copy */
+    ML_PERF_END(ML_PERF_RX_COPY, perf_copy, pkt->len);
 
     /* Build source address */
     ip_addr_t addr;
@@ -1721,6 +1738,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     /* Call WG RX handler — pbuf is PBUF_RAM so data survives async delivery */
     wireguardif_network_rx(device, NULL, p, &addr, pkt->src_port);
+    ML_PERF_END(ML_PERF_RX_TOTAL, perf_total, pkt->len);
 }
 
 /* ============================================================================

@@ -1,5 +1,18 @@
 // Taken from https://github.com/floodyberry/poly1305-donna - public domain or MIT
+#include <stdint.h>
 #include "wg_hotloop.h"
+
+/* Mattboxx performance work (2026-10-31): each 16-byte block is read as four
+ * little-endian words (one 32-bit load each when aligned on a little-endian
+ * target, else four byte-assembled words) and split into the five 26-bit
+ * limbs with shifts, instead of five overlapping byte-assembled reads. The
+ * limbs and therefore the arithmetic are unchanged. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define POLY1305_WORD_LOAD 1
+typedef uint32_t __attribute__((may_alias)) poly1305_word_t;
+#else
+#define POLY1305_WORD_LOAD 0
+#endif
 /*
 	poly1305 implementation using 32 bit * 32 bit = 64 bit multiplication and 64 bit addition
 */
@@ -98,12 +111,23 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
 	h4 = st->h[4];
 
 	while (bytes >= poly1305_block_size) {
-		/* h += m[i] */
-		h0 += (U8TO32(m+ 0)     ) & 0x3ffffff;
-		h1 += (U8TO32(m+ 3) >> 2) & 0x3ffffff;
-		h2 += (U8TO32(m+ 6) >> 4) & 0x3ffffff;
-		h3 += (U8TO32(m+ 9) >> 6) & 0x3ffffff;
-		h4 += (U8TO32(m+12) >> 8) | hibit;
+		unsigned long t0, t1, t2, t3;
+#if POLY1305_WORD_LOAD
+		if (!((uintptr_t)m & 3)) {
+			const poly1305_word_t *w = (const poly1305_word_t *)m;
+			t0 = w[0]; t1 = w[1]; t2 = w[2]; t3 = w[3];
+		} else
+#endif
+		{
+			t0 = U8TO32(m + 0); t1 = U8TO32(m + 4); t2 = U8TO32(m + 8); t3 = U8TO32(m + 12);
+		}
+
+		/* h += m[i]: bits 0-25, 26-51, 52-77, 78-103 and 104-127 (+ hibit) */
+		h0 += t0 & 0x3ffffff;
+		h1 += ((t0 >> 26) | (t1 << 6)) & 0x3ffffff;
+		h2 += ((t1 >> 20) | (t2 << 12)) & 0x3ffffff;
+		h3 += ((t2 >> 14) | (t3 << 18)) & 0x3ffffff;
+		h4 += (t3 >> 8) | hibit;
 
 		/* h *= r */
 		d0 = ((unsigned long long)h0 * r0) + ((unsigned long long)h1 * s4) + ((unsigned long long)h2 * s3) + ((unsigned long long)h3 * s2) + ((unsigned long long)h4 * s1);

@@ -1,7 +1,15 @@
+# Test-only packet-path profiling counters (ml_perf.h): linked only into an
+# image built with TSR_PERF_PROFILE=1, so release images are unchanged.
+set(ML_PERF_SRCS)
+if("$ENV{TSR_PERF_PROFILE}" STREQUAL "1")
+    set(ML_PERF_SRCS "src/ml_perf.c")
+endif()
+
 idf_component_register(
     SRCS
         "src/wireguard.c"
         "src/wireguardif.c"
+        ${ML_PERF_SRCS}
         "src/crypto.c"
         "src/wireguard-platform-esp32.c"
         "src/crypto/refc/blake2s.c"

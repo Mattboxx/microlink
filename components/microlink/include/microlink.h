@@ -347,6 +347,18 @@ esp_err_t microlink_set_wg_tx_copyfree(microlink_t *ml, bool on);
 bool microlink_get_wg_tx_copyfree(const microlink_t *ml);
 void microlink_get_wg_tx_profile(uint32_t *pkts, uint64_t *us, bool reset);
 
+#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
+/* Test-only packet-path counters (wireguard_lwip ml_perf.h), cumulative since
+ * boot: cycles (microseconds for "rx_queue_us"), bytes, samples, maximum and
+ * samples discarded because the task changed core. Returns the stage count. */
+typedef struct {
+    const char *name;
+    uint64_t total, bytes;
+    uint32_t count, max, migrated;
+} microlink_perf_stage_t;
+size_t microlink_perf_profile(microlink_perf_stage_t *out, size_t max);
+#endif
+
 /* Returns the human-readable city name for a DERP region (from the
  * MapResponse DERPMap.RegionName field). Returns NULL if region_id is
  * unknown — the caller should fall through to a "?" placeholder. */

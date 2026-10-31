@@ -33,6 +33,7 @@
 // AEAD_CHACHA20_POLY1305 as described in https://tools.ietf.org/html/rfc7539
 // AEAD_XChaCha20_Poly1305 as described in https://tools.ietf.org/id/draft-arciszewski-xchacha-02.html
 #include "chacha20poly1305.h"
+#include "ml_perf.h"
 #include "chacha20.h"
 #include "poly1305-donna.h"
 
@@ -71,10 +72,13 @@ void chacha20poly1305_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len, 
 	size_t padded_len;
 
 	// First, a Poly1305 one-time key is generated from the 256-bit key and nonce using the procedure described in Section 2.6.
+	ML_PERF_BEGIN(perf_chacha);
 	generate_poly1305_key(&poly1305_state, &chacha20_state, key, nonce);
 
 	// Next, the ChaCha20 encryption function is called to encrypt the plaintext, using the same key and nonce, and with the initial counter set to 1.
 	chacha20(&chacha20_state, dst, src, src_len);
+	ML_PERF_END(ML_PERF_TX_CHACHA, perf_chacha, src_len);
+	ML_PERF_BEGIN(perf_poly);
 
 	// Finally, the Poly1305 function is called with the Poly1305 key calculated above, and a message constructed as a concatenation of the following:
 	// - The AAD
@@ -98,6 +102,7 @@ void chacha20poly1305_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len, 
 	// - A ciphertext of the same length as the plaintext. (above, output of chacha20 into dst)
 	// - A 128-bit tag, which is the output of the Poly1305 function. (append to dst)
 	poly1305_finish(&poly1305_state, dst + src_len);
+	ML_PERF_END(ML_PERF_TX_POLY, perf_poly, src_len);
 
 	// Make sure we leave nothing sensitive on the stack
 	crypto_zero(&chacha20_state, sizeof(chacha20_state));
@@ -123,6 +128,7 @@ bool chacha20poly1305_decrypt(uint8_t *dst, const uint8_t *src, size_t src_len, 
 		dst_len = src_len - POLY1305_MAC_SIZE;
 
 		// First, a Poly1305 one-time key is generated from the 256-bit key and nonce using the procedure described in Section 2.6.
+		ML_PERF_BEGIN(perf_poly);
 		generate_poly1305_key(&poly1305_state, &chacha20_state, key, nonce);
 
 		// Calculate the MAC before attempting decryption
@@ -149,12 +155,15 @@ bool chacha20poly1305_decrypt(uint8_t *dst, const uint8_t *src, size_t src_len, 
 		// - A plaintext of the same length as the ciphertext. (below, output of chacha20 into dst)
 		// - A 128-bit tag, which is the output of the Poly1305 function. (into mac for checking against passed mac)
 		poly1305_finish(&poly1305_state, mac);
+		ML_PERF_END(ML_PERF_RX_POLY, perf_poly, dst_len);
 
 
 		if (crypto_equal(mac, src + dst_len, POLY1305_MAC_SIZE)) {
 			// mac is correct - do the decryption
 			// Next, the ChaCha20 encryption function is called to decrypt the ciphertext, using the same key and nonce, and with the initial counter set to 1.
+			ML_PERF_BEGIN(perf_chacha);
 			chacha20(&chacha20_state, dst, src, dst_len);
+			ML_PERF_END(ML_PERF_RX_CHACHA, perf_chacha, dst_len);
 			result = true;
 		}
 	}

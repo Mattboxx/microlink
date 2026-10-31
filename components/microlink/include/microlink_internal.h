@@ -261,6 +261,9 @@ typedef struct {
     uint16_t src_port;          /* Source port (for UDP packets) */
     uint8_t src_pubkey[32];     /* Source peer key (for DERP packets) */
     bool via_derp;              /* true if received via DERP, false if direct UDP */
+#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
+    int64_t enq_us;             /* test-only profiling: time queued (ml_perf.h) */
+#endif
 } ml_rx_packet_t;
 
 /* Coordination command */

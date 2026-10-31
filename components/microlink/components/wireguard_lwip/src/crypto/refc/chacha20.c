@@ -109,6 +109,33 @@ static inline void INNER_BLOCK(uint32_t *block) {
 // case) is combined a 32-bit word at a time instead of serialising the key
 // stream byte by byte. Same algorithm and output; other lengths/alignments
 // use the byte path. In-place (out == in) is supported as before.
+// Xtensa has no rotate instruction: GCC emits SSAI (shift amount 32 - n) and a
+// funnel shift SRC x, x, x for every rotation. The four quarter rounds of a
+// column/diagonal round rotate by the same amount at the same step, so one
+// SSAI serves four SRCs. GCC does not model SAR as a register: every shift it
+// emits sets SAR immediately before use, and interrupts/context switches save
+// it, so overwriting it here needs no clobber. Portable C elsewhere.
+#if defined(__XTENSA__)
+#define ROTL32X4(n, a, b, c, d) \
+	__asm__ ("ssai %4\n\tsrc %0, %0, %0\n\tsrc %1, %1, %1\n\tsrc %2, %2, %2\n\tsrc %3, %3, %3" \
+	         : "+a"(a), "+a"(b), "+a"(c), "+a"(d) : "i"(32 - (n)))
+#else
+#define ROTL32X4(n, a, b, c, d) do { \
+	a = ROTL32(a, n); b = ROTL32(b, n); c = ROTL32(c, n); d = ROTL32(d, n); } while (0)
+#endif
+
+// Four quarter rounds (RFC 8439 2.1) advanced together, step by step.
+#define QUARTERROUND4(a0,b0,c0,d0, a1,b1,c1,d1, a2,b2,c2,d2, a3,b3,c3,d3) do { \
+	a0 += b0; a1 += b1; a2 += b2; a3 += b3; d0 ^= a0; d1 ^= a1; d2 ^= a2; d3 ^= a3; \
+	ROTL32X4(16, d0, d1, d2, d3); \
+	c0 += d0; c1 += d1; c2 += d2; c3 += d3; b0 ^= c0; b1 ^= c1; b2 ^= c2; b3 ^= c3; \
+	ROTL32X4(12, b0, b1, b2, b3); \
+	a0 += b0; a1 += b1; a2 += b2; a3 += b3; d0 ^= a0; d1 ^= a1; d2 ^= a2; d3 ^= a3; \
+	ROTL32X4(8, d0, d1, d2, d3); \
+	c0 += d0; c1 += d1; c2 += d2; c3 += d3; b0 ^= c0; b1 ^= c1; b2 ^= c2; b3 ^= c3; \
+	ROTL32X4(7, b0, b1, b2, b3); \
+} while (0)
+
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define CHACHA20_WORD_XOR 1
 typedef uint32_t __attribute__((may_alias)) chacha20_word_t;
@@ -128,14 +155,9 @@ void WG_HOT_LOOP chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t 
 		int i;
 
 		for (i = 0; i < 10; i++) {
-			QUARTERROUND(x0, x4, x8, x12);  // column 0
-			QUARTERROUND(x1, x5, x9, x13);  // column 1
-			QUARTERROUND(x2, x6, x10, x14); // column 2
-			QUARTERROUND(x3, x7, x11, x15); // column 3
-			QUARTERROUND(x0, x5, x10, x15); // diagonal 1
-			QUARTERROUND(x1, x6, x11, x12); // diagonal 2
-			QUARTERROUND(x2, x7, x8, x13);  // diagonal 3
-			QUARTERROUND(x3, x4, x9, x14);  // diagonal 4
+			// columns 0-3, then diagonals 1-4
+			QUARTERROUND4(x0, x4, x8, x12, x1, x5, x9, x13, x2, x6, x10, x14, x3, x7, x11, x15);
+			QUARTERROUND4(x0, x5, x10, x15, x1, x6, x11, x12, x2, x7, x8, x13, x3, x4, x9, x14);
 		}
 		x0 += s[0];   x1 += s[1];   x2 += s[2];   x3 += s[3];
 		x4 += s[4];   x5 += s[5];   x6 += s[6];   x7 += s[7];

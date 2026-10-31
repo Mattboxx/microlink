@@ -2251,6 +2251,14 @@ static void dump_wg_state_snapshot(microlink_t *ml) {
  * WG Manager Task
  * ========================================================================== */
 
+/* Manager rest policy (pure; host-tested): rest the full 10 ms while WG frames
+ * are still queued or after WG_MGR_MAX_BUSY_MS of work without a real rest. */
+#define WG_MGR_MAX_BUSY_MS 40
+#define WG_MGR_REST_MS     5
+static inline bool wg_mgr_must_rest(bool frames_waiting, uint64_t busy_ms) {
+    return frames_waiting || busy_ms >= WG_MGR_MAX_BUSY_MS;
+}
+
 void ml_wg_mgr_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     EventBits_t startup = xEventGroupWaitBits(ml->events,
@@ -2326,9 +2334,11 @@ void ml_wg_mgr_task(void *arg) {
     uint32_t budget_hits_10s = 0;       /* iterations that hit the DISCO burst/time budget with work left */
     uint64_t budget_start_ms = 0;
     #define WG_MGR_BUDGET_LEFT(ms) ((ml_get_time_ms() - budget_start_ms) < (ms))
+    uint64_t busy_ms = 0;               /* work since the last real rest (see the end of the loop) */
 
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         budget_start_ms = ml_get_time_ms();   /* DISCO budget window */
+        const uint64_t iteration_start_ms = budget_start_ms;
 
         /* Process peer updates from coord task */
         process_peer_updates(ml);
@@ -2468,11 +2478,23 @@ void ml_wg_mgr_task(void *arg) {
             last_snapshot_ms = now;
         }
 
-        /* Yield - 10ms loop rate for minimum packet processing latency.
-         * Each wake is cheap: queue check + event bits check, no crypto.
-         * This sleep is what hands the core to lower-priority tasks; the
-         * budgets above guarantee it is reached every iteration (#46). */
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* Rest or wait (#46 and latency, 2026-10-31). The 10 ms sleep is what
+         * hands the core to lower-priority tasks; it is still taken whenever
+         * WG frames remain queued (saturated) or after WG_MGR_MAX_BUSY_MS of
+         * work without a real rest. Otherwise the task waits on wg_rx_wake,
+         * given by net_io/DERP RX per queued frame, so a frame is handled at
+         * once instead of at the next 10 ms poll (that poll alone added up to
+         * one tick of latency to every tunnelled packet). A wait that really
+         * blocked for WG_MGR_REST_MS counts as a rest. */
+        uint64_t iteration_end_ms = ml_get_time_ms();
+        busy_ms += iteration_end_ms - iteration_start_ms;
+        if (wg_mgr_must_rest(uxQueueMessagesWaiting(ml->wg_rx_queue) > 0, busy_ms)) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            busy_ms = 0;
+        } else {
+            (void)xSemaphoreTake(ml->wg_rx_wake, pdMS_TO_TICKS(10));
+            if (ml_get_time_ms() - iteration_end_ms >= WG_MGR_REST_MS) busy_ms = 0;
+        }
     }
     #undef WG_MGR_BUDGET_LEFT
 

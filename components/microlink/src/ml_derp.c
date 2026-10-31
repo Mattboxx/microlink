@@ -323,6 +323,8 @@ static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
             ESP_LOGW(TAG, "DERP-RX queue full: dropped %lu (type=%d)",
                      (unsigned long)derp_rx_drops, (int)type);
         free(data);
+    } else if (target == ml->wg_rx_queue) {
+        xSemaphoreGive(ml->wg_rx_wake);   /* wake wg_mgr now, not at its next 10 ms poll */
     }
 }
 

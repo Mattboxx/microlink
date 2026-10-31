@@ -91,7 +91,7 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
 	unsigned long s1,s2,s3,s4;
 	unsigned long h0,h1,h2,h3,h4;
 	unsigned long long d0,d1,d2,d3,d4;
-	unsigned long c;
+	unsigned long c,g0,g1,g2,g3;
 
 	r0 = st->r[0];
 	r1 = st->r[1];
@@ -129,21 +129,24 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
 		h3 += ((t2 >> 14) | (t3 << 18)) & 0x3ffffff;
 		h4 += (t3 >> 8) | hibit;
 
-		/* h *= r */
+		/* h *= r, then (partial) h %= p. Each d_i is finished and carried
+		 * before the next one is formed (the same products, carries and
+		 * result as computing d0..d4 first): only one 64-bit accumulator is
+		 * live, so a 16-register core does not spill five of them. */
 		d0 = ((unsigned long long)h0 * r0) + ((unsigned long long)h1 * s4) + ((unsigned long long)h2 * s3) + ((unsigned long long)h3 * s2) + ((unsigned long long)h4 * s1);
-		d1 = ((unsigned long long)h0 * r1) + ((unsigned long long)h1 * r0) + ((unsigned long long)h2 * s4) + ((unsigned long long)h3 * s3) + ((unsigned long long)h4 * s2);
-		d2 = ((unsigned long long)h0 * r2) + ((unsigned long long)h1 * r1) + ((unsigned long long)h2 * r0) + ((unsigned long long)h3 * s4) + ((unsigned long long)h4 * s3);
-		d3 = ((unsigned long long)h0 * r3) + ((unsigned long long)h1 * r2) + ((unsigned long long)h2 * r1) + ((unsigned long long)h3 * r0) + ((unsigned long long)h4 * s4);
-		d4 = ((unsigned long long)h0 * r4) + ((unsigned long long)h1 * r3) + ((unsigned long long)h2 * r2) + ((unsigned long long)h3 * r1) + ((unsigned long long)h4 * r0);
-
-		/* (partial) h %= p */
-		              c = (unsigned long)(d0 >> 26); h0 = (unsigned long)d0 & 0x3ffffff;
-		d1 += c;      c = (unsigned long)(d1 >> 26); h1 = (unsigned long)d1 & 0x3ffffff;
-		d2 += c;      c = (unsigned long)(d2 >> 26); h2 = (unsigned long)d2 & 0x3ffffff;
-		d3 += c;      c = (unsigned long)(d3 >> 26); h3 = (unsigned long)d3 & 0x3ffffff;
-		d4 += c;      c = (unsigned long)(d4 >> 26); h4 = (unsigned long)d4 & 0x3ffffff;
-		h0 += c * 5;  c =                (h0 >> 26); h0 =                h0 & 0x3ffffff;
-		h1 += c;
+		c = (unsigned long)(d0 >> 26); g0 = (unsigned long)d0 & 0x3ffffff;
+		d1 = ((unsigned long long)h0 * r1) + ((unsigned long long)h1 * r0) + ((unsigned long long)h2 * s4) + ((unsigned long long)h3 * s3) + ((unsigned long long)h4 * s2) + c;
+		c = (unsigned long)(d1 >> 26); g1 = (unsigned long)d1 & 0x3ffffff;
+		d2 = ((unsigned long long)h0 * r2) + ((unsigned long long)h1 * r1) + ((unsigned long long)h2 * r0) + ((unsigned long long)h3 * s4) + ((unsigned long long)h4 * s3) + c;
+		c = (unsigned long)(d2 >> 26); g2 = (unsigned long)d2 & 0x3ffffff;
+		d3 = ((unsigned long long)h0 * r3) + ((unsigned long long)h1 * r2) + ((unsigned long long)h2 * r1) + ((unsigned long long)h3 * r0) + ((unsigned long long)h4 * s4) + c;
+		c = (unsigned long)(d3 >> 26); g3 = (unsigned long)d3 & 0x3ffffff;
+		d4 = ((unsigned long long)h0 * r4) + ((unsigned long long)h1 * r3) + ((unsigned long long)h2 * r2) + ((unsigned long long)h3 * r1) + ((unsigned long long)h4 * r0) + c;
+		c = (unsigned long)(d4 >> 26); h4 = (unsigned long)d4 & 0x3ffffff;
+		h0 = g0 + c * 5;  c = (h0 >> 26); h0 = h0 & 0x3ffffff;
+		h1 = g1 + c;
+		h2 = g2;
+		h3 = g3;
 
 		m += poly1305_block_size;
 		bytes -= poly1305_block_size;

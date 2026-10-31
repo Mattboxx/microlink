@@ -524,6 +524,7 @@ struct microlink_s {
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
     QueueHandle_t disco_rx_queue;       /* net_io -> wg_mgr */
     QueueHandle_t wg_rx_queue;          /* net_io -> wg_mgr */
+    SemaphoreHandle_t wg_rx_wake;       /* given per queued WG frame: wakes wg_mgr early; lives as long as the queue */
     QueueHandle_t stun_rx_queue;        /* net_io -> coord */
     QueueHandle_t coord_cmd_queue;      /* any -> coord */
     QueueHandle_t peer_update_queue;    /* coord -> wg_mgr */

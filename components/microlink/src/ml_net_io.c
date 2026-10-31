@@ -95,6 +95,8 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
                 ESP_LOGW(TAG, "WG-RX(direct) queue full: dropped %lu",
                          (unsigned long)wg_rx_drops);
             free(data);  /* Queue full, drop */
+        } else {
+            xSemaphoreGive(ml->wg_rx_wake);   /* wake wg_mgr now, not at its next 10 ms poll */
         }
         break;
     default:

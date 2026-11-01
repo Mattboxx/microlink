@@ -53,8 +53,15 @@ extern "C" {
  * wg_mgr ~4.3K. Trimmed only the clearly-oversized ones, keeping a generous
  * margin over the observed peak (TLS handshakes can spike). coord/wg_mgr
  * left as-is — they run closer to their ceiling. */
+/* Data-plane receive tasks run at the TCPIP thread priority (18; Wi-Fi is 23).
+ * At 7, a saturating LAN->tunnel upload kept the TCPIP thread busy encrypting
+ * and the receive side starved: on 3.0.7-dev.11 a 4-stream upload lost
+ * ~8,600 frames at a full wg_rx_queue and ~8,900 more in the socket, mostly
+ * the returning TCP ACKs, so flows stalled in retransmission backoff. */
+#define ML_TASK_DATAPLANE_PRIO  18
+
 #define ML_TASK_NET_IO_STACK    (6 * 1024)   /* was 8K; ~3K peak observed */
-#define ML_TASK_NET_IO_PRIO     7
+#define ML_TASK_NET_IO_PRIO     ML_TASK_DATAPLANE_PRIO
 #define ML_TASK_NET_IO_CORE     0
 
 #define ML_TASK_DERP_TX_STACK   (10 * 1024)  /* was 14K; ~3.7K peak observed */
@@ -66,7 +73,7 @@ extern "C" {
 #define ML_TASK_COORD_CORE      1
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
-#define ML_TASK_WG_MGR_PRIO     7
+#define ML_TASK_WG_MGR_PRIO     ML_TASK_DATAPLANE_PRIO
 #define ML_TASK_WG_MGR_CORE     1
 
 /* Queue depths */

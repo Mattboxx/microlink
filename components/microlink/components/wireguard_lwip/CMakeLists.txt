@@ -4,11 +4,11 @@ set(ML_PERF_SRCS)
 if("$ENV{TSR_PERF_PROFILE}" STREQUAL "1")
     set(ML_PERF_SRCS "src/ml_perf.c")
 endif()
-# ESP32-S3 Poly1305 block function in assembly (checked against the C code
-# before first use; see poly1305-donna-32.h).
+# ESP32-S3 Poly1305 and ChaCha20 block functions in assembly (each checked
+# against the C code before first use; see poly1305-donna-32.h, chacha20.c).
 set(WG_ASM_SRCS)
 if(IDF_TARGET STREQUAL "esp32s3")
-    set(WG_ASM_SRCS "src/crypto/refc/poly1305_xtensa.S")
+    set(WG_ASM_SRCS "src/crypto/refc/poly1305_xtensa.S" "src/crypto/refc/chacha20_xtensa.S")
 endif()
 
 idf_component_register(

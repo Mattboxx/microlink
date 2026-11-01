@@ -87,6 +87,21 @@ void wireguardif_tx_profile(uint32_t *pkts, uint64_t *us, bool reset) {
 }
 static StaticSemaphore_t s_wg_tx_lock_buf;
 
+/* Transport-data packets lost on the way out since boot: the socket layer
+ * refused the send, or no output buffer could be allocated. Two writers
+ * (TCPIP thread, WireGuard manager task). Read: wireguardif_tx_drops(). */
+static volatile uint32_t s_wg_tx_send_failed;
+static volatile uint32_t s_wg_tx_alloc_failed;
+
+static inline void wg_tx_count_drop(volatile uint32_t *counter) {
+	__atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
+}
+
+void wireguardif_tx_drops(uint32_t *send_failed, uint32_t *alloc_failed) {
+	if (send_failed) *send_failed = __atomic_load_n(&s_wg_tx_send_failed, __ATOMIC_RELAXED);
+	if (alloc_failed) *alloc_failed = __atomic_load_n(&s_wg_tx_alloc_failed, __ATOMIC_RELAXED);
+}
+
 #include "ml_perf.h"
 
 #include <stdio.h>
@@ -492,6 +507,7 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 				ML_PERF_BEGIN(perf_output);
 				result = wireguardif_peer_output(netif, pbuf, peer);
 				ML_PERF_END(ML_PERF_TX_OUTPUT, perf_output, pbuf->tot_len);
+				if (result != ERR_OK) wg_tx_count_drop(&s_wg_tx_send_failed);
 				WG_DEBUG("[WG_TX] peer_output result=%d\n", result);
 			
 
@@ -531,6 +547,7 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 
 			} else {
 				// Failed to allocate memory
+				wg_tx_count_drop(&s_wg_tx_alloc_failed);
 				result = ERR_MEM;
 			}
 		} else {

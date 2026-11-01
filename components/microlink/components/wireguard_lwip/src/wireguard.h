@@ -324,6 +324,8 @@ void wireguard_expire_handshake(struct wireguard_peer *peer);
 
 struct wireguard_keypair *get_peer_keypair_for_idx(struct wireguard_peer *peer, uint32_t idx);
 bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq);
+/* Counter numbers skipped / filled late on receive since boot (see wireguard.c). */
+void wireguard_rx_seq_stats(uint32_t *gap, uint32_t *late);
 
 uint8_t wireguard_get_message_type(const uint8_t *data, size_t len);
 

@@ -319,6 +319,8 @@ static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
          * (wg_rx_queue depth) can decrypt/forward. Rate-limited so a flood
          * doesn't itself spam the SD recorder. */
         static uint32_t derp_rx_drops = 0;
+        if (target == ml->wg_rx_queue)
+            ml_count_wg_rx_queue_drop();
         if ((++derp_rx_drops & 0x1F) == 1)
             ESP_LOGW(TAG, "DERP-RX queue full: dropped %lu (type=%d)",
                      (unsigned long)derp_rx_drops, (int)type);

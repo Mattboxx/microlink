@@ -91,6 +91,7 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
     case PKT_WIREGUARD:
         if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
             static uint32_t wg_rx_drops = 0;
+            ml_count_wg_rx_queue_drop();
             if ((++wg_rx_drops & 0x1F) == 1)
                 ESP_LOGW(TAG, "WG-RX(direct) queue full: dropped %lu",
                          (unsigned long)wg_rx_drops);
@@ -104,6 +105,9 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
         break;
     }
 }
+
+/* Datagrams read from the WireGuard/DISCO socket per select() wake-up. */
+#define ML_NET_IO_DRAIN_MAX 16
 
 void ml_net_io_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
@@ -154,13 +158,20 @@ void ml_net_io_task(void *arg) {
         }
         if (sel == 0) continue;  /* Timeout */
 
-        /* Process DISCO UDP socket */
+        /* Process DISCO UDP socket. It also carries the WireGuard data plane:
+         * drain what lwIP already queued (only CONFIG_LWIP_UDP_RECVMBOX_SIZE
+         * datagrams per socket, the rest is dropped silently) instead of one
+         * datagram per select(). AT (cellular) sockets keep one read. */
         if (ml->disco_sock4 >= 0 && FD_ISSET(ml->disco_sock4, &read_fds)) {
+          int budget = ml_at_socket_is_at_fd(ml->disco_sock4) ? 1 : ML_NET_IO_DRAIN_MAX;
+          for (int drained = 0; drained < budget; drained++) {
             struct sockaddr_in src_addr;
             socklen_t addr_len = sizeof(src_addr);
-            int n = ml_recvfrom(ml->disco_sock4, udp_buf, sizeof(udp_buf), 0,
+            int n = ml_recvfrom(ml->disco_sock4, udp_buf, sizeof(udp_buf), drained ? MSG_DONTWAIT : 0,
                              (struct sockaddr *)&src_addr, &addr_len);
-            if (n > 0) {
+            if (n <= 0)
+                break;
+            {
                 /* PSRAM, not plain malloc(): with SPIRAM_MALLOC_ALWAYSINTERNAL
                  * a ~1.4 KB copy lands in internal RAM, and this socket also
                  * carries the WireGuard data plane. A download through an exit
@@ -176,6 +187,7 @@ void ml_net_io_task(void *arg) {
                     route_udp_packet(ml, pkt_data, n, src_ip, src_port);
                 }
             }
+          }
         }
 
         /* Process STUN socket (IPv4) */

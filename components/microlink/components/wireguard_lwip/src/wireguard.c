@@ -318,6 +318,19 @@ static void wireguard_kdf3(uint8_t *tau1, uint8_t *tau2, uint8_t *tau3, const ui
 	crypto_zero(output, sizeof(output));
 }
 
+/* Loss before decryption, seen from the authenticated counter sequence:
+ * numbers skipped when a larger counter arrives (gap), and skipped numbers
+ * that arrived later inside the replay window (late). gap - late = transport
+ * data packets that never reached the decrypt step (air, socket, queue).
+ * Jumps beyond WG_RX_GAP_MAX (rekey, peer restart) are not counted. */
+#define WG_RX_GAP_MAX 1024u
+static volatile uint32_t s_wg_rx_seq_gap, s_wg_rx_seq_late;
+
+void wireguard_rx_seq_stats(uint32_t *gap, uint32_t *late) {
+	if (gap) *gap = __atomic_load_n(&s_wg_rx_seq_gap, __ATOMIC_RELAXED);
+	if (late) *late = __atomic_load_n(&s_wg_rx_seq_late, __ATOMIC_RELAXED);
+}
+
 bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 	// Implementation of packet replay window - as per RFC2401
 	// Adapted from code in Appendix C at https://tools.ietf.org/html/rfc2401
@@ -333,6 +346,8 @@ bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 		if (seq > keypair->replay_counter) {
 			// new larger sequence number
 			diff = seq - keypair->replay_counter;
+			if (diff - 1 <= WG_RX_GAP_MAX && diff > 1)
+				__atomic_fetch_add(&s_wg_rx_seq_gap, (uint32_t)(diff - 1), __ATOMIC_RELAXED);
 			if (diff < ReplayWindowSize) {
 				// In window
 				keypair->replay_bitmap <<= diff;
@@ -353,6 +368,7 @@ bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 				} else {
 					// mark as seen
 					keypair->replay_bitmap |= ((uint32_t)1 << diff);
+					__atomic_fetch_add(&s_wg_rx_seq_late, 1, __ATOMIC_RELAXED);
 					// out of order but good
 					result = true;
 				}

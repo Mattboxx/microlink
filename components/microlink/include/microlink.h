@@ -345,6 +345,8 @@ int microlink_get_derp_rtts(const microlink_t *ml, microlink_derp_rtt_t *out, in
  * counts packets and microseconds from output-pbuf allocation to release; reset clears both. */
 esp_err_t microlink_set_wg_tx_copyfree(microlink_t *ml, bool on);
 bool microlink_get_wg_tx_copyfree(const microlink_t *ml);
+/* WireGuard frames dropped because wg_rx_queue was full (direct UDP and DERP), since boot. */
+uint32_t microlink_wg_rx_queue_drops(void);
 void microlink_get_wg_tx_profile(uint32_t *pkts, uint64_t *us, bool reset);
 
 #if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE

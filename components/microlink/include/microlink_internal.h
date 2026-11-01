@@ -856,6 +856,8 @@ static inline ssize_t ml_sendto(int fd, const void *buf, size_t len, int flags,
     return sendto(fd, buf, len, flags, addr, addrlen);
 }
 
+void ml_count_wg_rx_queue_drop(void);   /* microlink.c */
+
 static inline ssize_t ml_recvfrom(int fd, void *buf, size_t len, int flags,
                                     struct sockaddr *addr, socklen_t *addrlen) {
     if (ml_at_socket_is_at_fd(fd))

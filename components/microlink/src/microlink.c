@@ -830,6 +830,11 @@ const char *microlink_get_derp_region_name(const microlink_t *ml, uint16_t regio
 esp_err_t microlink_set_wg_tx_copyfree(microlink_t *ml, bool on) { return ml_wg_set_tx_copyfree(ml, on); }
 bool microlink_get_wg_tx_copyfree(const microlink_t *ml) { return ml ? ml->wg_tx_copyfree : false; }
 
+/* Written by the net I/O and DERP tasks; read by the operations API. */
+static volatile uint32_t s_wg_rx_queue_drops;
+void ml_count_wg_rx_queue_drop(void) { __atomic_fetch_add(&s_wg_rx_queue_drops, 1, __ATOMIC_RELAXED); }
+uint32_t microlink_wg_rx_queue_drops(void) { return __atomic_load_n(&s_wg_rx_queue_drops, __ATOMIC_RELAXED); }
+
 int microlink_get_derp_rtts(const microlink_t *ml, microlink_derp_rtt_t *out, int max) {
     if (!ml || !out || max <= 0) return 0;
     int count = 0;

@@ -143,10 +143,10 @@ typedef uint32_t __attribute__((may_alias)) chacha20_word_t;
 #define CHACHA20_WORD_XOR 0
 #endif
 
-// Kept in flash: measured on the ESP32-S3 (2026-10-31) the fused loop costs
-// only 7-15 % more cycles from flash, while IRAM would take about 1 KB of
-// internal RAM; Poly1305 keeps its IRAM placement (16-29 % slower from flash).
-void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
+// In IRAM on the ESP32-S3 (owner choice 2026-11-01: speed before ~1 KB of
+// internal RAM). Measured from flash the fused loop cost 7-15 % more cycles
+// (dev.5/dev.6) and 27 / 15 % in dev.8 (51.0 / 38.1 vs 40.1 / 33.0 cyc/B).
+void WG_HOT_LOOP chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
 	const uint32_t *s = ctx->state;
 
 	while (len) {

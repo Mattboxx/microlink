@@ -42,6 +42,25 @@
 #include "../../crypto.h"
 #include "wg_hotloop.h"
 
+/* ESP32-S3: whole 4-byte aligned blocks run the hand-written Xtensa block
+ * function in chacha20_xtensa.S (same algorithm, state kept in registers)
+ * once it has matched the C code below; partial or unaligned blocks use its
+ * key stream one block at a time and the C code stays in flash as the
+ * fallback. Other targets and host builds use the C code only. */
+#ifndef CHACHA20_XTENSA_ASM /* host tests may set it to drive the dispatcher with a stub */
+#if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3) && CONFIG_IDF_TARGET_ESP32S3
+#define CHACHA20_XTENSA_ASM 1
+#else
+#define CHACHA20_XTENSA_ASM 0
+#endif
+#endif
+#if CHACHA20_XTENSA_ASM
+#define CHACHA20_C_LOOP __attribute__((noinline)) /* flash; must not be inlined into the IRAM dispatcher */
+#include "esp_log.h"
+#else
+#define CHACHA20_C_LOOP WG_HOT_LOOP
+#endif
+
 // 2.3.  The ChaCha20 Block Function
 // The first four words (0-3) are constants: 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574
 static const uint32_t CHACHA20_CONSTANT_1 = 0x61707865;
@@ -143,10 +162,11 @@ typedef uint32_t __attribute__((may_alias)) chacha20_word_t;
 #define CHACHA20_WORD_XOR 0
 #endif
 
-// In IRAM on the ESP32-S3 (owner choice 2026-11-01: speed before ~1 KB of
-// internal RAM). Measured from flash the fused loop cost 7-15 % more cycles
-// (dev.5/dev.6) and 27 / 15 % in dev.8 (51.0 / 38.1 vs 40.1 / 33.0 cyc/B).
-void WG_HOT_LOOP chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
+// In IRAM on the ESP32-S3 when it is the data path (owner choice 2026-11-01:
+// speed before ~1 KB of internal RAM). Measured from flash the fused loop cost
+// 7-15 % more cycles (dev.5/dev.6) and 27 / 15 % in dev.8 (51.0 / 38.1 vs
+// 40.1 / 33.0 cyc/B). With the assembly it is only the checked fallback.
+static void CHACHA20_C_LOOP chacha20_c(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
 	const uint32_t *s = ctx->state;
 
 	while (len) {
@@ -193,6 +213,91 @@ void WG_HOT_LOOP chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t 
 	}
 }
 
+
+#if CHACHA20_XTENSA_ASM
+/* chacha20_xtensa.S: whole blocks, 4-byte aligned out/in (equal or not
+ * overlapping), blocks >= 1; increments state[12] once per block. */
+void chacha20_blocks_xtensa(uint32_t *state, uint32_t *out, const uint32_t *in, uint32_t blocks);
+
+static int chacha20_asm_state; /* 0 unchecked, 1 verified, -1 rejected (C from then on) */
+
+static uint32_t chacha20_xorshift(uint32_t *x) {
+	*x ^= *x << 13; *x ^= *x >> 17; *x ^= *x << 5;
+	return *x;
+}
+
+/* Compare the assembly with chacha20_c() before its first use: an all-ones
+ * state, a block counter about to wrap and pseudo-random states, one block
+ * into a separate buffer or two blocks in place. The C code encrypts the
+ * pattern, the assembly then encrypts that result again from the same state:
+ * the pattern comes back only if both key streams are equal, and both must
+ * leave the same state. Both cores may run this at the same time; they
+ * compute and store the same result. */
+static __attribute__((noinline)) int chacha20_asm_check(void) {
+	uint32_t x = 0x6a09e667u, buf[32];
+	int ok = 1;
+	for (int round = 0; round < 16 && ok; round++) {
+		struct chacha20_ctx a, b;
+		for (int i = 0; i < 16; i++)
+			a.state[i] = round == 0 ? 0xffffffffu : chacha20_xorshift(&x);
+		if (round == 1)
+			a.state[12] = 0xffffffffu;
+		b = a;
+		uint32_t seed = x, blocks = 1 + (round & 1), *dst = blocks == 1 ? buf + 16 : buf;
+		for (uint32_t i = 0; i < 16 * blocks; i++)
+			buf[i] = chacha20_xorshift(&x);
+		chacha20_c(&a, (uint8_t *)buf, (const uint8_t *)buf, CHACHA20_BLOCK_SIZE * blocks);
+		chacha20_blocks_xtensa(b.state, dst, buf, blocks);
+		ok = memcmp(a.state, b.state, sizeof(a.state)) == 0;
+		for (uint32_t i = 0; i < 16 * blocks && ok; i++)
+			ok = dst[i] == chacha20_xorshift(&seed);
+	}
+	if (!ok)
+		ESP_LOGE("chacha20", "assembly block function disagrees with C; using C");
+	chacha20_asm_state = ok ? 1 : -1;
+	return chacha20_asm_state;
+}
+#endif
+
+void WG_HOT_LOOP chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
+#if CHACHA20_XTENSA_ASM
+	int state = chacha20_asm_state;
+	if (state == 0)
+		state = chacha20_asm_check();
+	if (state > 0) {
+		uint32_t blocks = len / CHACHA20_BLOCK_SIZE;
+		if (blocks && !(((uintptr_t)in | (uintptr_t)out) & 3)) {
+			chacha20_blocks_xtensa(ctx->state, (uint32_t *)out, (const uint32_t *)in, blocks);
+			len -= blocks * CHACHA20_BLOCK_SIZE;
+			out += blocks * CHACHA20_BLOCK_SIZE;
+			in += blocks * CHACHA20_BLOCK_SIZE;
+		}
+		while (len) { /* partial or unaligned: one key-stream block at a time */
+			uint32_t ks[16] = { 0 };
+			const uint8_t *k = (const uint8_t *)ks;
+			uint32_t n = len < CHACHA20_BLOCK_SIZE ? len : CHACHA20_BLOCK_SIZE, j;
+			chacha20_blocks_xtensa(ctx->state, ks, ks, 1);
+			for (j = 0; j < n; j++)
+				out[j] = in[j] ^ k[j];
+			len -= n;
+			out += n;
+			in += n;
+		}
+		return;
+	}
+#endif
+	chacha20_c(ctx, out, in, len);
+}
+
+/* 1: the Xtensa assembly is in use, -1: it was rejected by its check,
+ * 0: not checked yet or not built for this target. */
+int chacha20_asm_status(void) {
+#if CHACHA20_XTENSA_ASM
+	return chacha20_asm_state;
+#else
+	return 0;
+#endif
+}
 
 // 2.3.  The ChaCha20 Block Function
 // The first four words (0-3) are constants: 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574

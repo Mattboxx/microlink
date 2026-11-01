@@ -48,6 +48,8 @@ struct chacha20_ctx {
 
 void chacha20_init(struct chacha20_ctx *ctx, const uint8_t *key, const uint64_t nonce);
 void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len);
+/* 1: ESP32-S3 assembly block function in use, -1: rejected by its check, 0: unchecked/not built. */
+int chacha20_asm_status(void);
 void hchacha20(uint8_t *out, const uint8_t *nonce, const uint8_t *key);
 
 #endif /* _CHACHA20_H_ */

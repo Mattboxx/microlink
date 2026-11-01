@@ -209,6 +209,8 @@ void wireguardif_set_tx_pbuf_output(struct netif *netif, wireguard_tx_pbuf_alloc
 void wireguardif_tx_profile(uint32_t *pkts, uint64_t *us, bool reset);
 /* Transport-data packets lost on the way out since boot (send refused, no buffer). */
 void wireguardif_tx_drops(uint32_t *send_failed, uint32_t *alloc_failed);
+/* Decrypted packets refused by netif->input (TCPIP mailbox full), since boot. */
+uint32_t wireguardif_rx_input_refused(void);
 
 // Force all peer output through DERP relay callback (cellular mode).
 // When enabled, peer_output always uses DERP even if peer has a direct endpoint.

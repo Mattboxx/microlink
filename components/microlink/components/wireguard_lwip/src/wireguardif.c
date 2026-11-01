@@ -97,6 +97,13 @@ static inline void wg_tx_count_drop(volatile uint32_t *counter) {
 	__atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
 }
 
+/* Decrypted packets refused by netif->input (tcpip_input: TCPIP mailbox full). */
+static volatile uint32_t s_wg_rx_input_refused;
+
+uint32_t wireguardif_rx_input_refused(void) {
+	return __atomic_load_n(&s_wg_rx_input_refused, __ATOMIC_RELAXED);
+}
+
 void wireguardif_tx_drops(uint32_t *send_failed, uint32_t *alloc_failed) {
 	if (send_failed) *send_failed = __atomic_load_n(&s_wg_tx_send_failed, __ATOMIC_RELAXED);
 	if (alloc_failed) *alloc_failed = __atomic_load_n(&s_wg_tx_alloc_failed, __ATOMIC_RELAXED);
@@ -849,6 +856,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 										if (device->netif->input(pbuf, device->netif) == ERR_OK) {
 										pbuf = NULL;
 										} else {
+											wg_tx_count_drop(&s_wg_rx_input_refused);
 											WG_DEBUG("[WG_RX_IP] DROPPED: input failed\n");
 										}
 									}

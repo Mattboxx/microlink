@@ -108,6 +108,11 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
 
 /* Datagrams read from the WireGuard/DISCO socket per select() wake-up. */
 #define ML_NET_IO_DRAIN_MAX 16
+#ifdef CONFIG_ML_ENABLE_CELLULAR
+#define ML_NET_IO_DRAIN_BUDGET(fd) (ml_at_socket_is_at_fd(fd) ? 1 : ML_NET_IO_DRAIN_MAX)
+#else
+#define ML_NET_IO_DRAIN_BUDGET(fd) ML_NET_IO_DRAIN_MAX
+#endif
 
 void ml_net_io_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
@@ -163,7 +168,7 @@ void ml_net_io_task(void *arg) {
          * datagrams per socket, the rest is dropped silently) instead of one
          * datagram per select(). AT (cellular) sockets keep one read. */
         if (ml->disco_sock4 >= 0 && FD_ISSET(ml->disco_sock4, &read_fds)) {
-          int budget = ml_at_socket_is_at_fd(ml->disco_sock4) ? 1 : ML_NET_IO_DRAIN_MAX;
+          int budget = ML_NET_IO_DRAIN_BUDGET(ml->disco_sock4);
           for (int drained = 0; drained < budget; drained++) {
             struct sockaddr_in src_addr;
             socklen_t addr_len = sizeof(src_addr);

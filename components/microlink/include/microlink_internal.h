@@ -819,6 +819,9 @@ uint64_t ml_get_time_ms(void);
 
 #include "ml_at_socket.h"
 
+/* Counts a WireGuard frame dropped because wg_rx_queue was full (microlink.c). */
+void ml_count_wg_rx_queue_drop(void);
+
 #ifdef CONFIG_ML_ENABLE_CELLULAR
 #include <sys/socket.h>
 #include <netdb.h>
@@ -855,8 +858,6 @@ static inline ssize_t ml_sendto(int fd, const void *buf, size_t len, int flags,
         return ml_at_sendto(fd, buf, len, flags, addr, addrlen);
     return sendto(fd, buf, len, flags, addr, addrlen);
 }
-
-void ml_count_wg_rx_queue_drop(void);   /* microlink.c */
 
 static inline ssize_t ml_recvfrom(int fd, void *buf, size_t len, int flags,
                                     struct sockaddr *addr, socklen_t *addrlen) {

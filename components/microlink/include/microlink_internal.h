@@ -86,6 +86,14 @@ extern "C" {
  * depth 8 overflowed and silently dropped → TCP loss → exit-node throughput
  * collapse. ml_rx_packet_t is small (ptr+len+meta); 32 is ~1KB internal. */
 #define ML_WG_RX_QUEUE_DEPTH    32
+/* Small WireGuard packets (pings, TCP ACKs, keepalives, handshakes) take a
+ * separate lane that the WireGuard manager serves first, so they do not wait
+ * behind up to ML_WG_RX_QUEUE_DEPTH full-size data packets for decryption.
+ * Only the size of an encrypted packet is known: a ping or a pure ACK is
+ * 96-128 bytes on the wire, a data segment ~1400. Overtaking is bounded by
+ * the large-queue depth, inside the 64-packet replay window. */
+#define ML_WG_RX_PRIO_QUEUE_DEPTH  16
+#define ML_WG_RX_SMALL_MAX         160
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
@@ -531,6 +539,7 @@ struct microlink_s {
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
     QueueHandle_t disco_rx_queue;       /* net_io -> wg_mgr */
     QueueHandle_t wg_rx_queue;          /* net_io -> wg_mgr */
+    QueueHandle_t wg_rx_prio_queue;     /* net_io -> wg_mgr, small packets, served first */
     SemaphoreHandle_t wg_rx_wake;       /* given per queued WG frame: wakes wg_mgr early; lives as long as the queue */
     QueueHandle_t stun_rx_queue;        /* net_io -> coord */
     QueueHandle_t coord_cmd_queue;      /* any -> coord */
@@ -825,6 +834,22 @@ uint64_t ml_get_time_ms(void);
  * ========================================================================== */
 
 #include "ml_at_socket.h"
+
+/* Queues a received WireGuard packet: small ones on the priority lane (falling
+ * back to the normal queue when it is full), the rest on the normal queue. */
+static inline BaseType_t ml_wg_rx_enqueue(microlink_t *ml, const ml_rx_packet_t *pkt) {
+    if (pkt->len <= ML_WG_RX_SMALL_MAX && ml->wg_rx_prio_queue &&
+        xQueueSend(ml->wg_rx_prio_queue, pkt, 0) == pdTRUE)
+        return pdTRUE;
+    return xQueueSend(ml->wg_rx_queue, pkt, 0);
+}
+
+/* Next packet for the WireGuard manager: the priority lane first. */
+static inline BaseType_t ml_wg_rx_dequeue(microlink_t *ml, ml_rx_packet_t *pkt) {
+    if (ml->wg_rx_prio_queue && xQueueReceive(ml->wg_rx_prio_queue, pkt, 0) == pdTRUE)
+        return pdTRUE;
+    return xQueueReceive(ml->wg_rx_queue, pkt, 0);
+}
 
 /* Counts a WireGuard frame dropped because wg_rx_queue was full (microlink.c). */
 void ml_count_wg_rx_queue_drop(void);

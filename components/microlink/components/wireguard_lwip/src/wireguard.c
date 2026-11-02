@@ -337,7 +337,7 @@ bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 	uint64_t diff;   /* was uint32_t: a counter jump beyond 2^32 wrapped and let an old counter back in */
 	bool result = false;
 	if (seq >= REJECT_AFTER_MESSAGES) return false;
-	size_t ReplayWindowSize = sizeof(keypair->replay_bitmap) * CHAR_BIT; // 32 bits
+	size_t ReplayWindowSize = sizeof(keypair->replay_bitmap) * CHAR_BIT; // 64 bits
 
 	// WireGuard data packet counter starts from 0 but algorithm expects packet numbers to start from 1
 	seq++;
@@ -363,11 +363,11 @@ bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 		} else {
 			diff = keypair->replay_counter - seq;
 			if (diff < ReplayWindowSize) {
-				if (keypair->replay_bitmap & ((uint32_t)1 << diff)) {
+				if (keypair->replay_bitmap & ((uint64_t)1 << diff)) {
 					// already seen
 				} else {
 					// mark as seen
-					keypair->replay_bitmap |= ((uint32_t)1 << diff);
+					keypair->replay_bitmap |= ((uint64_t)1 << diff);
 					__atomic_fetch_add(&s_wg_rx_seq_late, 1, __ATOMIC_RELAXED);
 					// out of order but good
 					result = true;

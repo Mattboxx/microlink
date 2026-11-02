@@ -89,7 +89,7 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
         }
         break;
     case PKT_WIREGUARD:
-        if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
+        if (ml_wg_rx_enqueue(ml, &pkt) != pdTRUE) {
             static uint32_t wg_rx_drops = 0;
             ml_count_wg_rx_queue_drop();
             if ((++wg_rx_drops & 0x1F) == 1)

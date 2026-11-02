@@ -2413,7 +2413,7 @@ void ml_wg_mgr_task(void *arg) {
         ml_rx_packet_t wg_pkt;
         budget_start_ms = ml_get_time_ms();   /* WG data plane: fresh window, not charged for DISCO */
         for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_WG_BUDGET_MS) &&
-                        xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE; n++) {
+                        ml_wg_rx_dequeue(ml, &wg_pkt) == pdTRUE; n++) {
             process_wg_packet(ml, &wg_pkt);
         }
 
@@ -2457,7 +2457,7 @@ void ml_wg_mgr_task(void *arg) {
          * window so the slow periodic work above cannot starve it (#46). */
         budget_start_ms = ml_get_time_ms();
         for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_WG_BUDGET_MS) &&
-                        xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE; n++) {
+                        ml_wg_rx_dequeue(ml, &wg_pkt) == pdTRUE; n++) {
             process_wg_packet(ml, &wg_pkt);
         }
 
@@ -2488,7 +2488,7 @@ void ml_wg_mgr_task(void *arg) {
          * blocked for WG_MGR_REST_MS counts as a rest. */
         uint64_t iteration_end_ms = ml_get_time_ms();
         busy_ms += iteration_end_ms - iteration_start_ms;
-        if (wg_mgr_must_rest(uxQueueMessagesWaiting(ml->wg_rx_queue) > 0, busy_ms)) {
+        if (wg_mgr_must_rest(uxQueueMessagesWaiting(ml->wg_rx_queue) + uxQueueMessagesWaiting(ml->wg_rx_prio_queue) > 0, busy_ms)) {
             vTaskDelay(pdMS_TO_TICKS(10));
             busy_ms = 0;
         } else {

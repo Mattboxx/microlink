@@ -314,7 +314,8 @@ static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
 #endif
 
     QueueHandle_t target = (type == PKT_DISCO) ? ml->disco_rx_queue : ml->wg_rx_queue;
-    if (xQueueSend(target, &pkt, 0) != pdTRUE) {
+    BaseType_t queued = (type == PKT_DISCO) ? xQueueSend(target, &pkt, 0) : ml_wg_rx_enqueue(ml, &pkt);
+    if (queued != pdTRUE) {
         /* Download-direction RX drop: frames arrive faster than the consumer
          * (wg_rx_queue depth) can decrypt/forward. Rate-limited so a flood
          * doesn't itself spam the SD recorder. */

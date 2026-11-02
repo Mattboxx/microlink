@@ -297,6 +297,13 @@ typedef struct {
     uint32_t rc_coord_transport;  /* established coord session died (transport) */
     uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
     uint32_t rc_derp_retry;       /* failed DERP connect attempts (backoff ladder) */
+
+    /* Why the last established control session ended ("" if none this boot)
+     * and why the latest reconnect attempt failed ("" if none since). */
+    char     ctrl_loss_reason[48];
+    uint32_t ctrl_loss_count;
+    char     ctrl_retry_reason[48];
+    uint32_t ctrl_retry_failures;
 } microlink_diag_t;
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);

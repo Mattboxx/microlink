@@ -514,6 +514,13 @@ struct microlink_s {
      * same as watchdog saves (esphome-tailscale#32 field verification) —
      * so each detector counts separately. */
     volatile uint32_t rc_coord_stream_wd;  /* map-stream watchdog fired */
+    /* Why the last established control session ended and why the latest
+     * reconnect attempt failed (static strings, written by the coord task).
+     * The counters let a reader tell a new loss from an old one. */
+    const char *volatile ctrl_loss_reason;
+    volatile uint32_t ctrl_loss_count;
+    const char *volatile ctrl_retry_reason;
+    volatile uint32_t ctrl_retry_failures;   /* failed attempts since the last loss */
     volatile uint32_t rc_coord_transport;  /* established coord session died (ctrl watchdog / PING send / recv) */
     volatile uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
     volatile uint32_t rc_derp_retry;       /* failed DERP connect attempts on the backoff ladder */

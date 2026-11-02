@@ -2608,6 +2608,9 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
 
     /* Now parse complete H2 frames from accumulated buffer */
     int fpos = 0;
+    /* Frame census for the parse-failure report below. */
+    int data_frames = 0, padded_frames = 0, incomplete_frames = 0;
+    uint32_t first_stream = 0, other_stream = 0;
     while (fpos + 9 <= (int)h2_total) {
         uint32_t f_len = (h2_recv[fpos] << 16) | (h2_recv[fpos + 1] << 8) | h2_recv[fpos + 2];
         uint8_t f_type = h2_recv[fpos + 3];
@@ -2623,10 +2626,15 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
         if (fpos + (int)f_len > (int)h2_total) {
             ESP_LOGW(TAG, "  Incomplete H2 frame at end (need %lu, have %d)",
                      (unsigned long)f_len, (int)h2_total - fpos);
+            incomplete_frames++;
             break;
         }
 
         if (f_type == 0x00 && f_len > 0) {  /* DATA frame */
+            data_frames++;
+            if (f_flags & 0x08) padded_frames++;
+            if (!first_stream) first_stream = f_stream;
+            else if (f_stream != first_stream) other_stream = f_stream;
             if (json_total + f_len < ML_JSON_BUFFER_SIZE) {
                 memcpy(resp_buf + json_total, h2_recv + fpos, f_len);
                 json_total += f_len;
@@ -2737,8 +2745,16 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     parse_start[parse_len] = saved;
 
     if (!map_json) {
+        /* cJSON keeps one global error pointer: another task's parse can move
+         * it, so report the offset only when it points into this buffer. */
         const char *err = cJSON_GetErrorPtr();
-        ESP_LOGE(TAG, "MapResponse JSON parse failed near: %.50s", err ? err : "unknown");
+        bool inside = err && err >= parse_start && err <= parse_start + parse_len;
+        ESP_LOGE(TAG, "MapResponse JSON parse failed at %d of %u bytes (data frames %d, streams %lu/%lu, "
+                      "padded %d, incomplete %d)%s%.40s",
+                 inside ? (int)(err - parse_start) : -1, (unsigned)parse_len, data_frames,
+                 (unsigned long)first_stream, (unsigned long)other_stream, padded_frames, incomplete_frames,
+                 inside ? ": " : ": error pointer outside this buffer; ",
+                 inside ? err : "");
         free(resp_buf);
         return -1;
     }
@@ -3444,6 +3460,22 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
  * Coordination Task Main Loop
  * ========================================================================== */
 
+/* Reconnect causes for diagnostics: the established session's end and each
+ * failed attempt. Static strings only; read by microlink_get_diag(). */
+static void note_ctrl_loss(microlink_t *ml, const char *why)
+{
+    ml->ctrl_loss_reason = why;
+    ml->ctrl_retry_reason = NULL;
+    ml->ctrl_retry_failures = 0;
+    ml->ctrl_loss_count++;
+}
+
+static void note_ctrl_retry(microlink_t *ml, const char *why)
+{
+    ml->ctrl_retry_reason = why;
+    ml->ctrl_retry_failures++;
+}
+
 void ml_coord_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     EventBits_t startup = xEventGroupWaitBits(ml->events,
@@ -3542,6 +3574,7 @@ void ml_coord_task(void *arg) {
         case COORD_TCP_CONNECT:
             if (do_tcp_connect(ml) < 0) {
                 ESP_LOGE(TAG, "TCP connect failed, retrying...");
+                    note_ctrl_retry(ml, "control-plane TCP connect failed");
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -3554,6 +3587,7 @@ void ml_coord_task(void *arg) {
             ml->state = ML_STATE_REGISTERING;
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
+                    note_ctrl_retry(ml, "Noise handshake failed");
                 ml_conn_close(ml);
                 state = COORD_RECONNECTING;
                 break;
@@ -3568,6 +3602,7 @@ void ml_coord_task(void *arg) {
         case COORD_H2_PREFACE:
             if (do_h2_preface(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "H2 preface failed");
+                    note_ctrl_retry(ml, "HTTP/2 preface failed");
                 ml_conn_close(ml);
                 state = COORD_RECONNECTING;
                 break;
@@ -3579,6 +3614,7 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Registering...");
             if (do_register(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Registration failed");
+                    note_ctrl_retry(ml, "registration failed");
                 ml_conn_close(ml);
                 state = COORD_RECONNECTING;
                 break;
@@ -3593,6 +3629,7 @@ void ml_coord_task(void *arg) {
                 int fp_rc = do_map_exchange(ml, &noise, true);
                 if (fp_rc < 0) {
                     ESP_LOGW(TAG, "MapRequest failed, will retry");
+                    note_ctrl_retry(ml, "MapRequest failed");
                     ml_conn_close(ml);
                     state = COORD_RECONNECTING;
                     break;
@@ -3607,6 +3644,7 @@ void ml_coord_task(void *arg) {
                     ESP_LOGI(TAG, "Reading initial netmap from the long-poll stream");
                     if (do_start_long_poll(ml, &noise) < 0) {
                         ESP_LOGW(TAG, "Failed to start long-poll");
+                    note_ctrl_retry(ml, "long-poll start failed");
                         ml_conn_close(ml);
                         state = COORD_RECONNECTING;
                         break;
@@ -3614,6 +3652,7 @@ void ml_coord_task(void *arg) {
                     lp_started = true;
                     if (do_map_exchange(ml, &noise, false) < 0) {
                         ESP_LOGW(TAG, "Initial streaming netmap unavailable; retrying connection");
+                    note_ctrl_retry(ml, "initial netmap unavailable or invalid");
                         ml_conn_close(ml);
                         state = COORD_RECONNECTING;
                         break;
@@ -3627,6 +3666,7 @@ void ml_coord_task(void *arg) {
                  * deltas or incomplete authority. No permission is inferred. */
                 if (!ml_policy_authority_active()) {
                     ESP_LOGW(TAG, "Initial policy authority incomplete; retrying connection");
+                    note_ctrl_retry(ml, "initial policy incomplete");
                     ml_conn_close(ml);
                     state = COORD_RECONNECTING;
                     break;
@@ -3706,6 +3746,7 @@ void ml_coord_task(void *arg) {
                 /* Check control plane watchdog (120s) */
                 if (now - last_activity_ms > ml->t_ctrl_watchdog_ms) {
                     ESP_LOGW(TAG, "Control plane watchdog timeout");
+                    note_ctrl_loss(ml, "control-plane watchdog (no data)");
                     ml->rc_coord_transport++;
                     state = COORD_RECONNECTING;
                     break;
@@ -3725,6 +3766,7 @@ void ml_coord_task(void *arg) {
                     ESP_LOGW(TAG, "Control-plane map stream silent for %lu s — "
                                   "mapSession presumed dead, reconnecting",
                              (unsigned long)((now - ml->ctrl_stream_rx_ms) / 1000));
+                    note_ctrl_loss(ml, "control-plane map stream silent");
                     ml->rc_coord_stream_wd++;
                     state = COORD_RECONNECTING;
                     break;
@@ -3886,6 +3928,7 @@ void ml_coord_task(void *arg) {
                         if (ml->key_expired) {
                             if (ml->config.auth_key) {
                                 ESP_LOGW(TAG, "Key expired, re-registering with auth_key...");
+                                note_ctrl_loss(ml, "node key expired, re-registering");
                                 state = COORD_RECONNECTING;
                                 break;
                             } else {
@@ -3920,6 +3963,7 @@ void ml_coord_task(void *arg) {
                         last_activity_ms = now;
                     } else {
                         ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
+                        note_ctrl_loss(ml, "control-plane PING send failed");
                         ml->rc_coord_transport++;
                         state = COORD_RECONNECTING;
                         break;
@@ -3938,6 +3982,7 @@ void ml_coord_task(void *arg) {
                     ml->ctrl_last_rx_ms = now;
                 } else if (poll_ret < 0) {
                     ESP_LOGW(TAG, "Long-poll connection lost");
+                    note_ctrl_loss(ml, "control-plane connection closed or failed");
                     ml->rc_coord_transport++;
                     state = COORD_RECONNECTING;
                     break;

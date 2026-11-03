@@ -301,6 +301,7 @@ typedef struct {
     /* Why the last established control session ended ("" if none this boot)
      * and why the latest reconnect attempt failed ("" if none since). */
     char     ctrl_loss_reason[48];
+    int32_t  ctrl_loss_code;      /* HTTP/2 error code or errno of that loss; -1 if none */
     uint32_t ctrl_loss_count;
     char     ctrl_retry_reason[48];
     uint32_t ctrl_retry_failures;

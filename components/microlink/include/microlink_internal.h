@@ -518,6 +518,11 @@ struct microlink_s {
      * reconnect attempt failed (static strings, written by the coord task).
      * The counters let a reader tell a new loss from an old one. */
     const char *volatile ctrl_loss_reason;
+    /* What ended the long-poll (set by poll_map_update) and its HTTP/2
+     * error code or errno; -1 when there is none. */
+    const char *volatile ctrl_close_detail;
+    volatile int32_t ctrl_close_code;
+    volatile int32_t ctrl_loss_code;
     volatile uint32_t ctrl_loss_count;
     const char *volatile ctrl_retry_reason;
     volatile uint32_t ctrl_retry_failures;   /* failed attempts since the last loss */

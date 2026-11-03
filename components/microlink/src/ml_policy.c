@@ -90,6 +90,31 @@ static uint32_t epoch;
 static bool suspended;
 static uint32_t suspended_at;
 #define RESUME_WINDOW_MS 30000u
+static uint8_t loss_mode = ML_POLICY_LOSS_KEEP;
+static uint32_t loss_grace_ms = 300000u;
+
+/* True while data must be blocked because the control transport is down.
+ * Reads plain words only; callers already hold LOCK where they test
+ * current/suspended together. */
+static bool blocked(void) {
+    if (!suspended || loss_mode == ML_POLICY_LOSS_KEEP) return false;
+    if (loss_mode == ML_POLICY_LOSS_BOUNDED) return (uint32_t)(NOW() - suspended_at) >= loss_grace_ms;
+    return true;
+}
+
+void ml_policy_set_control_loss(uint8_t mode, uint32_t grace_s) {
+    if (mode > ML_POLICY_LOSS_STRICT) mode = ML_POLICY_LOSS_KEEP;
+    if (grace_s < 30) grace_s = 30;
+    if (grace_s > 86400) grace_s = 86400;
+    LOCK();loss_mode=mode;loss_grace_ms=grace_s*1000u;UNLOCK();
+}
+
+void ml_policy_get_control_loss(uint8_t *mode, uint32_t *grace_s) {
+    LOCK();
+    if (mode) *mode = loss_mode;
+    if (grace_s) *grace_s = loss_grace_ms / 1000u;
+    UNLOCK();
+}
 
 static policy *acquire(void) {
     LOCK(); policy *p = current; if (p) p->refs++; UNLOCK(); return p;
@@ -423,11 +448,14 @@ bool ml_policy_apply(const cJSON *map) {
     if (!next) {s_reject="no-memory";ml_policy_reset();return false;}
     memset(next,0,sizeof *next);
     policy *old=acquire();
-    LOCK();bool resuming=suspended;uint32_t outage=NOW()-suspended_at;UNLOCK();
+    LOCK();bool resuming=suspended;uint32_t outage=NOW()-suspended_at;bool was_blocked=blocked();UNLOCK();
     /* Reconnects must not apply deltas to unseen stale authority. A complete
      * map is built from empty state, never the saved pre-outage filters. */
     bool complete=cJSON_IsArray(get(map,"Peers")) && cJSON_IsObject(get(map,"Node"))
         && (cJSON_IsArray(get(map,"PacketFilter")) || cJSON_IsObject(get(map,"PacketFilters")));
+    /* Never apply a delta to unconfirmed authority. The reconnect asks for a
+     * complete map, so a delta (or a malformed partial map) first is an anomaly
+     * and fails closed in every control-loss mode. */
     if(resuming&&!complete){s_reject="delta-while-suspended";release(old);free(next);ml_policy_reset();return false;}
     if (old&&!resuming) memcpy(next,old,offsetof(policy,flows));
     bool valid=peer_updates(next,map);
@@ -464,7 +492,7 @@ bool ml_policy_apply(const cJSON *map) {
     if (!valid) {if(strcmp(s_reject,"peer-update"))s_reject="packet-filter";release(old);free(next);ml_policy_reset();return false;}
     /* Endpoint/Online patches and identical refreshes are not revocations.
      * Do not tear down return traffic on every normal map heartbeat. */
-    bool same_authority=old && (!resuming||outage<RESUME_WINDOW_MS)
+    bool same_authority=old && (!resuming||outage<RESUME_WINDOW_MS||!was_blocked)
         && !memcmp(next,old,offsetof(policy,epoch));
     release(old);
     if (same_authority) {LOCK();suspended=false;UNLOCK();free(next);return true;}
@@ -574,17 +602,27 @@ static bool peer_owns(const policy *p,const uint8_t key[32],const uint8_t ip[16]
     if (family==6 && !memcmp(ip,tail6,6) && best!=128) return false;
     return owner>=0 && !tied && !memcmp(p->peers[owner].key,key,32);
 }
-static bool ready(const policy *p) {
+static bool complete_unexpired(const policy *p) {
     time_t now=time(NULL);
-    LOCK();bool enabled=!suspended && current==p;UNLOCK();
-    return enabled && p && p->filters_known && p->peers_known && p->local_known
+    return p && p->filters_known && p->peers_known && p->local_known
         && (!p->expires || (now>=1700000000 && now<p->expires));
+}
+/* Enforced now: current, complete, unexpired and not blocked by the
+ * control-loss mode. */
+static bool ready(const policy *p) {
+    LOCK();bool enabled=!blocked() && current==p;UNLOCK();
+    return enabled && complete_unexpired(p);
+}
+/* Confirmed by the live control session (no transport loss since). */
+static bool fresh(const policy *p) {
+    LOCK();bool enabled=!suspended && current==p;UNLOCK();
+    return enabled && complete_unexpired(p);
 }
 bool ml_policy_reply_age(uint8_t protocol,const uint8_t remote_ip4[4],uint16_t remote_port,uint32_t *age_ms) {
     if(!remote_ip4||!age_ms)return false;
     policy *p=acquire();if(!p)return false;
     bool found=false;uint32_t now=NOW(),best=0;LOCK();
-    if(current==p&&!suspended)for(unsigned i=0;i<FLOWS;i++){
+    if(current==p&&!blocked())for(unsigned i=0;i<FLOWS;i++){
         const flow *f=&p->flows[i];
         if(!f->used||!f->replied||f->epoch!=p->epoch||f->reverse.family!=4||f->reverse.protocol!=protocol
             ||f->reverse.sport!=remote_port||memcmp(f->reverse.src,remote_ip4,4))continue;
@@ -593,7 +631,7 @@ bool ml_policy_reply_age(uint8_t protocol,const uint8_t remote_ip4[4],uint16_t r
     UNLOCK();release(p);if(found)*age_ms=best;return found;
 }
 bool ml_policy_authority_active(void) {
-    policy *p=acquire();bool ok=p&&ready(p);release(p);return ok;
+    policy *p=acquire();bool ok=p&&fresh(p);release(p);return ok;
 }
 void ml_policy_get_status(ml_policy_status_t *out) {
     if(!out)return;
@@ -604,7 +642,9 @@ void ml_policy_get_status(ml_policy_status_t *out) {
     out->expanded_rules=p->count;
     for(unsigned i=0;i<PEERS;i++)if(p->peers[i].active)out->peers++;
     uint32_t now=NOW();LOCK();
-    if(current==p&&!suspended){
+    out->control_stale=suspended&&!blocked()&&current==p;
+    out->stale_ms=suspended?(uint32_t)(now-suspended_at):0;
+    if(current==p&&!blocked()){
         for(unsigned i=0;i<FLOWS;i++){
             const flow *f=&p->flows[i];uint32_t timeout=f->reverse.protocol==6?120000:f->reverse.protocol==17?30000:10000;
             if(f->used && f->epoch==p->epoch && now-f->touched<=timeout)out->return_flows++;
@@ -643,7 +683,7 @@ static bool flow_allowed(policy *p,const tuple *t,const uint8_t key[32],bool rep
     if ((t->protocol==1 && t->icmp!=0)||(t->protocol==58 && t->icmp!=129)) return false;
     bool ok=false; uint32_t now=NOW();
     LOCK();
-    if (current==p&&!suspended) for (unsigned i=0;i<FLOWS;i++) {
+    if (current==p&&!blocked()) for (unsigned i=0;i<FLOWS;i++) {
         flow *f=&p->flows[i]; uint32_t limit=t->protocol==6?120000:t->protocol==17?30000:10000;
         if (f->used && f->epoch==p->epoch && now-f->touched<=limit && !memcmp(f->key,key,32) && same(&f->reverse,t)) {
             f->touched=now;if(reply)f->replied=now?now:1;ok=true;break;
@@ -658,7 +698,7 @@ static bool local_owns(const policy *p,const uint8_t ip[16],unsigned family) {
 bool ml_policy_fragment_epoch(const uint8_t src[16],const uint8_t dst[16],unsigned family,const uint8_t key[32],uint32_t *out) {
     if(!src||!dst||!key||!out||(family!=4&&family!=6))return false;
     policy *p=acquire();bool ok=ready(p)&&peer_owns(p,key,src,(uint8_t)family)&&local_owns(p,dst,family);
-    LOCK();ok=ok&&current==p&&!suspended;if(ok)*out=p->epoch;UNLOCK();release(p);return ok;
+    LOCK();ok=ok&&current==p&&!blocked();if(ok)*out=p->epoch;UNLOCK();release(p);return ok;
 }
 bool ml_policy_tx_fragment_epoch(const uint8_t src[16],const uint8_t dst[16],unsigned family,const uint8_t key[32],uint32_t *out) {
     if(!src||!dst||!key||!out||(family!=4&&family!=6))return false;
@@ -673,7 +713,7 @@ bool ml_policy_tx_fragment_epoch(const uint8_t src[16],const uint8_t dst[16],uns
     /* TX uses the receiving peer's independent service policy. Local inbound
      * grants do not apply to client-originated TCP/UDP traffic or its fragments. */
     policy *p=acquire();bool ok=ready(p)&&peer_owns(p,key,dst,(uint8_t)family);
-    LOCK();ok=ok&&current==p&&!suspended;if(ok)*out=p->epoch;UNLOCK();release(p);return ok;
+    LOCK();ok=ok&&current==p&&!blocked();if(ok)*out=p->epoch;UNLOCK();release(p);return ok;
 }
 static bool rule_allowed(const policy *p,const tuple *t) {
     for (unsigned i=0;i<p->count;i++) {
@@ -718,14 +758,14 @@ bool ml_policy_rx(const struct pbuf *packet,const uint8_t key[32]) {
 done:
     /* A concurrently revoked snapshot cannot grant a new packet. Admission is
      * linearized here, BEFORE translation/queueing, not at socket delivery. */
-    LOCK(); ok=ok && current==p && !suspended; UNLOCK();
+    LOCK(); ok=ok && current==p && !blocked(); UNLOCK();
     release(p); return ok;
 }
 bool ml_policy_tx(const struct pbuf *packet,const uint8_t key[32]) {
     tuple t; if (!key || !decode(packet,&t)) return false;
     policy *p=acquire(); bool ok=ready(p) && peer_owns(p,key,t.dst,t.family);
     if (ok && error_tuple(&t)) ok=related_error(p,packet,&t,key,false);
-    LOCK();ok=ok && current==p && !suspended;UNLOCK();release(p);return ok;
+    LOCK();ok=ok && current==p && !blocked();UNLOCK();release(p);return ok;
 }
 void ml_policy_sent(const struct pbuf *packet,const uint8_t key[32]) {
     ml_policy_sent_epoch(packet,key,0);
@@ -741,7 +781,7 @@ void ml_policy_sent_epoch(const struct pbuf *packet,const uint8_t key[32],uint32
     memcpy(reverse.src,t.dst,16);memcpy(reverse.dst,t.src,16);reverse.sport=t.dport;reverse.dport=t.sport;
     uint32_t now=NOW();int slot=-1;uint32_t oldest=0;
     LOCK();
-    if (current==p && !suspended) {
+    if (current==p && !blocked()) {
         for (unsigned i=0;i<FLOWS;i++) {
             flow *f=&p->flows[i];
             if (f->used && f->epoch==p->epoch && !memcmp(f->key,key,32) && same(&f->reverse,&reverse)) {slot=(int)i;break;}

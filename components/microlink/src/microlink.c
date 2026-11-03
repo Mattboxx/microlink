@@ -788,6 +788,7 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
     out->vpn_ip = ml->vpn_ip;
     out->wan_public_ip = ml->stun_public_ip;
     out->derp_home_region = ml->derp_home_region;
+    out->derp_connected = ml->derp.connected;
     out->derp_region_default = ml->derp_region_default;
     out->peer_count = ml->peer_count;
     int online = 0;

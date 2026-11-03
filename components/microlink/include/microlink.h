@@ -270,6 +270,7 @@ typedef struct {
     uint32_t wan_public_ip;     /* STUN-discovered, host byte order, 0 if unknown */
     uint16_t derp_home_region;     /* currently active DERP region (netcheck may have overridden the default) */
     uint16_t derp_region_default;  /* configured default region (user pick from /tailscale form, or ML_DERP_REGION fallback) */
+    bool     derp_connected;       /* DERP relay connection to the home region is up */
     int      peer_count;
     int      peer_online;       /* peers currently marked active */
     uint32_t uptime_sec;        /* seconds in ML_STATE_CONNECTED; 0 if not connected */

@@ -562,11 +562,11 @@ void ml_derp_tx_task(void *arg) {
          * the DERP-stall issue; now downgraded to INFO since the /log
          * ring + /tailscale diag panel cover that need and the W-spam
          * was drowning real warnings. */
-        /* TEMP 2026-05-27: WARN + 2s so the SD recorder captures the DERP frame
-         * rate during the exit-node throughput hunt (loop_count vs frames_tx/rx
-         * tells us if the loop spins without progress or is genuinely starved). */
+        /* INFO again (3.0.7-beta.6): the temporary 2026-05-27 WARN filled the
+         * 16 KB warning ring in ~100 s and hid the warnings around a Tailnet
+         * loss. Raise the SD/console level to INFO to see it. */
         if (loop_start - last_heartbeat_ms > 2000) {
-            ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+            ESP_LOGI(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
@@ -577,7 +577,7 @@ void ml_derp_tx_task(void *arg) {
         {
             uint64_t now_ms = loop_start;
             if (now_ms - last_status_ms > 10000) {
-                ESP_LOGW(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
+                ESP_LOGI(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
                          ml->derp.connected, ml->derp.sockfd,
                          (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                          (unsigned long)loop_count);

@@ -3165,6 +3165,9 @@ static bool lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
     return true;
 }
 
+/* Defined with the reconnect-cause helpers below. */
+static void note_poll_close(microlink_t *ml, const char *why, int32_t code);
+
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     /* Use select() to check if data is available before blocking in recv */
     fd_set readfds;
@@ -3234,6 +3237,8 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         int saved_errno = errno;
         /* EAGAIN/EWOULDBLOCK = no data yet = not an error */
         if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) return 0;
+        if (frame_len == 0) note_poll_close(ml, "control server closed the connection", -1);
+        else note_poll_close(ml, "control connection error (errno)", saved_errno);
         return frame_len;  /* Real error or connection closed */
     }
 
@@ -3298,11 +3303,15 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 ml->ctrl_stream_rx_ms = ml_get_time_ms();
                 data_stream_id = f_stream;
                 /* Append EVERY stream-5 DATA frame - see lp_acc_append(). */
-                if (!lp_acc_append(ml, frame_buf + pos, f_len)) proto_err = true;
+                if (!lp_acc_append(ml, frame_buf + pos, f_len)) {
+                    note_poll_close(ml, "map message buffer full", -1);
+                    proto_err = true;
+                }
                 if (f_flags & 0x01) {
                     /* END_STREAM: the server finished the map session. Nothing
                      * more will ever arrive on this stream; open a new one. */
                     ESP_LOGW(TAG, "H2 END_STREAM on the long-poll - the server closed the map session, reconnecting");
+                    note_poll_close(ml, "control server ended the map session", -1);
                     proto_err = true;
                 }
             } else if (f_len > 0) {
@@ -3331,12 +3340,14 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                                               ((uint32_t)frame_buf[pos + 6] << 8) | frame_buf[pos + 7]) : 0;
             ESP_LOGW(TAG, "H2 GOAWAY from the control server (last stream %lu, error %lu) - reconnecting",
                      (unsigned long)last_sid, (unsigned long)err_code);
+            note_poll_close(ml, "control server sent GOAWAY", (int32_t)err_code);
             proto_err = true;
         } else if (f_type == 0x03 && f_stream == 5) {
             /* RST_STREAM on the long-poll: the map session is gone. */
             uint32_t err_code = f_len >= 4 ? (((uint32_t)frame_buf[pos] << 24) | ((uint32_t)frame_buf[pos + 1] << 16) |
                                               ((uint32_t)frame_buf[pos + 2] << 8) | frame_buf[pos + 3]) : 0;
             ESP_LOGW(TAG, "H2 RST_STREAM on the long-poll (error %lu) - reconnecting", (unsigned long)err_code);
+            note_poll_close(ml, "control server reset the map stream", (int32_t)err_code);
             proto_err = true;
         } else if (f_type == 0x04 && !(f_flags & 0x01)) {
             /* HTTP/2 SETTINGS from server — respond with SETTINGS ACK */
@@ -3415,6 +3426,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 ml->lp_acc_len = 0;
                 ml->h2_acc_len = 0;
                 consumed = 0;
+                note_poll_close(ml, "map stream out of frame", -1);
                 proto_err = true;
                 break;
             }
@@ -3464,10 +3476,18 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
  * failed attempt. Static strings only; read by microlink_get_diag(). */
 static void note_ctrl_loss(microlink_t *ml, const char *why)
 {
+    ml->ctrl_loss_code = -1;
     ml->ctrl_loss_reason = why;
     ml->ctrl_retry_reason = NULL;
     ml->ctrl_retry_failures = 0;
     ml->ctrl_loss_count++;
+}
+
+/* What ended the long-poll, recorded where poll_map_update() gives up. */
+static void note_poll_close(microlink_t *ml, const char *why, int32_t code)
+{
+    ml->ctrl_close_detail = why;
+    ml->ctrl_close_code = code;
 }
 
 static void note_ctrl_retry(microlink_t *ml, const char *why)
@@ -3981,8 +4001,12 @@ void ml_coord_task(void *arg) {
                      * writes. That climb is the wedge fingerprint. */
                     ml->ctrl_last_rx_ms = now;
                 } else if (poll_ret < 0) {
-                    ESP_LOGW(TAG, "Long-poll connection lost");
-                    note_ctrl_loss(ml, "control-plane connection closed or failed");
+                    ESP_LOGW(TAG, "Long-poll connection lost: %s (%ld)",
+                             ml->ctrl_close_detail ? ml->ctrl_close_detail : "unknown", (long)ml->ctrl_close_code);
+                    note_ctrl_loss(ml, ml->ctrl_close_detail ? ml->ctrl_close_detail
+                                                             : "control-plane connection closed or failed");
+                    ml->ctrl_loss_code = ml->ctrl_close_detail ? ml->ctrl_close_code : -1;
+                    note_poll_close(ml, NULL, -1);
                     ml->rc_coord_transport++;
                     state = COORD_RECONNECTING;
                     break;

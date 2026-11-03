@@ -814,6 +814,7 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
         strlcpy(out->ctrl_loss_reason, loss ? loss : "", sizeof out->ctrl_loss_reason);
         strlcpy(out->ctrl_retry_reason, retry ? retry : "", sizeof out->ctrl_retry_reason);
         out->ctrl_loss_count = ml->ctrl_loss_count;
+        out->ctrl_loss_code = ml->ctrl_loss_reason ? ml->ctrl_loss_code : -1;
         out->ctrl_retry_failures = ml->ctrl_retry_failures;
     }
     /* First 16 hex chars of the WG public key (= 8 bytes). Enough to

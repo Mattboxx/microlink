@@ -368,6 +368,12 @@ typedef struct {
     uint32_t count, max, migrated;
 } microlink_perf_stage_t;
 size_t microlink_perf_profile(microlink_perf_stage_t *out, size_t max);
+/* RX data-path variants (bit 0 zero-copy hand-off, bit 1 next-packet DCache
+ * preload) and a decrypt micro-benchmark: cycles for 1,408 bytes from
+ * internal RAM, warm SPIRAM and cold SPIRAM, then the length. */
+void microlink_perf_set_rx_mode(uint8_t mode);
+uint8_t microlink_perf_get_rx_mode(void);
+int microlink_perf_decrypt_bench(uint32_t out[4]);
 #endif
 
 /* Returns the human-readable city name for a DERP region (from the

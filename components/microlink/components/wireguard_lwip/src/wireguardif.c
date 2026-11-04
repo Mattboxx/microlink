@@ -403,6 +403,19 @@ static err_t wireguardif_device_output(struct wireguard_device *device, struct p
 	return udp_sendto(device->udp_pcb, q, ipaddr, port);
 }
 
+
+/* Zeros the bytes of an outgoing data message that nothing else writes: the
+ * header (its reserved bytes), the padding after the plaintext and anything
+ * past the tag. The plaintext is copied over the rest and the tag is written
+ * by the encryption, so zeroing the whole buffer first is not needed. */
+static void wg_tx_zero_unwritten(uint8_t *payload, size_t header_len, size_t unpadded_len,
+                                 size_t padded_len, size_t tot_len) {
+	size_t out_len = header_len + padded_len + WIREGUARD_AUTHTAG_LEN;
+	memset(payload, 0, header_len);
+	if (padded_len > unpadded_len) memset(payload + header_len + unpadded_len, 0, padded_len - unpadded_len);
+	if (tot_len > out_len) memset(payload + out_len, 0, tot_len - out_len);
+}
+
 static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr, struct wireguard_peer *peer) {
     int fragment_kind=q && ml_fragment_tx_check?ml_fragment_tx_check(q,peer->public_key):0;
     if (q && (fragment_kind<0 || (!fragment_kind && ml_policy_tx && !ml_policy_tx(q, peer->public_key)))) return ERR_RTE;
@@ -479,7 +492,7 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 				// Note: allocating pbuf from RAM above guarantees that the pbuf is in one section and not chained
 				// - i.e payload points to the contiguous memory region
 				ML_PERF_BEGIN(perf_memset);
-				memset(pbuf->payload, 0, pbuf->tot_len);
+				wg_tx_zero_unwritten(pbuf->payload, header_len, unpadded_len, padded_len, pbuf->tot_len);
 				ML_PERF_END(ML_PERF_TX_MEMSET, perf_memset, pbuf->tot_len);
 
 				hdr = (struct message_transport_data *)pbuf->payload;
@@ -500,7 +513,8 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 
 					// Copy pbuf to memory - handles case where pbuf is chained
 					ML_PERF_BEGIN(perf_copy);
-					pbuf_copy_partial(q, dst, unpadded_len, 0);
+					u16_t copied = pbuf_copy_partial(q, dst, unpadded_len, 0);
+					if (copied < unpadded_len) memset(dst + copied, 0, unpadded_len - copied);
 					ML_PERF_END(ML_PERF_TX_COPY, perf_copy, unpadded_len);
 				}
 
@@ -723,10 +737,8 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 			pbuf = pbuf_alloc(PBUF_TRANSPORT, src_len - WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
 			ML_PERF_END(ML_PERF_RX_ALLOC, perf_alloc, src_len);
 			if (pbuf) {
-				// Decrypt the packet
-				ML_PERF_BEGIN(perf_memset);
-				memset(pbuf->payload, 0, pbuf->tot_len);
-				ML_PERF_END(ML_PERF_RX_MEMSET, perf_memset, pbuf->tot_len);
+				// Decrypt the packet. No zeroing first: a successful decryption
+				// writes every plaintext byte, a failed one frees the pbuf unread.
 				bool decrypt_ok = wireguard_decrypt_packet(pbuf->payload, src, src_len, nonce, keypair);
 				WG_DEBUG("[WG_DECRYPT] result=%d, src_len=%u, nonce=%llu\n",
 				       decrypt_ok, (unsigned)src_len, (unsigned long long)nonce);

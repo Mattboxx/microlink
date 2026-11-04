@@ -33,27 +33,6 @@
 #include "wireguardif.h"
 #include "wireguard.h"
 #include "ml_perf.h"
-#include "esp_memory_utils.h"
-/* RX data-path variants. Release images use the constants; -prof images can
- * switch them at run time for interleaved measurements. Preloading uses the
- * ESP32-S3 ROM cache routine and is compiled for that target only. */
-#ifndef ML_RX_PRELOAD_BUILD
-#if CONFIG_IDF_TARGET_ESP32S3
-#define ML_RX_PRELOAD_BUILD 1
-#else
-#define ML_RX_PRELOAD_BUILD 0
-#endif
-#endif
-#define ML_RX_MODE_ZERO_COPY 1u
-#define ML_RX_MODE_PRELOAD   2u
-#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
-static volatile uint8_t s_rx_mode;
-#define ML_RX_ZERO_COPY() ((s_rx_mode & ML_RX_MODE_ZERO_COPY) != 0)
-#define ML_RX_PRELOAD()   ((s_rx_mode & ML_RX_MODE_PRELOAD) != 0)
-#else
-#define ML_RX_ZERO_COPY() 1
-#define ML_RX_PRELOAD()   0   /* off until measured on hardware */
-#endif
 #include "mbedtls/base64.h"
 #include <string.h>
 #include <errno.h>
@@ -380,11 +359,6 @@ static struct pbuf *wg_tx_pbuf_alloc_cb(u16_t len, void *ctx);
 static err_t wg_udp_pbuf_output_cb(uint32_t dest_ip, uint16_t dest_port, struct pbuf *p, void *ctx);
 void microlink_get_wg_tx_profile(uint32_t *pkts, uint64_t *us, bool reset) { wireguardif_tx_profile(pkts, us, reset); }
 #if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
-/* Test-only: which RX data-path variants run (microlink_perf_set_rx_mode). */
-static volatile uint8_t s_rx_mode = ML_RX_MODE_ZERO_COPY | (ML_RX_PRELOAD_BUILD ? ML_RX_MODE_PRELOAD : 0);
-void microlink_perf_set_rx_mode(uint8_t mode) { s_rx_mode = mode; }
-uint8_t microlink_perf_get_rx_mode(void) { return s_rx_mode; }
-
 /* Test-only: decryption of one 1,408-byte data packet from internal RAM,
  * warm SPIRAM and cold SPIRAM (cache evicted by reading 64 KB of other
  * SPIRAM), with the scheduler suspended so other tasks cannot run in
@@ -1764,30 +1738,6 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * WireGuard Packet Processing
  * ========================================================================== */
 
-/* Received packets wait in SPIRAM, usually long enough to leave the 32 KB
- * data cache, so decryption starts on cold lines. While one packet is
- * processed, the cache controller fetches the next queued one. Its buffer
- * stays valid: only this task dequeues and frees queued packets. The ROM
- * routine only fills cache lines; DCache autoload is off at boot
- * (Cache_Enable_DCache(0)), so there is no automatic preload to suspend. */
-#if ML_RX_PRELOAD_BUILD
-#include "esp32s3/rom/cache.h"
-static void wg_rx_preload_next(microlink_t *ml) {
-    ml_rx_packet_t next;
-    if (!ML_RX_PRELOAD()) return;
-    if (!(ml->wg_rx_prio_queue && xQueuePeek(ml->wg_rx_prio_queue, &next, 0) == pdTRUE)
-        && xQueuePeek(ml->wg_rx_queue, &next, 0) != pdTRUE) return;
-    if (!next.data || !next.len || !esp_ptr_external_ram(next.data)) return;
-    if (!Cache_DCache_Preload_Done()) return;   /* the previous one is still running */
-    uintptr_t start = (uintptr_t)next.data & ~(uintptr_t)63;
-    uintptr_t end = ((uintptr_t)next.data + next.len + 63u) & ~(uintptr_t)63;
-    Cache_End_DCache_Preload(0);
-    Cache_Start_DCache_Preload((uint32_t)start, (uint32_t)(end - start), 0);
-}
-#else
-static inline void wg_rx_preload_next(microlink_t *ml) { (void)ml; }
-#endif
-
 static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     ML_PERF_US(ML_PERF_RX_QUEUE_US, ML_PERF_NOW_US() - pkt->enq_us);
     ML_PERF_BEGIN(perf_total);
@@ -1807,26 +1757,19 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
         return;
     }
 
-    /* wireguardif_network_rx() handles the frame synchronously and frees the
-     * pbuf before it returns: data messages are decrypted into a new pbuf,
-     * handshakes are parsed in place. So a PBUF_REF over the queued SPIRAM
-     * buffer is enough, freed with the buffer below; this saves a heap
-     * allocation and a SPIRAM-to-SPIRAM copy of every packet. */
+    /* Allocate PBUF_RAM and copy data so the pbuf OWNS its data.
+     * This is required because wireguardif decrypts in-place and then
+     * calls ip_input → tcpip_input which posts to the TCPIP thread.
+     * With PBUF_REF the backing data would be freed before the TCPIP
+     * thread processes the packet. */
     ML_PERF_BEGIN(perf_copy);
-    struct pbuf *p;
-    bool owned = ML_RX_ZERO_COPY();
-    if (owned) {
-        p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_REF);
-        if (p) p->payload = pkt->data;
-    } else {
-        p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
-        if (p) pbuf_take(p, pkt->data, pkt->len);
-    }
+    struct pbuf *p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
     if (!p) {
         free(pkt->data);
         return;
     }
-    if (!owned) free(pkt->data);
+    pbuf_take(p, pkt->data, pkt->len);
+    free(pkt->data);  /* Original data no longer needed — pbuf has its own copy */
     ML_PERF_END(ML_PERF_RX_COPY, perf_copy, pkt->len);
 
     /* Build source address */
@@ -1838,8 +1781,8 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
         ip4_addr_set_u32(ip_2_ip4(&addr), htonl(pkt->src_ip));
     }
 
-    wireguardif_network_rx(device, NULL, p, &addr, pkt->src_port);   /* frees p */
-    if (owned) free(pkt->data);
+    /* Call WG RX handler — pbuf is PBUF_RAM so data survives async delivery */
+    wireguardif_network_rx(device, NULL, p, &addr, pkt->src_port);
     ML_PERF_END(ML_PERF_RX_TOTAL, perf_total, pkt->len);
 }
 
@@ -2516,7 +2459,6 @@ void ml_wg_mgr_task(void *arg) {
         budget_start_ms = ml_get_time_ms();   /* WG data plane: fresh window, not charged for DISCO */
         for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_WG_BUDGET_MS) &&
                         ml_wg_rx_dequeue(ml, &wg_pkt) == pdTRUE; n++) {
-            wg_rx_preload_next(ml);
             process_wg_packet(ml, &wg_pkt);
         }
 
@@ -2561,7 +2503,6 @@ void ml_wg_mgr_task(void *arg) {
         budget_start_ms = ml_get_time_ms();
         for (int n = 0; n < WG_MGR_WG_BURST && WG_MGR_BUDGET_LEFT(WG_MGR_WG_BUDGET_MS) &&
                         ml_wg_rx_dequeue(ml, &wg_pkt) == pdTRUE; n++) {
-            wg_rx_preload_next(ml);
             process_wg_packet(ml, &wg_pkt);
         }
 

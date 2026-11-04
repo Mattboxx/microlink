@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "esp_crt_bundle.h"
+#include "ml_tls_distrust.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mbedtls/net_sockets.h"
@@ -919,7 +920,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     const char *tls_name = (derp_node && derp_node->cert_name[0]) ? derp_node->cert_name : derp_host;
     if (verify_tls) {
         mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-        esp_err_t cb = esp_crt_bundle_attach(&ml->derp.ssl_conf);
+        esp_err_t cb = ml_tls_bundle_attach(&ml->derp.ssl_conf);
         if (cb != ESP_OK) {
             ESP_LOGE(TAG, "DERP TLS: CA bundle attach failed (%s)", esp_err_to_name(cb));
             goto fail_tls;

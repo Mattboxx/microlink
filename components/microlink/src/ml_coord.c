@@ -37,6 +37,7 @@
 #include "mbedtls/base64.h"
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
+#include "ml_tls_distrust.h"
 #include <string.h>
 #include <errno.h>
 
@@ -342,7 +343,7 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
                  ML_CTRL_PROTOCOL_VER);
 
         const esp_tls_cfg_t cfg = {
-            .crt_bundle_attach = esp_crt_bundle_attach,
+            .crt_bundle_attach = ml_tls_bundle_attach,
             .timeout_ms        = 10000,
             .non_block         = false,
         };
@@ -801,7 +802,7 @@ static int do_tcp_connect(microlink_t *ml) {
      * =================================================================== */
     if (ml->use_tls) {
         const esp_tls_cfg_t cfg = {
-            .crt_bundle_attach = esp_crt_bundle_attach,
+            .crt_bundle_attach = ml_tls_bundle_attach,
             .timeout_ms        = 10000,
             .non_block         = false,
         };

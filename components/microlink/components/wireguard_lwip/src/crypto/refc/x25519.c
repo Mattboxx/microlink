@@ -152,9 +152,43 @@ static void mul(fe out, const fe a, const fe b, unsigned nb) {
     propagate(out,carry2);
 }
 
-static void sqr(fe out, const fe a) { mul(out,a,a,NLIMBS); }
+/* Dedicated squaring (Mattboxx 2026-11-08): the off-diagonal products once
+ * (28 instead of 56), doubled, plus the 8 squares: 36 multiplications
+ * instead of 64, then the same reduction as mul(). Squarings are about half
+ * of the ladder's multiplications and nearly all of the final inversion. */
+static void sqr(fe out, const fe a) {
+    limb_t accum[2*NLIMBS] = {0};
+    unsigned i,j;
+    limb_t carry2;
+    for (i=0; i<NLIMBS; i++) {
+        carry2 = 0;
+        const limb_t mand = a[i];
+        for (j=i+1; j<NLIMBS; j++) {
+            accum[i+j] = umaal(&carry2, accum[i+j], mand, a[j]);
+        }
+        accum[i+NLIMBS] = carry2;
+    }
+    limb_t top = 0;
+    for (i=0; i<2*NLIMBS; i++) {           /* x2: the off-diagonal sum is < 2^511 */
+        limb_t v = accum[i];
+        accum[i] = (v << 1) | top;
+        top = v >> (X25519_WBITS-1);
+    }
+    carry2 = 0;
+    for (i=0; i<NLIMBS; i++) {             /* + a[i]^2 at 2i; the total is a^2 < 2^512 */
+        dlimb_t d = (dlimb_t)a[i] * a[i];
+        accum[2*i] = adc(&carry2, accum[2*i], (limb_t)d);
+        accum[2*i+1] = adc(&carry2, accum[2*i+1], (limb_t)(d >> X25519_WBITS));
+    }
+    carry2 = 0;
+    const limb_t m38 = 38;
+    for (j=0; j<NLIMBS; j++) {
+         out[j] = umaal(&carry2, accum[j], m38, accum[j+NLIMBS]);
+    }
+    propagate(out,carry2);
+}
 static void mul1(fe out, const fe a) { mul(out,a,out,NLIMBS); }
-static void sqr1(fe a) { mul1(a,a); }
+static void sqr1(fe a) { sqr(a,a); }
 
 static void condswap(limb_t a[2*NLIMBS], limb_t b[2*NLIMBS], limb_t doswap) {
     unsigned i;
@@ -264,7 +298,7 @@ static void x25519_core(fe xs[5], const uint8_t scalar[X25519_BYTES], const uint
     condswap(x2,x3,swap);
 }
 
-int x25519(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], const uint8_t x1[X25519_BYTES], int clamp) {
+static int x25519_impl(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], const uint8_t x1[X25519_BYTES], int clamp) {
     fe xs[5];
     x25519_core(xs,scalar,x1,clamp);
 
@@ -449,3 +483,31 @@ void x25519_sign_p2 (
     #endif
 }
 #endif // X25519_SUPPORT_SIGN
+
+#if defined(ESP_PLATFORM)
+#include "esp_cpu.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+/* Duration of the last and longest scalar multiplication, in CPU cycles
+ * (/api/system/diag): handshake work runs in the WireGuard receive task, so
+ * this is time incoming packets wait. A call that moved to the other core is
+ * not counted. */
+volatile uint32_t x25519_cycles_last, x25519_cycles_max, x25519_calls;
+#endif
+
+int x25519(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], const uint8_t x1[X25519_BYTES], int clamp) {
+#if defined(ESP_PLATFORM)
+    int core = xPortGetCoreID();
+    uint32_t t0 = esp_cpu_get_cycle_count();
+#endif
+    int r = x25519_impl(out, scalar, x1, clamp);
+#if defined(ESP_PLATFORM)
+    uint32_t dt = esp_cpu_get_cycle_count() - t0;
+    if (core == xPortGetCoreID() && dt < 0x80000000u) {
+        x25519_cycles_last = dt;
+        if (dt > x25519_cycles_max) x25519_cycles_max = dt;
+        x25519_calls++;
+    }
+#endif
+    return r;
+}

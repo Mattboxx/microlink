@@ -770,6 +770,26 @@ void ml_derp_tx_task(void *arg) {
  * not touching the ssl context so the writer can tear it down safely.
  * ========================================================================== */
 
+/* Idle reader: wait until the relay socket has bytes instead of sleeping a
+ * whole tick, so a relayed packet is read as soon as it arrives (it used to
+ * wait up to 10 ms). The 20 ms bound keeps the reader quick to park when the
+ * writer tears the connection down (it waits up to 200 ms for that). */
+#define DERP_RX_IDLE_WAIT_US 20000
+static void derp_rx_wait(microlink_t *ml)
+{
+    int fd = ml->derp.sockfd;
+    if (fd < 0 || !ml->derp.connected) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(fd, &rd);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = DERP_RX_IDLE_WAIT_US };
+    if (ml_select_fds(fd + 1, &rd, NULL, NULL, &tv) < 0)
+        vTaskDelay(pdMS_TO_TICKS(10));   /* select failed: never hot-spin */
+}
+
 void ml_derp_rx_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "DERP RX task started (Core %d)", xPortGetCoreID());
@@ -797,7 +817,7 @@ void ml_derp_rx_task(void *arg) {
                 break;
             }
         }
-        if (!got) vTaskDelay(pdMS_TO_TICKS(10));   /* idle: don't hot-spin (O_NONBLOCK) */
+        if (!got) derp_rx_wait(ml);   /* idle: until bytes arrive, bounded (O_NONBLOCK socket) */
     }
     ESP_LOGI(TAG, "DERP RX task exiting");
     ml_task_exiting(ml);

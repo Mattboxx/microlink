@@ -400,9 +400,28 @@ static int poll_derp_read(microlink_t *ml) {
         ESP_LOGW(TAG, "DERP header read returned %d (0x%04x)", n, n < 0 ? -n : 0);
         return n;
     }
-    if (n < 5) {
-        ESP_LOGW(TAG, "DERP partial header: got %d of 5 bytes", n);
-        return -1;
+    /* mbedtls_ssl_read() never crosses a TLS record, and the server's records
+     * do not follow DERP frame boundaries: a header split across two records
+     * is normal stream data, not an error that should drop the relay. */
+    size_t got = (size_t)n;
+    uint64_t header_start = ml_get_time_ms();
+    while (got < sizeof header) {
+        if (ml_get_time_ms() - header_start > 5000) {
+            ESP_LOGW(TAG, "DERP header timeout at %u/5 bytes", (unsigned)got);
+            return -1;
+        }
+        n = mbedtls_ssl_read(&ml->derp.ssl, header + got, sizeof header - got);
+        if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
+            n == MBEDTLS_ERR_SSL_TIMEOUT) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (n <= 0) {
+            ESP_LOGW(TAG, "DERP header read error: %d (0x%04x) at %u/5 bytes",
+                     n, n < 0 ? -n : 0, (unsigned)got);
+            return n < 0 ? n : -1;
+        }
+        got += (size_t)n;
     }
 
     uint8_t frame_type = header[0];
@@ -454,13 +473,12 @@ static int poll_derp_read(microlink_t *ml) {
 
     /* For RecvPacket (0x05): first 32 bytes are sender's public key */
     if (frame_type == DERP_FRAME_RECV_PACKET && len > 32) {
+        /* Shift the packet to the start of the same buffer: no second
+         * allocation, copy and free per relayed packet. */
         memcpy(src_key, buf, 32);
-        payload = malloc(len - 32);
-        if (payload) {
-            memcpy(payload, buf + 32, len - 32);
-            payload_len = len - 32;
-        }
-        free(buf);
+        memmove(buf, buf + 32, len - 32);
+        payload = buf;
+        payload_len = len - 32;
     } else {
         payload = buf;
         payload_len = len;

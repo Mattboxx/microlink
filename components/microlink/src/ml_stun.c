@@ -554,7 +554,8 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
 
         if (offset + attr_len > len) break;
 
-        if (attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS) {
+        /* The family byte is read only from an attribute that holds one. */
+        if (attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && attr_len >= 8) {
             uint8_t family = data[offset + 1];
 
             if (family == 0x02 && attr_len >= 20) {

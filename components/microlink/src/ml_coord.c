@@ -3243,8 +3243,15 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         return frame_len;  /* Real error or connection closed */
     }
 
-    /* Extract DATA frame payload from H2 frames, track flow control */
-    bool proto_err = false;
+    /* Extract DATA frame payload from H2 frames, track flow control.
+     * proto_err ends this map session. `malformed` (framing lost, an
+     * oversized or unparseable message, an unauthorised map) also revokes the
+     * policy. `session_end` (END_STREAM, GOAWAY, RST_STREAM) is the server
+     * closing the map session: a transport loss like a closed connection, so
+     * the caller's ml_conn_close() suspends the policy and the control-loss
+     * mode decides whether traffic continues (3.0.7-beta.9; before, every
+     * close revoked the policy and blocked all traffic until a new map). */
+    bool proto_err = false, session_end = false, malformed = false;
     uint32_t total_data_bytes = 0;
     uint32_t data_stream_id = 0;
     int pos = 0;
@@ -3266,6 +3273,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                           "dropping the session", (unsigned long)f_len, ML_H2_MAX_FRAME_LEN);
             ml->h2_acc_len = 0;
             ml->lp_acc_len = 0;
+            malformed = true;
             /* Do NOT fall through to the trailing-bytes carry below: `pos` is
              * already past this frame's header and its payload is still in the
              * buffer, so carrying it would re-inject the very bytes we just
@@ -3307,6 +3315,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 if (!lp_acc_append(ml, frame_buf + pos, f_len)) {
                     note_poll_close(ml, "map message buffer full", -1);
                     proto_err = true;
+                    malformed = true;   /* an update was lost: fail closed */
                 }
                 if (f_flags & 0x01) {
                     /* END_STREAM: the server finished the map session. Nothing
@@ -3314,6 +3323,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                     ESP_LOGW(TAG, "H2 END_STREAM on the long-poll - the server closed the map session, reconnecting");
                     note_poll_close(ml, "control server ended the map session", -1);
                     proto_err = true;
+                    session_end = true;
                 }
             } else if (f_len > 0) {
                 /* Endpoint update response (stream 7+) — discard body */
@@ -3343,6 +3353,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                      (unsigned long)last_sid, (unsigned long)err_code);
             note_poll_close(ml, "control server sent GOAWAY", (int32_t)err_code);
             proto_err = true;
+            session_end = true;
         } else if (f_type == 0x03 && f_stream == 5) {
             /* RST_STREAM on the long-poll: the map session is gone. */
             uint32_t err_code = f_len >= 4 ? (((uint32_t)frame_buf[pos] << 24) | ((uint32_t)frame_buf[pos + 1] << 16) |
@@ -3350,6 +3361,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             ESP_LOGW(TAG, "H2 RST_STREAM on the long-poll (error %lu) - reconnecting", (unsigned long)err_code);
             note_poll_close(ml, "control server reset the map stream", (int32_t)err_code);
             proto_err = true;
+            session_end = true;
         } else if (f_type == 0x04 && !(f_flags & 0x01)) {
             /* HTTP/2 SETTINGS from server — respond with SETTINGS ACK */
             uint8_t settings_ack[9] = {0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00};
@@ -3398,7 +3410,9 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
      * SILENTLY - with ctrl_stream_rx_ms already stamped above, so every liveness signal stayed green
      * while netmap updates were lost. Compression is disabled (Compress: ""), so responses arrive at
      * full size and spanning is the normal case for anything but a keepalive. */
-    if (!proto_err && ml->lp_acc && ml->lp_acc_len >= 4) {
+    /* Messages completed before the server ended the session are applied
+     * first: the last one may be a revocation. */
+    if ((!proto_err || (session_end && !malformed)) && ml->lp_acc && ml->lp_acc_len >= 4) {
         size_t consumed = 0;
         for (;;) {
             size_t avail = ml->lp_acc_len - consumed;
@@ -3429,6 +3443,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 consumed = 0;
                 note_poll_close(ml, "map stream out of frame", -1);
                 proto_err = true;
+                malformed = true;
                 break;
             }
             if (avail < 4 + (size_t)size) break;   /* incomplete - keep for the next read */
@@ -3441,7 +3456,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             if (update_json) {
                 bool authorized = apply_long_poll_map(ml, update_json);
                 cJSON_Delete(update_json);
-                if (!authorized) { proto_err = true; break; }
+                if (!authorized) { proto_err = true; malformed = true; break; }
                 /* A home-region change made from a streamed DERPMap: the
                  * control plane gets the new NetInfo now, not at the next
                  * reconnect. (The full-netmap path is followed by the
@@ -3451,6 +3466,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 ESP_LOGW(TAG, "long-poll: %lu-byte message failed to parse", (unsigned long)size);
                 ml_policy_reset();
                 proto_err = true;
+                malformed = true;
                 break;
             }
             consumed += 4 + size;
@@ -3463,7 +3479,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 
     free(frame_buf);
     if (proto_err) {
-        ml_policy_reset();
+        if (malformed || !session_end) ml_policy_reset();
         return -1;   /* caller closes the connection and reconnects */
     }
     return 1;
@@ -3477,11 +3493,42 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
  * failed attempt. Static strings only; read by microlink_get_diag(). */
 static void note_ctrl_loss(microlink_t *ml, const char *why)
 {
+    ml->rt_loss_ms = ml_get_time_ms();
+    ml->rt_backoff_ms = ml->rt_tcp_ms = ml->rt_noise_ms = ml->rt_register_ms = 0;
+    ml->rt_fetch_ms = ml->rt_stream_ms = ml->rt_derp_ms = 0;
     ml->ctrl_loss_code = -1;
     ml->ctrl_loss_reason = why;
     ml->ctrl_retry_reason = NULL;
     ml->ctrl_retry_failures = 0;
     ml->ctrl_loss_count++;
+}
+
+/* The session is back after a loss: how long each stage of the last attempt
+ * took ("backoff" covers the wait and any earlier failed attempts), logged
+ * once at WARN so it stays in the warning log, and published in the diag. */
+static void note_reconnected(microlink_t *ml, uint64_t now)
+{
+    if (!ml->rt_loss_ms) return;
+    static const char *const names[] = {"backoff", "tcp+tls", "noise", "register", "map", "stream map", "derp"};
+    const uint64_t marks[] = {ml->rt_backoff_ms, ml->rt_tcp_ms, ml->rt_noise_ms, ml->rt_register_ms,
+                              ml->rt_fetch_ms, ml->rt_stream_ms, ml->rt_derp_ms};
+    char text[sizeof ml->ctrl_reconnect_stages];
+    size_t used = 0;
+    uint64_t prev = ml->rt_loss_ms;
+    text[0] = '\0';
+    for (size_t i = 0; i < sizeof marks / sizeof marks[0] && used < sizeof text; i++) {
+        if (!marks[i] || marks[i] < prev) continue;
+        int n = snprintf(text + used, sizeof text - used, "%s%s %lu", used ? ", " : "", names[i],
+                         (unsigned long)(marks[i] - prev));
+        if (n < 0) break;
+        used += (size_t)n < sizeof text - used ? (size_t)n : sizeof text - used - 1;
+        prev = marks[i];
+    }
+    uint64_t total = now >= ml->rt_loss_ms ? now - ml->rt_loss_ms : 0;
+    strlcpy(ml->ctrl_reconnect_stages, text, sizeof ml->ctrl_reconnect_stages);
+    ml->ctrl_last_reconnect_ms = total > UINT32_MAX ? UINT32_MAX : (uint32_t)total;
+    ESP_LOGW(TAG, "Control session back %lu ms after the loss (%s ms)", (unsigned long)total, text);
+    ml->rt_loss_ms = 0;
 }
 
 /* What ended the long-poll, recorded where poll_map_update() gives up. */
@@ -3599,6 +3646,7 @@ void ml_coord_task(void *arg) {
                 state = COORD_RECONNECTING;
                 break;
             }
+            ml->rt_tcp_ms = ml_get_time_ms();
             ml->h2_next_stream_id = 7;  /* Reset H2 stream counter for new connection */
             ml->last_ep_update_hash = 0;   /* new map session: send the endpoints once regardless */
             state = COORD_NOISE_HANDSHAKE;
@@ -3617,6 +3665,7 @@ void ml_coord_task(void *arg) {
              * before sending our H2 preface. Extracts nodeKeyChallenge
              * and adjusts rx_nonce. */
             process_proactive_frames(ml, &noise);
+            ml->rt_noise_ms = ml_get_time_ms();
             state = COORD_H2_PREFACE;
             break;
 
@@ -3640,6 +3689,7 @@ void ml_coord_task(void *arg) {
                 state = COORD_RECONNECTING;
                 break;
             }
+            ml->rt_register_ms = ml_get_time_ms();
             state = COORD_FETCH_PEERS;
             break;
 
@@ -3648,6 +3698,7 @@ void ml_coord_task(void *arg) {
             {
                 bool lp_started = false;
                 int fp_rc = do_map_exchange(ml, &noise, true);
+                ml->rt_fetch_ms = ml_get_time_ms();
                 if (fp_rc < 0) {
                     ESP_LOGW(TAG, "MapRequest failed, will retry");
                     note_ctrl_retry(ml, "MapRequest failed");
@@ -3671,7 +3722,9 @@ void ml_coord_task(void *arg) {
                         break;
                     }
                     lp_started = true;
-                    if (do_map_exchange(ml, &noise, false) < 0) {
+                    int stream_rc = do_map_exchange(ml, &noise, false);
+                    ml->rt_stream_ms = ml_get_time_ms();
+                    if (stream_rc < 0) {
                         ESP_LOGW(TAG, "Initial streaming netmap unavailable; retrying connection");
                     note_ctrl_retry(ml, "initial netmap unavailable or invalid");
                         ml_conn_close(ml);
@@ -3716,6 +3769,7 @@ void ml_coord_task(void *arg) {
                         ESP_LOGI(TAG, "Stop requested while waiting for DERP");
                         break;
                     }
+                    ml->rt_derp_ms = ml_get_time_ms();
                 }
 
                 /* Start streaming long-poll for incremental updates */
@@ -3746,6 +3800,7 @@ void ml_coord_task(void *arg) {
             state = COORD_LONG_POLL;
             ml->state = ML_STATE_CONNECTED;
             ml->connected_at_ms = ml_get_time_ms();
+            note_reconnected(ml, ml->connected_at_ms);
             reconnect_attempts = 0;
             last_activity_ms = ml->connected_at_ms;
             /* Seed the server-RX freshness clocks at (re)connect; from here
@@ -4040,6 +4095,7 @@ void ml_coord_task(void *arg) {
                 }
 
                 reconnect_attempts++;
+                ml->rt_backoff_ms = ml_get_time_ms();
 
                 /* Close old connection */
                 ml_conn_close(ml);

@@ -2299,6 +2299,7 @@ static void dump_wg_state_snapshot(microlink_t *ml) {
 /* Manager rest policy (pure; host-tested): rest the full 10 ms while WG frames
  * are still queued or after WG_MGR_MAX_BUSY_MS of work without a real rest. */
 #define WG_MGR_MAX_BUSY_MS 40
+#define WG_PERIODIC_SLOW_MS 80   /* wireguardif_periodic() warning threshold */
 #define WG_MGR_REST_MS     5
 static inline bool wg_mgr_must_rest(bool frames_waiting, uint64_t busy_ms) {
     return frames_waiting || busy_ms >= WG_MGR_MAX_BUSY_MS;
@@ -2472,9 +2473,9 @@ void ml_wg_mgr_task(void *arg) {
             wireguardif_periodic((struct netif *)ml->wg_netif);
             uint64_t dt = ml_get_time_ms() - t0;
             last_wg_periodic_ms = now;
-            /* Throughput-collapse diag: only log when actually slow (>30ms),
-             * routine fast ticks are noise. */
-            if (dt > 30) {
+            /* Only real stalls: a handshake initiation (X25519) takes ~32 ms
+             * and is routine; the old 30 ms threshold filled the warning log. */
+            if (dt > WG_PERIODIC_SLOW_MS) {
                 ESP_LOGW(TAG, "wireguardif_periodic SLOW: %llu ms",
                          (unsigned long long)dt);
             }

@@ -306,6 +306,9 @@ typedef struct {
     uint32_t ctrl_loss_count;
     char     ctrl_retry_reason[48];
     uint32_t ctrl_retry_failures;
+    /* Last reconnect after a loss: total and per-stage milliseconds. */
+    uint32_t ctrl_last_reconnect_ms;
+    char     ctrl_reconnect_stages[112];
 } microlink_diag_t;
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);

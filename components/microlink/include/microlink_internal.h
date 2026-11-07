@@ -526,6 +526,12 @@ struct microlink_s {
     volatile uint32_t ctrl_loss_count;
     const char *volatile ctrl_retry_reason;
     volatile uint32_t ctrl_retry_failures;   /* failed attempts since the last loss */
+    /* Reconnect timing (ml_get_time_ms): the loss and the end of each stage
+     * of the latest attempt, 0 = not reached. Coordinator task only. */
+    uint64_t rt_loss_ms, rt_backoff_ms, rt_tcp_ms, rt_noise_ms, rt_register_ms;
+    uint64_t rt_fetch_ms, rt_stream_ms, rt_derp_ms;
+    volatile uint32_t ctrl_last_reconnect_ms;   /* loss to session back, last time */
+    char ctrl_reconnect_stages[112];            /* "backoff 1000, tcp+tls 420, ..." */
     volatile uint32_t rc_coord_transport;  /* established coord session died (ctrl watchdog / PING send / recv) */
     volatile uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
     volatile uint32_t rc_derp_retry;       /* failed DERP connect attempts on the backoff ladder */

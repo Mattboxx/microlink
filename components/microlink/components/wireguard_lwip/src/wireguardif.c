@@ -1156,7 +1156,17 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 					// Process the handshake response
 					wireguardif_process_response_message(device, peer, msg_response, addr, port);
 				} else {
-					ESP_LOGW(TAG, "[WG_RX] ERROR: No peer found for receiver_idx=%lu", (unsigned long)msg_response->receiver);
+					/* Usually the second answer to an initiation sent both direct and via
+					 * DERP (the first one completed the handshake): one line per 30 s. */
+					static int64_t s_unmatched_logged_us; static uint32_t s_unmatched_suppressed;
+					int64_t unmatched_now = esp_timer_get_time();
+					if (!s_unmatched_logged_us || unmatched_now - s_unmatched_logged_us >= 30000000LL) {
+						ESP_LOGW(TAG, "[WG_RX] Handshake response without a pending handshake (receiver_idx=%lu, %lu more in the last 30 s)",
+						         (unsigned long)msg_response->receiver, (unsigned long)s_unmatched_suppressed);
+						s_unmatched_logged_us = unmatched_now; s_unmatched_suppressed = 0;
+					} else {
+						s_unmatched_suppressed++;
+					}
 				}
 			} else {
 				ESP_LOGW(TAG, "[WG_RX] Response MAC check FAILED");

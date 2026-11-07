@@ -1072,6 +1072,22 @@ static bool wireguardif_check_response_message(struct wireguard_device *device, 
 }
 
 
+/* Handshake messages that fail the MAC check come from anyone who can reach
+ * the port: one warning per 30 s with a count, so a flood costs neither
+ * logging CPU nor recorder writes. */
+static void log_mac_failure(const char *what) {
+	static int64_t s_logged_us;
+	static uint32_t s_suppressed;
+	int64_t now = esp_timer_get_time();
+	if (!s_logged_us || now - s_logged_us >= 30000000LL) {
+		ESP_LOGW(TAG, "[WG_RX] %s MAC check FAILED (%lu more in the last 30 s)", what, (unsigned long)s_suppressed);
+		s_logged_us = now;
+		s_suppressed = 0;
+	} else {
+		s_suppressed++;
+	}
+}
+
 void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port) {
 	LWIP_ASSERT("wireguardif_network_rx: invalid arg", arg != NULL);
 	LWIP_ASSERT("wireguardif_network_rx: invalid pbuf", p != NULL);
@@ -1098,12 +1114,11 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 	switch (type) {
 		case MESSAGE_HANDSHAKE_INITIATION:
 			msg_initiation = (struct message_handshake_initiation *)data;
-			ESP_LOGI(TAG, "[WG_RX] Handshake INITIATION from peer, sender_idx=%lu",
-				(unsigned long)msg_initiation->sender);
 
 			// Check mac1 (and optionally mac2) are correct - note it may internally generate a cookie reply packet
 			if (wireguardif_check_initiation_message(device, msg_initiation, addr, port)) {
-				ESP_LOGI(TAG, "[WG_RX] Initiation MAC check PASSED");
+				ESP_LOGI(TAG, "[WG_RX] Handshake INITIATION, sender_idx=%lu, MAC check PASSED",
+					(unsigned long)msg_initiation->sender);
 
 				peer = wireguard_process_initiation_message(device, msg_initiation);
 				if (peer) {
@@ -1137,18 +1152,17 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 					ESP_LOGW(TAG, "[WG_RX] Initiation process FAILED (bad keys/timestamp?)");
 				}
 			} else {
-				ESP_LOGW(TAG, "[WG_RX] Initiation MAC check FAILED");
+				log_mac_failure("Initiation");
 			}
 			break;
 
 		case MESSAGE_HANDSHAKE_RESPONSE:
 			msg_response = (struct message_handshake_response *)data;
-			ESP_LOGI(TAG, "[WG_RX] Handshake RESPONSE! receiver_idx=%lu sender_idx=%lu",
-				(unsigned long)msg_response->receiver, (unsigned long)msg_response->sender);
 
 			// Check mac1 (and optionally mac2) are correct - note it may internally generate a cookie reply packet
 			if (wireguardif_check_response_message(device, msg_response, addr, port)) {
-				ESP_LOGI(TAG, "[WG_RX] Response MAC check PASSED");
+				ESP_LOGI(TAG, "[WG_RX] Handshake RESPONSE, receiver_idx=%lu sender_idx=%lu, MAC check PASSED",
+					(unsigned long)msg_response->receiver, (unsigned long)msg_response->sender);
 
 				peer = peer_lookup_by_handshake(device, msg_response->receiver);
 				if (peer) {
@@ -1169,7 +1183,7 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 					}
 				}
 			} else {
-				ESP_LOGW(TAG, "[WG_RX] Response MAC check FAILED");
+				log_mac_failure("Response");
 			}
 			break;
 

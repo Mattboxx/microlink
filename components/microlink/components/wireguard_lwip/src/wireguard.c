@@ -592,6 +592,23 @@ uint8_t wireguard_get_message_type(const uint8_t *data, size_t len) {
 	return result;
 }
 
+/* DH(Sprivi,Spubr) of a peer, computed at its first handshake instead of when
+ * the peer is added (Mattboxx 2026-11-08): one X25519 costs about 15 ms on
+ * the ESP32-S3 and runs in the task that decrypts incoming packets, and a
+ * Tailnet adds every peer of its map at start and on each map change, most
+ * of which never talk to this node. A low-order key fails here, at its first
+ * handshake, instead of when it was added: no handshake is possible either way. */
+static bool peer_static_dh(struct wireguard_device *device, struct wireguard_peer *peer) {
+	if (!peer->public_key_dh_ready) {
+		if (wireguard_x25519(peer->public_key_dh, device->private_key, peer->public_key) != 0) {
+			crypto_zero(peer->public_key_dh, WIREGUARD_PUBLIC_KEY_LEN);
+			return false;
+		}
+		peer->public_key_dh_ready = true;
+	}
+	return true;
+}
+
 struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_device *device, struct message_handshake_initiation *msg) {
 	struct wireguard_peer *ret_peer = NULL;
 	struct wireguard_peer *peer = NULL;
@@ -640,7 +657,7 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 			wireguard_mix_hash(hash, msg->enc_static, sizeof(msg->enc_static));
 
 			peer = peer_lookup_by_pubkey(device, s);
-			if (peer) {
+			if (peer && peer_static_dh(device, peer)) {
 				handshake = &peer->handshake;
 
 				// (Ci,k) := Kdf2(Ci,DH(Sprivi,Spubr))
@@ -818,6 +835,7 @@ bool wireguard_create_handshake_initiation(struct wireguard_device *device, stru
 	struct wireguard_handshake *handshake = &peer->handshake;
 
 	memset(dst, 0, sizeof(struct message_handshake_initiation));
+	if (!peer_static_dh(device, peer)) return false;
 
 	// Ci := Hash(Construction) (precalculated hash)
 	memcpy(handshake->chaining_key, construction_hash, WIREGUARD_HASH_LEN);
@@ -1012,7 +1030,9 @@ bool wireguard_peer_init(struct wireguard_device *device, struct wireguard_peer 
 			crypto_zero(peer->preshared_key, WIREGUARD_SESSION_KEY_LEN);
 		}
 
-		if (wireguard_x25519(peer->public_key_dh, device->private_key, peer->public_key) == 0) {
+		/* DH(Sprivi,Spubr) is computed at the first handshake: peer_static_dh(). */
+		peer->public_key_dh_ready = false;
+		{
 			// Zero out handshake
 			memset(&peer->handshake, 0, sizeof(struct wireguard_handshake));
 			peer->handshake.valid = false;
@@ -1026,8 +1046,6 @@ bool wireguard_peer_init(struct wireguard_device *device, struct wireguard_peer 
 			wireguard_mac_key(peer->label_cookie_key, peer->public_key, LABEL_COOKIE, sizeof(LABEL_COOKIE));
 
 			peer->valid = true;
-		} else {
-			crypto_zero(peer->public_key_dh, WIREGUARD_PUBLIC_KEY_LEN);
 		}
 	}
 	return peer->valid;

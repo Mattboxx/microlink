@@ -65,7 +65,12 @@ extern "C" {
 #define ML_TASK_NET_IO_CORE     0
 
 #define ML_TASK_DERP_TX_STACK   (10 * 1024)  /* was 14K; ~3.7K peak observed */
-#define ML_TASK_DERP_TX_PRIO    5
+/* Relayed packets cross these tasks (TLS read/write) on their way to and from
+ * WireGuard: data-plane priority like the direct path (3.0.9; was 5, below
+ * the web server, MQTT and checks). Both rest 10 ms after 40 ms of
+ * continuous work (derp_must_rest) so lower tasks keep running. */
+#define ML_TASK_DERP_TX_PRIO    ML_TASK_DATAPLANE_PRIO
+#define ML_DERP_MAX_BUSY_MS     40
 #define ML_TASK_DERP_TX_CORE    0
 
 #define ML_TASK_COORD_STACK     (12 * 1024)

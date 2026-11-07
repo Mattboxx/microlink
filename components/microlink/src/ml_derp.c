@@ -549,11 +549,24 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * the writer task's heartbeat/status logs. File-scope so both tasks see it. */
 static volatile uint32_t s_derp_frames_rx = 0;
 
+/* Rest policy of the relay tasks (pure; host-tested): after
+ * ML_DERP_MAX_BUSY_MS of uninterrupted work, a 10 ms rest lets lower tasks
+ * run; a pass that found nothing to do restarts the window. */
+static bool derp_must_rest(bool worked, uint64_t now_ms, uint64_t *busy_since_ms)
+{
+    if (!worked) { *busy_since_ms = 0; return false; }
+    if (!*busy_since_ms) { *busy_since_ms = now_ms ? now_ms : 1; return false; }
+    if (now_ms - *busy_since_ms < ML_DERP_MAX_BUSY_MS) return false;
+    *busy_since_ms = 0;
+    return true;
+}
+
 void ml_derp_tx_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "DERP I/O task started (Core %d)", xPortGetCoreID());
 
     uint32_t frames_tx = 0;
+    uint64_t tx_busy_since = 0;
     uint64_t last_status_ms = 0;
     uint32_t loop_count = 0;
     uint64_t last_heartbeat_ms = 0;
@@ -719,7 +732,8 @@ void ml_derp_tx_task(void *arg) {
          * wakes within 50ms to re-check events/connected. Remaining items in
          * the batch use timeout 0 to clear the burst in one pass. */
         {
-            for (int tx_count = 0; tx_count < 32; tx_count++) {
+            int tx_count;
+            for (tx_count = 0; tx_count < 32; tx_count++) {
                 ml_derp_tx_item_t item;
                 /* First item: block up to 50ms so the writer paces itself
                  * (no RX work to fill idle loops anymore) and wakes within
@@ -752,6 +766,8 @@ void ml_derp_tx_task(void *arg) {
                 }
                 free(item.data);
             }
+            /* A full batch means more is queued: rest after 40 ms of it. */
+            if (derp_must_rest(tx_count == 32, ml_get_time_ms(), &tx_busy_since)) vTaskDelay(pdMS_TO_TICKS(10));
         }
         /* Writer paces naturally by blocking up to 50ms on the queue above;
          * RX (and its hot-spin pacing) now lives in ml_derp_rx_task. */
@@ -792,6 +808,7 @@ static void derp_rx_wait(microlink_t *ml)
 
 void ml_derp_rx_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
+    uint64_t rx_busy_since = 0;
     ESP_LOGI(TAG, "DERP RX task started (Core %d)", xPortGetCoreID());
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         if (!ml->derp.connected || ml->derp.sockfd < 0) {
@@ -818,6 +835,7 @@ void ml_derp_rx_task(void *arg) {
             }
         }
         if (!got) derp_rx_wait(ml);   /* idle: until bytes arrive, bounded (O_NONBLOCK socket) */
+        if (derp_must_rest(got, ml_get_time_ms(), &rx_busy_since)) vTaskDelay(pdMS_TO_TICKS(10));
     }
     ESP_LOGI(TAG, "DERP RX task exiting");
     ml_task_exiting(ml);

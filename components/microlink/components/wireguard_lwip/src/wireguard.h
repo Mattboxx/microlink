@@ -159,6 +159,7 @@ struct wireguard_peer {
 
 	// Precomputed DH(Sprivi,Spubr) with device private key, and peer public key
 	uint8_t public_key_dh[WIREGUARD_PUBLIC_KEY_LEN];
+	bool public_key_dh_ready;	// computed at the first handshake with this peer
 
 	// Session keypairs
 	struct wireguard_keypair curr_keypair;

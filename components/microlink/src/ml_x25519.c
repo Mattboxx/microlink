@@ -20,6 +20,22 @@
 #define X25519_SUPPORT_SIGN 0
 #define X25519_MEMCPY_PARAMS 1
 #define X25519_USE_POWER_CHAIN 1
+#if defined(ESP_PLATFORM)
+/* Mattboxx 2026-11-08: on the device the control plane (Noise, the node key,
+ * DISCO shared keys for every peer, DERP boxes) uses the WireGuard X25519
+ * (wireguard_lwip refc/x25519.c): the same STROBE algorithm and results, with
+ * the field product chosen on the device (Xtensa assembly or the ESP32-S3
+ * vector unit, each checked against C before use) instead of the compiled C
+ * product. It also masks the received point's top bit as RFC 7748 section 5
+ * requires (as Go's x/crypto and the WireGuard path do); the copy below did
+ * not, which only changes results for non-canonical points. Host builds keep
+ * the implementation below; tools/test_x25519_control.py compares the two. */
+int x25519_control(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], const uint8_t x1[X25519_BYTES], int clamp);
+
+int ml_x25519(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], const uint8_t x1[X25519_BYTES], int clamp) {
+    return x25519_control(out, scalar, x1, clamp);
+}
+#else
 #if BYTE_ORDER == LITTLE_ENDIAN
 static inline uint32_t eswap_letoh_32(uint32_t w) { return w; }
 #else
@@ -321,6 +337,7 @@ int ml_x25519(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], con
     if (clamp) return ret;
     else return 0;
 }
+#endif /* ESP_PLATFORM */
 
 const uint8_t ML_X25519_BASE_POINT[X25519_BYTES] = {9};
 

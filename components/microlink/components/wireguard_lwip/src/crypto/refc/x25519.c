@@ -648,3 +648,26 @@ int x25519(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], const 
 #endif
     return r;
 }
+
+/* Control-plane calls (MicroLink ml_x25519: Noise, node key, DISCO, DERP):
+ * the same scalar multiplication and product selection, timed separately so
+ * the WireGuard handshake figures above stay those of the data plane. */
+#if defined(ESP_PLATFORM)
+volatile uint32_t x25519_control_cycles_last, x25519_control_calls;
+#endif
+int x25519_control(uint8_t out[X25519_BYTES], const uint8_t scalar[X25519_BYTES], const uint8_t x1[X25519_BYTES], int clamp) {
+#if defined(ESP_PLATFORM)
+    int core = xPortGetCoreID();
+    uint32_t t0 = esp_cpu_get_cycle_count();
+#endif
+#if defined(__XTENSA__) && X25519_WBITS == 32 && !defined(X25519_NO_XTENSA_MUL)
+    if (!s_mul_asm) mul_select();
+#endif
+    int r = x25519_impl(out, scalar, x1, clamp);
+#if defined(ESP_PLATFORM)
+    uint32_t dt = esp_cpu_get_cycle_count() - t0;
+    if (core == xPortGetCoreID() && dt < 0x80000000u) x25519_control_cycles_last = dt;
+    x25519_control_calls++;
+#endif
+    return r;
+}

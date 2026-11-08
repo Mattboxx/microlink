@@ -331,6 +331,19 @@ typedef enum {
 } microlink_boot_mark_t;
 void microlink_get_boot_marks(const microlink_t *ml, uint32_t out[ML_BOOT_MARKS]);
 
+/* The first non-streaming map fetch of this boot, in ms from the start of
+ * the request: when it was sent, when the first and the last response data
+ * arrived, and when the fetch ended (end_stream: 1 = HTTP/2 END_STREAM,
+ * 2 = the socket closed or timed out, 0 = not done). Separates waiting for
+ * the server from waiting for the end of a response already received. */
+typedef struct {
+    uint32_t sent_ms, first_byte_ms, last_data_ms, done_ms;
+    uint32_t bytes, frames;
+    int8_t end;
+    bool valid;
+} microlink_boot_fetch_t;
+void microlink_get_boot_fetch(const microlink_t *ml, microlink_boot_fetch_t *out);
+
 /* Liveness probe for the DERP I/O task: ml_get_time_ms() captured at the
  * top of that task's most recent loop iteration. Subtract from a monotonic
  * ms clock to get the "heartbeat age" — a value that climbs without bound

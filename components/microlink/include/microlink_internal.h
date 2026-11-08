@@ -538,6 +538,7 @@ struct microlink_s {
     volatile uint32_t ctrl_last_reconnect_ms;   /* loss to session back, last time */
     char ctrl_reconnect_stages[112];            /* "backoff 1000, tcp+tls 420, ..." */
     uint32_t boot_ms[ML_BOOT_FIRST_TUNNEL];     /* microlink_get_boot_marks(): first session only */
+    microlink_boot_fetch_t boot_fetch;          /* microlink_get_boot_fetch(): first map fetch only */
     volatile uint32_t rc_coord_transport;  /* established coord session died (ctrl watchdog / PING send / recv) */
     volatile uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
     volatile uint32_t rc_derp_retry;       /* failed DERP connect attempts on the backoff ladder */

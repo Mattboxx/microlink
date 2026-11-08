@@ -972,6 +972,11 @@ void microlink_get_boot_marks(const microlink_t *ml, uint32_t out[ML_BOOT_MARKS]
     out[ML_BOOT_FIRST_TUNNEL] = wireguard_first_session_ms;
 }
 
+void microlink_get_boot_fetch(const microlink_t *ml, microlink_boot_fetch_t *out) {
+    if (!out) return;
+    if (ml) *out = ml->boot_fetch; else memset(out, 0, sizeof *out);
+}
+
 uint64_t ml_get_time_ms(void) {
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
 }

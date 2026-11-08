@@ -2451,6 +2451,11 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     if (send_request) {
         ESP_LOGI(TAG, "[TIMING] MapRequest send: %lld ms", (t_map_sent - t_map_start) / 1000);
     }
+    /* Boot timeline: time the first fetch of this boot (microlink_get_boot_fetch). */
+    microlink_boot_fetch_t bf = {0};
+    const bool time_fetch = send_request && !ml->boot_fetch.valid;
+    bf.sent_ms = (uint32_t)((t_map_sent - t_map_start) / 1000);
+    size_t bf_prev_data = 0;
 
     /* Read MapResponse - accumulate ALL decrypted Noise frames first, then parse H2.
      * This is critical because a single H2 frame can span multiple Noise frames
@@ -2494,8 +2499,12 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
         int frame_len = noise_recv(ml, noise, frame_buf, 65536);
         if (frame_len <= 0) {
             free(frame_buf);
+            bf.end = 2;
             break;
         }
+        if (!bf.frames) bf.first_byte_ms = (uint32_t)((esp_timer_get_time() - t_map_start) / 1000);
+        bf.frames++;
+        bf.bytes += (uint32_t)frame_len;
 
         /* Append decrypted data to h2_recv */
         if (h2_total + frame_len < ML_H2_BUFFER_SIZE) {
@@ -2569,7 +2578,12 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
             }
         }
 
+        if (scan_data_total > bf_prev_data) {
+            bf.last_data_ms = (uint32_t)((esp_timer_get_time() - t_map_start) / 1000);
+            bf_prev_data = scan_data_total;
+        }
         if (got_end_stream) {
+            bf.end = 1;
             ESP_LOGI(TAG, "H2 END_STREAM detected after %d Noise frames (%dKB, %lums)",
                      read_count + 1, (int)(h2_total / 1024),
                      (unsigned long)(ml_get_time_ms() - recv_start_ms));
@@ -2597,6 +2611,12 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
             }
             window_consumed = 0;
         }
+    }
+
+    if (time_fetch) {
+        bf.done_ms = (uint32_t)((esp_timer_get_time() - t_map_start) / 1000);
+        bf.valid = true;
+        ml->boot_fetch = bf;
     }
 
     /* Restore normal recv timeout (5 seconds for long-poll) */

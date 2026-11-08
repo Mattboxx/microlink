@@ -390,6 +390,10 @@ esp_err_t microlink_start(microlink_t *ml) {
 
     ml->state = ML_STATE_WIFI_WAIT;
     xEventGroupClearBits(ml->events, ML_EVT_TASKS_READY | ML_EVT_SHUTDOWN_REQUEST);
+    if (!ml->boot_ms[ML_BOOT_START]) {
+        uint64_t now = ml_get_time_ms();
+        ml->boot_ms[ML_BOOT_START] = now ? (uint32_t)now : 1;
+    }
 
     /* Set WiFi TX power if configured */
     if (ml->config.wifi_tx_power_dbm > 0) {
@@ -957,6 +961,15 @@ const char *microlink_imei_device_name(void) {
     }
 #endif
     return NULL;
+}
+
+extern volatile uint32_t wireguard_first_session_ms;   /* wireguard.c */
+
+void microlink_get_boot_marks(const microlink_t *ml, uint32_t out[ML_BOOT_MARKS]) {
+    for (int i = 0; i < ML_BOOT_MARKS; i++) out[i] = 0;
+    if (!ml) return;
+    for (int i = 0; i < ML_BOOT_FIRST_TUNNEL; i++) out[i] = ml->boot_ms[i];
+    out[ML_BOOT_FIRST_TUNNEL] = wireguard_first_session_ms;
 }
 
 uint64_t ml_get_time_ms(void) {

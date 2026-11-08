@@ -313,6 +313,24 @@ typedef struct {
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);
 
+/* Boot timeline of the tailnet: milliseconds since boot at which the first
+ * control session of this boot passed each stage (0 = not reached yet). Set
+ * once per boot from the stage clocks the reconnect diagnostics already keep;
+ * RAM only. FIRST_TUNNEL is the first WireGuard session with any peer. */
+typedef enum {
+    ML_BOOT_START,          /* microlink_start() */
+    ML_BOOT_TCP_TLS,        /* control server TCP + TLS */
+    ML_BOOT_NOISE,          /* Noise handshake */
+    ML_BOOT_REGISTER,       /* node registration */
+    ML_BOOT_MAP,            /* first network map */
+    ML_BOOT_STREAM_MAP,     /* streaming map request */
+    ML_BOOT_DERP,           /* DERP relay connected */
+    ML_BOOT_CONNECTED,      /* control session established */
+    ML_BOOT_FIRST_TUNNEL,   /* first WireGuard session */
+    ML_BOOT_MARKS
+} microlink_boot_mark_t;
+void microlink_get_boot_marks(const microlink_t *ml, uint32_t out[ML_BOOT_MARKS]);
+
 /* Liveness probe for the DERP I/O task: ml_get_time_ms() captured at the
  * top of that task's most recent loop iteration. Subtract from a monotonic
  * ms clock to get the "heartbeat age" — a value that climbs without bound

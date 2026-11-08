@@ -3800,6 +3800,16 @@ void ml_coord_task(void *arg) {
             state = COORD_LONG_POLL;
             ml->state = ML_STATE_CONNECTED;
             ml->connected_at_ms = ml_get_time_ms();
+            if (!ml->boot_ms[ML_BOOT_CONNECTED]) {
+                /* First session of this boot: keep its stage clocks (set by
+                 * every attempt, ms since boot) for the boot timeline. */
+                const uint64_t stage[] = {ml->rt_tcp_ms, ml->rt_noise_ms, ml->rt_register_ms,
+                                          ml->rt_fetch_ms, ml->rt_stream_ms, ml->rt_derp_ms};
+                for (size_t i = 0; i < sizeof stage / sizeof stage[0]; i++) {
+                    ml->boot_ms[ML_BOOT_TCP_TLS + i] = stage[i] > UINT32_MAX ? UINT32_MAX : (uint32_t)stage[i];
+                }
+                ml->boot_ms[ML_BOOT_CONNECTED] = ml->connected_at_ms ? (uint32_t)ml->connected_at_ms : 1;
+            }
             note_reconnected(ml, ml->connected_at_ms);
             reconnect_attempts = 0;
             last_activity_ms = ml->connected_at_ms;

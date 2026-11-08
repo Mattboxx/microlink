@@ -520,9 +520,17 @@ static void add_new_keypair(struct wireguard_peer *peer, struct wireguard_keypai
 	}
 }
 
+/* First WireGuard session of this boot, ms since boot (0 = none yet): the
+ * boot timeline's "first tunnel" (microlink_get_boot_marks). */
+volatile uint32_t wireguard_first_session_ms;
+
 bool wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
 	wireguard_expire_handshake(peer);
 	if (!peer->handshake.valid) return false;
+	if (!wireguard_first_session_ms) {
+		uint32_t now = wireguard_sys_now();
+		wireguard_first_session_ms = now ? now : 1;
+	}
 	struct wireguard_handshake *handshake = &peer->handshake;
 	struct wireguard_keypair new_keypair;
 

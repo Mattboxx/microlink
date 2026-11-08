@@ -8,7 +8,7 @@ endif()
 # against the C code before first use; see poly1305-donna-32.h, chacha20.c).
 set(WG_ASM_SRCS)
 if(IDF_TARGET STREQUAL "esp32s3")
-    set(WG_ASM_SRCS "src/crypto/refc/poly1305_xtensa.S" "src/crypto/refc/chacha20_xtensa.S")
+    set(WG_ASM_SRCS "src/crypto/refc/poly1305_xtensa.S" "src/crypto/refc/chacha20_xtensa.S" "src/crypto/refc/x25519_mul_xtensa.S")
 endif()
 
 idf_component_register(

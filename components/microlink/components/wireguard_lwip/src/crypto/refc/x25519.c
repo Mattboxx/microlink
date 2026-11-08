@@ -161,11 +161,16 @@ void x25519_mul_xtensa(limb_t out[2*NLIMBS], const limb_t a[NLIMBS], const limb_
 #if CONFIG_IDF_TARGET_ESP32S3 && !defined(X25519_NO_PIE)
 #define X25519_HAVE_PIE 1
 void x25519_mul_pie(limb_t out[2*NLIMBS], const limb_t a[NLIMBS], const limb_t b[NLIMBS]);
+/* The PIE product and mul()'s reduction in one routine (out may be a or b). */
+void x25519_mulred_pie(limb_t out[NLIMBS], const limb_t a[NLIMBS], const limb_t b[NLIMBS]);
+static bool s_mulred_pie;               /* mul() is x25519_mulred_pie: checked, faster */
 #endif
 static volatile int s_mul_asm;          /* 0 unchecked, 1 Xtensa, 2 PIE, -1 C */
 static mul_product_fn volatile s_mul_fn; /* the product mul() uses when s_mul_asm > 0 */
 static bool s_sqr_pie;                  /* squares as PIE products: faster than sqr() */
-volatile uint32_t x25519_mul_cycles[4]; /* C, Xtensa, PIE product; C square (diag) */
+/* diag: product cycles of C, Xtensa, PIE; C square; mul() with the PIE product
+ * and the C reduction; mul() fused (x25519_mulred_pie) */
+volatile uint32_t x25519_mul_cycles[6];
 
 static int mul_fn_check(mul_product_fn fn) {
     limb_t a[NLIMBS], b[NLIMBS], want[2*NLIMBS], got[2*NLIMBS];
@@ -188,6 +193,14 @@ static int mul_fn_check(mul_product_fn fn) {
 }
 #endif
 
+int x25519_mulred_status(void) {
+#if defined(X25519_HAVE_PIE)
+    return s_mulred_pie;
+#else
+    return 0;
+#endif
+}
+
 int x25519_sqr_pie(void) {
 #if defined(X25519_HAVE_PIE)
     return s_sqr_pie;
@@ -204,15 +217,9 @@ int x25519_mul_status(void) {
 #endif
 }
 
-static void mul(fe out, const fe a, const fe b, unsigned nb) {
-    limb_t accum[2*NLIMBS];
+/* out = accum mod 2^255 - 19, partially reduced (2^256 = 38). */
+static void mul_reduce(fe out, const limb_t accum[2*NLIMBS]) {
     unsigned j;
-#if defined(__XTENSA__) && X25519_WBITS == 32 && !defined(X25519_NO_XTENSA_MUL)
-    if (nb == NLIMBS && s_mul_asm > 0) s_mul_fn(accum, a, b);
-    else
-#endif
-    mul_product_c(accum, a, b, nb);
-
     limb_t carry2 = 0;
     const limb_t mand = 38;
     for (j=0; j<NLIMBS; j++) {
@@ -220,6 +227,53 @@ static void mul(fe out, const fe a, const fe b, unsigned nb) {
     }
     propagate(out,carry2);
 }
+
+static void mul(fe out, const fe a, const fe b, unsigned nb) {
+#if defined(X25519_HAVE_PIE)
+    if (nb == NLIMBS && s_mulred_pie) {x25519_mulred_pie(out, a, b); return;}
+#endif
+    limb_t accum[2*NLIMBS];
+#if defined(__XTENSA__) && X25519_WBITS == 32 && !defined(X25519_NO_XTENSA_MUL)
+    if (nb == NLIMBS && s_mul_asm > 0) s_mul_fn(accum, a, b);
+    else
+#endif
+    mul_product_c(accum, a, b, nb);
+    mul_reduce(out, accum);
+}
+
+#if defined(X25519_HAVE_PIE)
+/* The fused routine against the C product and reduction: separate output,
+ * output aliasing a, then b, and squares in place (as mul1()/sqr1() use it). */
+static int mulred_check(void) {
+    limb_t a[NLIMBS], b[NLIMBS], acc[2*NLIMBS];
+    fe want, got;
+    uint32_t seed = 0x19u;
+    for (int round = 0; round < 40; round++) {
+        for (int i = 0; i < NLIMBS; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            a[i] = round == 0 ? ~(limb_t)0 : round == 1 ? 0 : round == 2 ? (limb_t)1 << (i * 4) : seed;
+            seed = seed * 1664525u + 1013904223u;
+            b[i] = round == 0 || round == 1 ? ~(limb_t)0 : seed ^ (round & 1 ? ~(limb_t)0 : 0);
+        }
+        mul_product_c(acc, a, b, NLIMBS);
+        mul_reduce(want, acc);
+        x25519_mulred_pie(got, a, b);
+        if (memcmp(want, got, sizeof want)) return 0;
+        memcpy(got, a, sizeof got);
+        x25519_mulred_pie(got, got, b);
+        if (memcmp(want, got, sizeof want)) return 0;
+        memcpy(got, b, sizeof got);
+        x25519_mulred_pie(got, a, got);
+        if (memcmp(want, got, sizeof want)) return 0;
+        mul_product_c(acc, a, a, NLIMBS);
+        mul_reduce(want, acc);
+        memcpy(got, a, sizeof got);
+        x25519_mulred_pie(got, got, got);
+        if (memcmp(want, got, sizeof want)) return 0;
+    }
+    return 1;
+}
+#endif
 
 /* Dedicated squaring (Mattboxx 2026-11-08): the off-diagonal products once
  * (28 instead of 56), doubled, plus the 8 squares: 36 multiplications
@@ -308,6 +362,24 @@ static limb_t canon(fe x) {
 
 static const limb_t a24[1]={121665};
 
+/* out = a * 121665, reduced as mul(a, a24, 1) does, word for word: the
+ * 9-word product has only one high word, so the 38 fold touches out[0] and
+ * then only carries. Without the 16-word zeroed accumulator and the eight
+ * folds of zero words of the generic path (once per ladder step). */
+static void mul_a24(fe out, const fe a) {
+    limb_t t[NLIMBS], carry = 0;
+    unsigned j;
+    for (j=0; j<NLIMBS; j++) {
+        t[j] = umaal(&carry, 0, a24[0], a[j]);
+    }
+    limb_t c2 = 0;
+    out[0] = umaal(&c2, t[0], 38, carry);
+    for (j=1; j<NLIMBS; j++) {
+        out[j] = adc0(&c2, t[j]);
+    }
+    propagate(out, c2);
+}
+
 static void ladder_part1(fe xs[5]) {
     limb_t *x2 = xs[0], *z2=xs[1],*x3=xs[2],*z3=xs[3],*t1=xs[4];
     add(t1,x2,z2);  // t1 = A
@@ -321,7 +393,7 @@ static void ladder_part1(fe xs[5]) {
     sqr1(t1);       // t1 = AA
     sqr1(z2);       // z2 = BB
     sub(x2,t1,z2);  // x2 = E = AA-BB
-    mul(z2,x2,a24,sizeof(a24)/sizeof(a24[0])); // z2 = E*a24
+    mul_a24(z2,x2); // z2 = E*a24
     add(z2,z2,t1);  // z2 = E*a24 + AA
 }
 static void ladder_part2(fe xs[5], const fe x1) {
@@ -570,6 +642,7 @@ volatile uint32_t x25519_cycles_last, x25519_cycles_max, x25519_calls;
 #if defined(__XTENSA__) && X25519_WBITS == 32 && !defined(X25519_NO_XTENSA_MUL)
 #if defined(ESP_PLATFORM)
 /* Fewest cycles of eight runs (an interrupt only makes a run slower). */
+/* square: 0 the product fn (NULL: C), 1 sqr(), 2 mul() as configured. */
 static uint32_t mul_cycles(mul_product_fn fn, int square) {
     limb_t a[NLIMBS], b[NLIMBS], acc[2*NLIMBS];
     fe out;
@@ -577,7 +650,8 @@ static uint32_t mul_cycles(mul_product_fn fn, int square) {
     for (int i = 0; i < NLIMBS; i++) {a[i] = 0x9e3779b9u * (i + 1); b[i] = ~a[i];}
     for (int run = 0; run < 8; run++) {
         uint32_t t0 = esp_cpu_get_cycle_count();
-        if (square) sqr(out, a);
+        if (square == 2) mul(out, a, b, NLIMBS);
+        else if (square) sqr(out, a);
         else if (fn) fn(acc, a, b);
         else mul_product_c(acc, a, b, NLIMBS);
         uint32_t dt = esp_cpu_get_cycle_count() - t0;
@@ -587,8 +661,9 @@ static uint32_t mul_cycles(mul_product_fn fn, int square) {
 }
 #endif
 
-/* First use: keep the products that match C, use the fastest; squares go
- * through the PIE product when that beats the dedicated C squaring. */
+/* First use: keep the products that match C, use the fastest; with PIE,
+ * mul() becomes the fused product and reduction when that matches C and is
+ * faster, and squares go through it when that beats the dedicated C square. */
 static void mul_select(void) {
     static const struct {mul_product_fn fn; int id;} cand[] = {
         {x25519_mul_xtensa, 1},
@@ -617,9 +692,15 @@ static void mul_select(void) {
 #if defined(X25519_HAVE_PIE) && defined(ESP_PLATFORM)
     x25519_mul_cycles[3] = mul_cycles(NULL, 1);   /* C square, before any switch */
     if (best_id == 2) {
-        /* sqr() through PIE: the PIE product plus the reduction, against the
-         * C square measured above (both with the reduction) */
         s_mul_asm = 2;
+        x25519_mul_cycles[4] = mul_cycles(NULL, 2);  /* PIE product + C reduction */
+        if (mulred_check()) {
+            s_mulred_pie = true;
+            x25519_mul_cycles[5] = mul_cycles(NULL, 2);
+            s_mulred_pie = x25519_mul_cycles[5] < x25519_mul_cycles[4];
+        }
+        /* sqr() through mul(), as now configured, against the C square
+         * measured above (both with the reduction) */
         s_sqr_pie = true;
         uint32_t via_pie = mul_cycles(NULL, 1);
         s_sqr_pie = via_pie < x25519_mul_cycles[3];

@@ -26,7 +26,7 @@
 
 static const char *TAG = "ml_netcheck";
 
-/* Total wait after the probes are sent. It blocks the control session, the
+/* Total time of the netcheck, DNS and sends included. It blocks the control session, the
  * relay and the first tunnel, and one silent region (usual: some regions do
  * not answer STUN from every network) used to hold it for the whole budget:
  * 25 s made every boot and control reconnect about 28 s slower on board A
@@ -217,6 +217,9 @@ uint16_t ml_netcheck_pick_best_derp(microlink_t *ml) {
     }
 
     struct nc_probe probes[NETCHECK_MAX_PROBES];
+    /* The budget counts from here: the DNS lookups and the spaced sends
+     * (about 2 s for 28 regions) are part of the time the session waits. */
+    const uint64_t deadline = esp_timer_get_time() + (uint64_t)NETCHECK_TIMEOUT_MS * 1000ULL;
     int probe_count = 0;
 
     int regions = ml->derp_region_count < NETCHECK_MAX_PROBES ?
@@ -265,7 +268,6 @@ uint16_t ml_netcheck_pick_best_derp(microlink_t *ml) {
     ESP_LOGI(TAG, "sent %d STUN probes, retrying every %d ms up to %d ms total",
              probe_count, NETCHECK_RETRY_GAP_MS, NETCHECK_TIMEOUT_MS);
 
-    uint64_t deadline = esp_timer_get_time() + (uint64_t)NETCHECK_TIMEOUT_MS * 1000ULL;
     uint64_t next_retry_at = esp_timer_get_time() + (uint64_t)NETCHECK_RETRY_GAP_MS * 1000ULL;
     int retries_done = 0;
 

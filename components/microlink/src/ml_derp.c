@@ -380,6 +380,29 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
     if (payload) free(payload);
 }
 
+/* Wait until the relay socket has bytes instead of sleeping a whole tick
+ * (pdMS_TO_TICKS(5) is 0 at 100 Hz: those waits spun), so a relayed packet is
+ * read as soon as it arrives. The bound keeps the reader quick to park when
+ * the writer tears the connection down (the writer waits up to 200 ms).
+ * Returns select()'s result; without a socket, or on failure, sleeps one
+ * tick and returns -1. */
+#define DERP_RX_IDLE_WAIT_US 20000
+static int derp_wait_readable(microlink_t *ml, long us)
+{
+    int fd = ml->derp.sockfd;
+    if (fd < 0 || !ml->derp.connected) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return -1;
+    }
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(fd, &rd);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = us };
+    int rc = ml_select_fds(fd + 1, &rd, NULL, NULL, &tv);
+    if (rc < 0) vTaskDelay(pdMS_TO_TICKS(10));   /* select failed: never hot-spin */
+    return rc;
+}
+
 /**
  * Try to read one DERP frame.
  * Uses mbedtls recv_timeout (100ms) so ssl_read never blocks indefinitely.
@@ -396,8 +419,15 @@ static int poll_derp_read(microlink_t *ml) {
         n == MBEDTLS_ERR_SSL_TIMEOUT) {
         return 0;  /* No data available / timeout */
     }
-    if (n <= 0) {
-        ESP_LOGW(TAG, "DERP header read returned %d (0x%04x)", n, n < 0 ? -n : 0);
+    if (n == 0) {
+        /* The relay closed the TLS session: reconnect now. Treating it as "no
+         * data" left the reader polling a closed socket until the 90 s
+         * silence watchdog (and, waiting with select(), spinning). */
+        ESP_LOGW(TAG, "DERP server closed the connection");
+        return -1;
+    }
+    if (n < 0) {
+        ESP_LOGW(TAG, "DERP header read returned %d (0x%04x)", n, -n);
         return n;
     }
     /* mbedtls_ssl_read() never crosses a TLS record, and the server's records
@@ -413,7 +443,7 @@ static int poll_derp_read(microlink_t *ml) {
         n = mbedtls_ssl_read(&ml->derp.ssl, header + got, sizeof header - got);
         if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
             n == MBEDTLS_ERR_SSL_TIMEOUT) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            derp_wait_readable(ml, DERP_RX_IDLE_WAIT_US);
             continue;
         }
         if (n <= 0) {
@@ -459,14 +489,14 @@ static int poll_derp_read(microlink_t *ml) {
         n = mbedtls_ssl_read(&ml->derp.ssl, buf + total_read, len - total_read);
         if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
             n == MBEDTLS_ERR_SSL_TIMEOUT) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            derp_wait_readable(ml, DERP_RX_IDLE_WAIT_US);
             continue;
         }
         if (n <= 0) {
             ESP_LOGW(TAG, "DERP payload read error: %d (0x%04x) at %d/%lu bytes",
                      n, n < 0 ? -n : 0, (int)total_read, (unsigned long)len);
             free(buf);
-            return n;
+            return n < 0 ? n : -1;   /* 0 = the relay closed the session */
         }
         total_read += n;
     }
@@ -786,29 +816,10 @@ void ml_derp_tx_task(void *arg) {
  * not touching the ssl context so the writer can tear it down safely.
  * ========================================================================== */
 
-/* Idle reader: wait until the relay socket has bytes instead of sleeping a
- * whole tick, so a relayed packet is read as soon as it arrives (it used to
- * wait up to 10 ms). The 20 ms bound keeps the reader quick to park when the
- * writer tears the connection down (it waits up to 200 ms for that). */
-#define DERP_RX_IDLE_WAIT_US 20000
-static void derp_rx_wait(microlink_t *ml)
-{
-    int fd = ml->derp.sockfd;
-    if (fd < 0 || !ml->derp.connected) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        return;
-    }
-    fd_set rd;
-    FD_ZERO(&rd);
-    FD_SET(fd, &rd);
-    struct timeval tv = { .tv_sec = 0, .tv_usec = DERP_RX_IDLE_WAIT_US };
-    if (ml_select_fds(fd + 1, &rd, NULL, NULL, &tv) < 0)
-        vTaskDelay(pdMS_TO_TICKS(10));   /* select failed: never hot-spin */
-}
-
 void ml_derp_rx_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     uint64_t rx_busy_since = 0;
+    bool readable_idle = false;   /* select() said readable, then nothing was read */
     ESP_LOGI(TAG, "DERP RX task started (Core %d)", xPortGetCoreID());
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         if (!ml->derp.connected || ml->derp.sockfd < 0) {
@@ -834,7 +845,13 @@ void ml_derp_rx_task(void *arg) {
                 break;
             }
         }
-        if (!got) derp_rx_wait(ml);   /* idle: until bytes arrive, bounded (O_NONBLOCK socket) */
+        /* Idle: wait for bytes (bounded). If the socket was reported readable
+         * and the next pass still read nothing, sleep a tick instead: a
+         * readable socket that yields no frame must never make this
+         * data-plane-priority task spin. */
+        if (got) readable_idle = false;
+        else if (readable_idle) { vTaskDelay(pdMS_TO_TICKS(10)); readable_idle = false; }
+        else readable_idle = derp_wait_readable(ml, DERP_RX_IDLE_WAIT_US) > 0;
         if (derp_must_rest(got, ml_get_time_ms(), &rx_busy_since)) vTaskDelay(pdMS_TO_TICKS(10));
     }
     ESP_LOGI(TAG, "DERP RX task exiting");

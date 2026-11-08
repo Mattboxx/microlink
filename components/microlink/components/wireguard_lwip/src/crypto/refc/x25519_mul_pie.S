@@ -60,333 +60,333 @@ x25519_mul_pie:
     wur.sar_byte a5
     ee.src.q q5, q3, q4
     ee.vmulas.u16.accx q0, q5
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a2, 0
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 12
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 2
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 0
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 4
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 2
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 6
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 4
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 8
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 6
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 10
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 8
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q5, q3, q4
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a2, 10
     ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a2, 12
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     ee.vmulas.u16.accx q0, q3
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a2, 14
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 14
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 16
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 14
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 12
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 18
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 16
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 20
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 18
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 22
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 20
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 24
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 22
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 26
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 24
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a2, 26
+    ee.vmulas.u16.accx q0, q5
     ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 28
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 28
     ee.vmulas.u16.accx q0, q2
     ee.vmulas.u16.accx q1, q3
+    movi    a5, 14
+    wur.sar_byte a5
+    ee.src.q q5, q4, q2
+    ee.src.q q6, q2, q3
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a2, 30
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
-    movi    a5, 14
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
+    movi    a5, 12
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a2, 32
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
-    movi    a5, 12
-    wur.sar_byte a5
-    ee.src.q q5, q4, q2
     ee.vmulas.u16.accx q0, q5
-    ee.src.q q6, q2, q3
     ee.vmulas.u16.accx q1, q6
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a2, 34
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 36
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 34
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 38
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 36
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 40
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 38
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 42
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 40
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a2, 42
+    ee.vmulas.u16.accx q0, q5
     ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a2, 44
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     ee.vmulas.u16.accx q1, q2
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a2, 46
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 14
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 48
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 46
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 12
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 50
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 48
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 52
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 50
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 54
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 52
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 56
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 54
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 58
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a2, 56
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q6, q4, q2
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a2, 58
     ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a2, 60
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
-    s16i    a6, a2, 62
+    s16i    a6, a2, 60
+    s16i    a8, a2, 62
     retw.n
     .size   x25519_mul_pie, . - x25519_mul_pie
 
@@ -435,417 +435,417 @@ x25519_mulred_pie:
     wur.sar_byte a5
     ee.src.q q5, q3, q4
     ee.vmulas.u16.accx q0, q5
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a1, 0
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 12
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 2
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 0
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 4
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 2
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 6
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 4
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 8
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 6
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q5, q3, q4
-    ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 10
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 8
+    ee.vmulas.u16.accx q0, q5
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q5, q3, q4
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a1, 10
     ee.vmulas.u16.accx q0, q5
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a1, 12
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     ee.vmulas.u16.accx q0, q3
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a1, 14
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 14
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 16
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 14
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 12
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 18
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 16
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 20
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 18
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 22
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 20
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 24
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 22
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 26
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 24
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q5, q2, q3
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q3, q4
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a1, 26
+    ee.vmulas.u16.accx q0, q5
     ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 28
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 28
     ee.vmulas.u16.accx q0, q2
     ee.vmulas.u16.accx q1, q3
+    movi    a5, 14
+    wur.sar_byte a5
+    ee.src.q q5, q4, q2
+    ee.src.q q6, q2, q3
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a1, 30
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
-    movi    a5, 14
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
+    movi    a5, 12
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a1, 32
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
-    movi    a5, 12
-    wur.sar_byte a5
-    ee.src.q q5, q4, q2
     ee.vmulas.u16.accx q0, q5
-    ee.src.q q6, q2, q3
     ee.vmulas.u16.accx q1, q6
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a1, 34
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 36
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 34
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 38
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 36
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 40
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 38
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 42
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 40
+    ee.vmulas.u16.accx q0, q5
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q5, q4, q2
-    ee.vmulas.u16.accx q0, q5
     ee.src.q q6, q2, q3
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a1, 42
+    ee.vmulas.u16.accx q0, q5
     ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
     s16i    a6, a1, 44
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     ee.vmulas.u16.accx q1, q2
-    rur.accx_0 a6
-    rur.accx_1 a7
-    s16i    a6, a1, 46
-    src     a6, a7, a6
-    wur.accx_0 a6
-    wur.accx_1 a15
     movi    a5, 14
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 48
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 46
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 12
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 50
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 48
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 10
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 52
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 50
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 8
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 54
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 52
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 6
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 56
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 54
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 4
     wur.sar_byte a5
     ee.src.q q6, q4, q2
-    ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 58
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
+    s16i    a6, a1, 56
+    ee.vmulas.u16.accx q1, q6
     movi    a5, 2
     wur.sar_byte a5
     ee.src.q q6, q4, q2
+    rur.accx_0 a6
+    rur.accx_1 a7
+    src     a8, a7, a6
+    wur.accx_0 a8
+    wur.accx_1 a15
+    s16i    a6, a1, 58
     ee.vmulas.u16.accx q1, q6
     rur.accx_0 a6
     rur.accx_1 a7
-    s16i    a6, a1, 60
-    src     a6, a7, a6
-    wur.accx_0 a6
+    src     a8, a7, a6
+    wur.accx_0 a8
     wur.accx_1 a15
-    s16i    a6, a1, 62
+    s16i    a6, a1, 60
+    s16i    a8, a1, 62
     movi    a15, 38
-    l32i    a3, a1, 0
     l32i    a11, a1, 32
-    mull    a13, a11, a15
-    muluh   a11, a11, a15
-    add     a3, a3, a13
-    saltu   a13, a3, a13
-    add     a14, a11, a13
+    l32i    a3, a1, 0
+    l32i    a13, a1, 36
+    mull    a12, a11, a15
     l32i    a4, a1, 4
-    l32i    a11, a1, 36
-    mull    a13, a11, a15
     muluh   a11, a11, a15
-    add     a4, a4, a13
-    saltu   a13, a4, a13
-    add     a11, a11, a13
-    add     a4, a4, a14
-    saltu   a13, a4, a14
-    add     a14, a11, a13
     l32i    a5, a1, 8
-    l32i    a11, a1, 40
-    mull    a13, a11, a15
-    muluh   a11, a11, a15
-    add     a5, a5, a13
-    saltu   a13, a5, a13
-    add     a11, a11, a13
-    add     a5, a5, a14
-    saltu   a13, a5, a14
-    add     a14, a11, a13
     l32i    a6, a1, 12
-    l32i    a11, a1, 44
-    mull    a13, a11, a15
-    muluh   a11, a11, a15
-    add     a6, a6, a13
-    saltu   a13, a6, a13
-    add     a11, a11, a13
-    add     a6, a6, a14
-    saltu   a13, a6, a14
-    add     a14, a11, a13
     l32i    a7, a1, 16
-    l32i    a11, a1, 48
-    mull    a13, a11, a15
-    muluh   a11, a11, a15
-    add     a7, a7, a13
-    saltu   a13, a7, a13
-    add     a11, a11, a13
-    add     a7, a7, a14
-    saltu   a13, a7, a14
-    add     a14, a11, a13
     l32i    a8, a1, 20
-    l32i    a11, a1, 52
-    mull    a13, a11, a15
-    muluh   a11, a11, a15
-    add     a8, a8, a13
-    saltu   a13, a8, a13
-    add     a11, a11, a13
-    add     a8, a8, a14
-    saltu   a13, a8, a14
-    add     a14, a11, a13
     l32i    a9, a1, 24
-    l32i    a11, a1, 56
-    mull    a13, a11, a15
-    muluh   a11, a11, a15
-    add     a9, a9, a13
-    saltu   a13, a9, a13
-    add     a11, a11, a13
-    add     a9, a9, a14
-    saltu   a13, a9, a14
-    add     a14, a11, a13
     l32i    a10, a1, 28
-    l32i    a11, a1, 60
-    mull    a13, a11, a15
+    add     a3, a3, a12
+    saltu   a12, a3, a12
+    add     a14, a11, a12
+    mull    a12, a13, a15
+    muluh   a13, a13, a15
+    l32i    a11, a1, 40
+    add     a4, a4, a12
+    saltu   a12, a4, a12
+    add     a13, a13, a12
+    add     a4, a4, a14
+    saltu   a14, a4, a14
+    add     a14, a14, a13
+    mull    a12, a11, a15
     muluh   a11, a11, a15
-    add     a10, a10, a13
-    saltu   a13, a10, a13
-    add     a11, a11, a13
+    l32i    a13, a1, 44
+    add     a5, a5, a12
+    saltu   a12, a5, a12
+    add     a11, a11, a12
+    add     a5, a5, a14
+    saltu   a14, a5, a14
+    add     a14, a14, a11
+    mull    a12, a13, a15
+    muluh   a13, a13, a15
+    l32i    a11, a1, 48
+    add     a6, a6, a12
+    saltu   a12, a6, a12
+    add     a13, a13, a12
+    add     a6, a6, a14
+    saltu   a14, a6, a14
+    add     a14, a14, a13
+    mull    a12, a11, a15
+    muluh   a11, a11, a15
+    l32i    a13, a1, 52
+    add     a7, a7, a12
+    saltu   a12, a7, a12
+    add     a11, a11, a12
+    add     a7, a7, a14
+    saltu   a14, a7, a14
+    add     a14, a14, a11
+    mull    a12, a13, a15
+    muluh   a13, a13, a15
+    l32i    a11, a1, 56
+    add     a8, a8, a12
+    saltu   a12, a8, a12
+    add     a13, a13, a12
+    add     a8, a8, a14
+    saltu   a14, a8, a14
+    add     a14, a14, a13
+    mull    a12, a11, a15
+    muluh   a11, a11, a15
+    l32i    a13, a1, 60
+    add     a9, a9, a12
+    saltu   a12, a9, a12
+    add     a11, a11, a12
+    add     a9, a9, a14
+    saltu   a14, a9, a14
+    add     a14, a14, a11
+    mull    a12, a13, a15
+    muluh   a13, a13, a15
+    add     a10, a10, a12
+    saltu   a12, a10, a12
+    add     a13, a13, a12
     add     a10, a10, a14
-    saltu   a13, a10, a14
-    add     a14, a11, a13
-    srli    a11, a10, 31
+    saltu   a14, a10, a14
+    add     a14, a14, a13
+    movi    a15, 19
+    srli    a12, a10, 31
     slli    a10, a10, 1
     srli    a10, a10, 1
-    addx2   a11, a14, a11
-    movi    a15, 19
-    mull    a13, a11, a15
+    addx2   a12, a14, a12
+    mull    a13, a12, a15
     add     a3, a3, a13
     saltu   a13, a3, a13
     s32i    a3, a2, 0

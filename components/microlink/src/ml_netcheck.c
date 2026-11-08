@@ -26,8 +26,14 @@
 
 static const char *TAG = "ml_netcheck";
 
-#define NETCHECK_TIMEOUT_MS    25000 /* Total budget — covers a 19-second STUN retry seen in ml_stun */
-#define NETCHECK_RETRY_GAP_MS  5000  /* Re-send to non-responded regions every 5 s, mimics tailscale Go */
+/* Total wait after the probes are sent. It blocks the control session, the
+ * relay and the first tunnel, and one silent region (usual: some regions do
+ * not answer STUN from every network) used to hold it for the whole budget:
+ * 25 s made every boot and control reconnect about 28 s slower on board A
+ * (3.0.12-pre4/pre5 boot timeline). 5 s, like the Tailscale client's report
+ * timeout; a region slower than that is not a useful relay. */
+#define NETCHECK_TIMEOUT_MS    5000
+#define NETCHECK_RETRY_GAP_MS  1000  /* Re-send to regions without two samples every second */
 #define NETCHECK_MAX_RETRIES   3     /* Initial send + up to 3 retries = 4 attempts/region */
 #define NETCHECK_PROBE_GAP_MS  50    /* Spread sendto() to avoid local NAT/UDP burst loss */
 #define NETCHECK_MAX_PROBES    ML_MAX_DERP_REGIONS

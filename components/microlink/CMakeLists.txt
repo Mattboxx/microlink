@@ -6,6 +6,7 @@ set(SRCS
     "src/ml_peer_sync.c"
     "src/ml_derp.c"
     "src/ml_tls_distrust.c"
+    "src/ml_dns_config.c"
     "src/ml_net_io.c"
     "src/ml_wg_mgr.c"
     "src/ml_stun.c"

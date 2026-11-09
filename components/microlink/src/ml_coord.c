@@ -38,6 +38,7 @@
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
 #include "ml_tls_distrust.h"
+#include "ml_dns_config.h"
 #include <string.h>
 #include <errno.h>
 
@@ -2116,6 +2117,7 @@ static bool apply_peer_map(microlink_t *ml,cJSON *map) {
                  policy_ok?"peers":"policy",policy_ok?"peer-parse":ml_policy_last_reject(),keys);
         return false;
     }
+    ml_dns_apply_map(map);   /* own MagicDNS name and tailnet DNS settings */
     return true;
 }
 

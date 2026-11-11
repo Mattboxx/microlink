@@ -747,8 +747,9 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->vpn_ip = update->vpn_ip;
     memcpy(p->public_key, update->public_key, 32);
     memcpy(p->disco_key, update->disco_key, 32);
-    strncpy(p->hostname, update->hostname, sizeof(p->hostname) - 1);
-    p->hostname[sizeof(p->hostname) - 1] = '\0';
+    size_t hostname_len = strnlen(update->hostname, sizeof(p->hostname) - 1);
+    memcpy(p->hostname, update->hostname, hostname_len);
+    p->hostname[hostname_len] = '\0';
     p->derp_region = update->derp_region;
     p->active = true;
 

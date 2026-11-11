@@ -24,8 +24,11 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "mbedtls/ssl.h"
+#include "mbedtls/version.h"
+#if MBEDTLS_VERSION_MAJOR < 4
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
+#endif
 #include "esp_heap_caps.h"
 /* Forward-declare esp_tls_t so we can hold a pointer without pulling in
  * the full esp_tls.h header (esp-tls REQUIRES added in CMakeLists). */
@@ -473,8 +476,10 @@ typedef struct {
     int sockfd;                     /* Raw TCP socket */
     mbedtls_ssl_context ssl;        /* TLS context (owned exclusively by DERP I/O task) */
     mbedtls_ssl_config ssl_conf;
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
+#endif
     bool connected;
     volatile bool rx_parked;        /* reader sets true when NOT touching the ssl context */
     uint64_t last_recv_ms;          /* For keepalive watchdog */

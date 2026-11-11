@@ -25,6 +25,11 @@ set(SRCS
     "src/ml_config_httpd.c"
 )
 
+set(ML_JSON_COMPONENT json)
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    set(ML_JSON_COMPONENT espressif__cjson)
+endif()
+
 set(REQUIRES
     nvs_flash
     esp_wifi
@@ -33,9 +38,11 @@ set(REQUIRES
     esp_timer
     lwip
     mbedtls
-    json
+    ${ML_JSON_COMPONENT}
     driver
     esp_driver_tsens
+    esp_driver_uart
+    esp_driver_gpio
     esp_http_server
     esp-tls
 )

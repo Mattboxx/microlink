@@ -970,12 +970,14 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     /* TLS setup */
     mbedtls_ssl_init(&ml->derp.ssl);
     mbedtls_ssl_config_init(&ml->derp.ssl_conf);
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_entropy_init(&ml->derp.entropy);
     mbedtls_ctr_drbg_init(&ml->derp.ctr_drbg);
 
     mbedtls_ctr_drbg_seed(&ml->derp.ctr_drbg, mbedtls_entropy_func,
                            &ml->derp.entropy, NULL, 0);
 
+#endif
     mbedtls_ssl_config_defaults(&ml->derp.ssl_conf,
                                  MBEDTLS_SSL_IS_CLIENT,
                                  MBEDTLS_SSL_TRANSPORT_STREAM,
@@ -988,7 +990,9 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         ESP_LOGE(TAG, "DERP TLS: CA bundle attach failed (%s)", esp_err_to_name(cb));
         goto fail_tls;
     }
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, mbedtls_ctr_drbg_random, &ml->derp.ctr_drbg);
+#endif
     mbedtls_ssl_conf_read_timeout(&ml->derp.ssl_conf, DERP_CONNECT_TIMEOUT_MS);
 
     if (mbedtls_ssl_setup(&ml->derp.ssl, &ml->derp.ssl_conf) != 0) {
@@ -1297,8 +1301,10 @@ fail_tls:
      * would have defeated the endless-retry recovery entirely. */
     mbedtls_ssl_free(&ml->derp.ssl);
     mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
     mbedtls_entropy_free(&ml->derp.entropy);
+#endif
     ml_close_sock(sock);
     ml->derp.sockfd = -1;
     return ESP_FAIL;
@@ -1312,8 +1318,10 @@ void ml_derp_disconnect(microlink_t *ml) {
         mbedtls_ssl_close_notify(&ml->derp.ssl);
         mbedtls_ssl_free(&ml->derp.ssl);
         mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+#if MBEDTLS_VERSION_MAJOR < 4
         mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
         mbedtls_entropy_free(&ml->derp.entropy);
+#endif
         ml_close_sock(ml->derp.sockfd);
         ml->derp.sockfd = -1;
     }

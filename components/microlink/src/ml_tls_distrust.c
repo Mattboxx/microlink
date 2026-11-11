@@ -3,7 +3,12 @@
 #include "ml_tls_distrust.h"
 
 #include <string.h>
+#include "mbedtls/version.h"
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include "psa/crypto.h"
+#else
 #include "mbedtls/sha256.h"
+#endif
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 
@@ -52,7 +57,13 @@ bool ml_tls_spki_distrusted(const uint8_t *spki_der, size_t len)
 {
     if (!spki_der || !len) return false;
     uint8_t digest[32];
+#if MBEDTLS_VERSION_MAJOR >= 4
+    size_t written = 0;
+    if (psa_hash_compute(PSA_ALG_SHA_256, spki_der, len, digest, sizeof digest,
+                         &written) != PSA_SUCCESS || written != sizeof digest) return true;
+#else
     if (mbedtls_sha256(spki_der, len, digest, 0) != 0) return true;   /* fail closed */
+#endif
     for (unsigned i = 0; i < ML_TLS_DISTRUSTED_COUNT; i++) {
         if (!memcmp(digest, s_distrusted[i], sizeof digest)) return true;
     }

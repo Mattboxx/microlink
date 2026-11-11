@@ -1,14 +1,40 @@
-# MicroLink v2 — ESP32 Tailscale Client
+# MicroLink — Mattboxx Edition
 
-> [!IMPORTANT]
-> **Upstream credit and fork notice:** this repository is a focused fork of
-> [Csontikka/microlink](https://github.com/Csontikka/microlink), the original
-> MicroLink project by **Cameron Malone**. The original project and its
-> contributors retain full credit for MicroLink. This fork remains distributed
-> under the original [MIT License](LICENSE); it is not a new, independently
-> authored VPN implementation.
+ESP-IDF networking component used by
+[ESP32 Tailnet Gateway — Mattboxx Edition](https://github.com/Mattboxx/esp32-tailnet-gateway).
+It supplies the gateway's Tailscale-compatible control and data planes,
+including userspace WireGuard, DERP relay connections and peer discovery.
+For ready-to-install firmware, use the [gateway releases](https://github.com/Mattboxx/esp32-tailnet-gateway/releases).
 
-## What the Mattboxx fork changes
+MicroLink originated with **[Cameron Malone](https://github.com/CamM2325/microlink)**.
+This repository is maintained by Mattboxx and descends from the
+[Csontikka fork](https://github.com/Csontikka/microlink). See [NOTICE](NOTICE.md)
+for the original authors and the bundled WireGuard and X25519 notices.
+
+## Mattboxx integration
+
+- Bounded startup and reconnect handling, plus reduced diagnostic exposure of peer details.
+- Optional 4via6 hooks for the host firmware.
+- ESP32-S3 WireGuard cryptography optimizations, with device-checked Xtensa
+  and vector routines for ChaCha20, Poly1305 and X25519.
+- Gateway diagnostics for control-plane timing and relay state.
+
+The gateway pins an exact MicroLink commit. The default `mattboxx` branch
+serves the ESP-IDF 5.5 integration. The [ESP-IDF 6.1 branch](https://github.com/Mattboxx/microlink/tree/fix/esp-idf-6.1)
+is used by the gateway's 6.1 beta line. Standalone examples and the hardware
+notes below come from upstream and have their own validation scope.
+
+## License
+
+The current Mattboxx fork is distributed as a whole under [GPL-3.0-only](LICENSE)
+with the [ESP-IDF linking permission](LICENSE-EXCEPTION.md). Original MicroLink
+and third-party notices are preserved. Earlier copies keep the terms under
+which they were received. See [NOTICE](NOTICE.md) for the scope of each licence.
+
+## Integration history
+
+<details>
+<summary>October and September 2026 integration notes</summary>
 
 ### October 13, 2026: upstream v0.1.32 dependency fixes
 
@@ -69,9 +95,7 @@ registration-error handling and coordinated task/DERP/WireGuard teardown.
 The privacy redactions and 4via6 hooks below are retained, including in merge
 conflicts. Upstream tests do not substitute for testing this integrated build.
 
-Compared with the upstream `main` branch, this fork contains only the following
-integration and privacy changes for the
-[Mattboxx ESP32 Tailscale Gateway](https://github.com/Mattboxx/esp32-tailscale-gateway):
+The earlier gateway integration also added:
 
 - **Privacy-hardened diagnostics:** removes peer hostnames, WireGuard/DISCO key
   prefixes, endpoint IP addresses and endpoint ports from warning-level
@@ -83,14 +107,14 @@ integration and privacy changes for the
 - **Longer advertised-route configuration:** expands the internal advertised
   route buffer from 256 to 512 bytes for the router integration.
 
-Everything else below documents the original MicroLink project and is retained
-for compatibility and upstream attribution.
+</details>
 
-Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G cellular support. Should work on most ESP32 variants (ESP32, ESP32-S3, ESP32-P4, etc.) — ESP32-S3 with PSRAM recommended for production.
+The reference below covers MicroLink's upstream APIs, standalone examples
+and historical hardware measurements.
 
 ## Features
 
-- **Full Tailscale Protocol Support**
+- **Tailscale-compatible networking**
   - ts2021 coordination protocol
   - WireGuard encryption (ChaCha20-Poly1305)
   - DISCO path discovery (PING/PONG/CALL_ME_MAYBE)
@@ -168,7 +192,7 @@ MicroLink uses standard ESP-IDF APIs — any ESP32 variant with WiFi and suffici
 ### 1. Clone and enter an example
 
 ```bash
-git clone https://github.com/CamM2325/microlink.git
+git clone https://github.com/Mattboxx/microlink.git
 cd microlink/examples/basic_connect    # or: cellular_connect, cellular_heartbeat, failover_connect
 ```
 
@@ -857,10 +881,6 @@ MicroLink includes improvements from community forks:
 - **[dj-oyu](https://github.com/dj-oyu)** — Zero-copy WireGuard receive mode, PONG rate-limiting, adaptive probe intervals, symmetric NAT port spray, and path discovery optimizations. Originally developed for high-throughput video streaming on RDK-X5 smart pet camera.
 
 - **[GrieferPig](https://github.com/GrieferPig)** — WireGuard peer lookup fix to prefer peers with valid keypairs, preventing handshake failures with stale peer references.
-
-## License
-
-MIT License — see [LICENSE](LICENSE)
 
 ## Disclaimer
 

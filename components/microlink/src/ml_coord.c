@@ -1401,11 +1401,25 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
     cJSON_AddStringToObject(root, "NodeKey", key_str);
 
-    /* Auth - only include if auth_key is valid (matching v1 behavior) */
-    if (ml->config.auth_key && strlen(ml->config.auth_key) > 0) {
+    /* Auth: only while this identity has not been accepted with this key
+     * (ml_reg_auth.h). Presenting a used single-use key again at every
+     * reconnect made the control server refuse a registered device. */
+    bool have_key = ml->config.auth_key && ml->config.auth_key[0];
+    if (!ml->reg_auth_loaded) {
+        ml->reg_auth.registered = ml_identity_registered(ml);
+        ml->reg_auth_loaded = true;
+    }
+    bool sent_key = ml_reg_auth_send_key(&ml->reg_auth, have_key);
+    ml->reg_note = NULL;
+    if (sent_key) {
         cJSON *auth = cJSON_CreateObject();
+        if (!auth) { cJSON_Delete(root); return -1; }
         cJSON_AddStringToObject(auth, "AuthKey", ml->config.auth_key);
         cJSON_AddItemToObject(root, "Auth", auth);
+        ESP_LOGI(TAG, "Registering with the auth key");
+    } else if (have_key) {
+        ESP_LOGI(TAG, "Registering the known identity without the auth key (%s)",
+                 ml->reg_auth.refused ? "the key was refused" : "already registered with it");
     }
 
     /* Hostinfo */
@@ -1657,12 +1671,24 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
      * exchanging map updates and passing traffic. */
     {
         cJSON *err_j = cJSON_GetObjectItem(resp_json, "Error");
-        if (err_j && cJSON_IsString(err_j) && err_j->valuestring && *err_j->valuestring) {
+        cJSON *url_j = cJSON_GetObjectItem(resp_json, "AuthURL");
+        bool refused = err_j && cJSON_IsString(err_j) && err_j->valuestring && *err_j->valuestring;
+        bool needs_auth = !refused && url_j && cJSON_IsString(url_j) && url_j->valuestring && *url_j->valuestring;
+        const char *note = NULL;
+        ml_reg_outcome_t outcome = ml_reg_auth_result(&ml->reg_auth, have_key, sent_key, refused, needs_auth, &note);
+        if (refused) {
             ESP_LOGE(TAG, "RegisterResponse.Error: %s", err_j->valuestring);
-            ESP_LOGE(TAG, "  Registration was refused by the control plane. "
-                          "Check the auth_key is valid and not expired.");
+        } else if (needs_auth) {
+            /* Not usable: the control server does not authorize this node.
+             * (Proceeding to the map used to look connected while not.) */
+            ESP_LOGW(TAG, "RegisterResponse.AuthURL set - this device is not authorized. "
+                          "Approve it at: %s", url_j->valuestring);
+        }
+        if (outcome != ML_REG_ACCEPTED) {
+            ESP_LOGE(TAG, "  %s", note);
+            ml->reg_note = note;
             cJSON_Delete(resp_json);
-            return -1;
+            return outcome == ML_REG_RETRY ? -2 : -1;
         }
 
         cJSON *exp_j = cJSON_GetObjectItem(resp_json, "NodeKeyExpired");
@@ -1678,11 +1704,14 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
             return -1;
         }
 
-        cJSON *url_j = cJSON_GetObjectItem(resp_json, "AuthURL");
-        if (url_j && cJSON_IsString(url_j) && url_j->valuestring && *url_j->valuestring) {
-            ESP_LOGW(TAG, "RegisterResponse.AuthURL set - authorization is pending. "
-                          "Approve this node at: %s", url_j->valuestring);
+        cJSON *auth_j = cJSON_GetObjectItem(resp_json, "MachineAuthorized");
+        if (auth_j && cJSON_IsFalse(auth_j)) {
+            ESP_LOGW(TAG, "RegisterResponse.MachineAuthorized=false - waiting for approval "
+                          "of this device in the admin console");
         }
+        /* Accepted (the key, if presented, is consumed now): from here on
+         * reconnects and restarts register without it. */
+        ml_identity_mark_registered(ml);
 
         /* Identity, for logging only. ID from User, name from Login (with the
          * User.DisplayName override applied if present) - as the reference does. */
@@ -3701,12 +3730,17 @@ void ml_coord_task(void *arg) {
 
         case COORD_REGISTER:
             ESP_LOGI(TAG, "Registering...");
-            if (do_register(ml, &noise) < 0) {
-                ESP_LOGE(TAG, "Registration failed");
-                    note_ctrl_retry(ml, "registration failed");
-                ml_conn_close(ml);
-                state = COORD_RECONNECTING;
-                break;
+            {
+                int reg = do_register(ml, &noise);
+                if (reg < 0) {
+                    ESP_LOGE(TAG, "Registration failed");
+                    note_ctrl_retry(ml, ml->reg_note ? ml->reg_note : "registration failed");
+                    ml_conn_close(ml);
+                    /* The other key choice is tried at once on a new
+                     * connection; every other failure keeps the backoff. */
+                    state = reg == -2 ? COORD_TCP_CONNECT : COORD_RECONNECTING;
+                    break;
+                }
             }
             ml->rt_register_ms = ml_get_time_ms();
             state = COORD_FETCH_PEERS;

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "microlink.h"
+#include "ml_reg_auth.h"
 #include "ml_config_httpd.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -503,6 +504,13 @@ struct microlink_s {
      * common case is a never-registered board or one that just went
      * through microlink_factory_reset. */
     bool identity_persistent;
+
+    /* When registration presents the auth key (ml_reg_auth.h); `registered`
+     * is read from NVS at the first registration, the rest is per boot. */
+    ml_reg_auth_t reg_auth;
+    bool reg_auth_loaded;
+    /* Why the last registration failed (static text), for ctrl_retry_reason. */
+    const char *reg_note;
 
     /* Identity from the last RegisterResponse — for display only. A failed
      * registration is detected from RegisterResponse.Error / NodeKeyExpired /
@@ -1021,6 +1029,10 @@ static inline void *ml_psram_calloc(size_t n, size_t size) {
     if (!ptr) ptr = calloc(n, size);
     return ptr;
 }
+
+/* Registration record of this identity and auth key (microlink.c). */
+bool ml_identity_registered(microlink_t *ml);
+void ml_identity_mark_registered(microlink_t *ml);
 
 #ifdef __cplusplus
 }

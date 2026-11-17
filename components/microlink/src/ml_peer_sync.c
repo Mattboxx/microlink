@@ -22,7 +22,24 @@ static portMUX_TYPE sync_lock=portMUX_INITIALIZER_UNLOCKED;
 #define SALLOC(n) heap_caps_malloc((n),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)
 #endif
 typedef struct {bool used;ml_peer_update_t desired;} sync_entry;
+/* Sized by the tailnet (PSRAM), not by the WireGuard slot count: every peer
+ * of the map has its latest metadata here even while it has no tunnel. */
 static sync_entry *sync_entries;
+static int sync_cap;
+#define SYNC_FIRST_CAP 16
+#define SYNC_MAX_CAP 65536
+/* Writer only. Readers touch entries only under SLOCK, so the copy needs no
+ * lock: only the pointer swap does, and the old table is unused after it. */
+static bool sync_grow(void){
+    if(sync_cap>=SYNC_MAX_CAP)return false;
+    int cap=sync_cap?sync_cap*2:SYNC_FIRST_CAP;
+    sync_entry *fresh=SALLOC((size_t)cap*sizeof *fresh);if(!fresh)return false;
+    memset(fresh,0,(size_t)cap*sizeof *fresh);
+    if(sync_entries)memcpy(fresh,sync_entries,(size_t)sync_cap*sizeof *fresh);
+    sync_entry *old=sync_entries;
+    SLOCK();sync_entries=fresh;sync_cap=cap;SUNLOCK();
+    free(old);return true;
+}
 bool ml_peer_sync_record(const ml_peer_update_t *u){
     if(!u||!u->has_node_id)return false;
     uint8_t key[32];int authority=ml_policy_peer_key(u->node_id,key);
@@ -31,14 +48,13 @@ bool ml_peer_sync_record(const ml_peer_update_t *u){
     static const uint8_t zero[32]={0};
     if(memcmp(u->public_key,zero,32)&&memcmp(u->public_key,key,32))return false;
     /* Only the coordinator allocates; readers see NULL until fully zeroed. */
-    if(!sync_entries){sync_entry *fresh=SALLOC(ML_MAX_PEERS*sizeof *fresh);if(!fresh)return false;
-        memset(fresh,0,ML_MAX_PEERS*sizeof *fresh);SLOCK();sync_entries=fresh;SUNLOCK();}
+    if(!sync_entries&&!sync_grow())return false;
     int slot=-1;
     /* Writer-only selection. Calls to policy never occur under the mailbox
      * lock, avoiding policy/mailbox lock inversion with the WG consumer. */
-    for(int i=0;i<ML_MAX_PEERS;i++)if(sync_entries[i].used&&sync_entries[i].desired.node_id==u->node_id){slot=i;break;}
-    if(slot<0)for(int i=0;i<ML_MAX_PEERS;i++)if(!sync_entries[i].used||ml_policy_peer_status(sync_entries[i].desired.public_key)==0){slot=i;break;}
-    if(slot<0)return false;
+    for(int i=0;i<sync_cap;i++)if(sync_entries[i].used&&sync_entries[i].desired.node_id==u->node_id){slot=i;break;}
+    if(slot<0)for(int i=0;i<sync_cap;i++)if(!sync_entries[i].used||ml_policy_peer_status(sync_entries[i].desired.public_key)==0){slot=i;break;}
+    if(slot<0){int first_new=sync_cap;if(!sync_grow())return false;slot=first_new;}
     SLOCK();sync_entry *e=&sync_entries[slot];
     if(u->action==ML_PEER_ADD){
         bool keep_online=e->used&&!memcmp(e->desired.public_key,key,32)&&e->desired.has_online&&!u->has_online;
@@ -59,9 +75,16 @@ bool ml_peer_sync_resolve(ml_peer_update_t *u){
     static const uint8_t zero[32]={0};
     if(memcmp(u->public_key,zero,32)&&memcmp(u->public_key,key,32))return false;
     bool found=false;int action=u->action;
-    SLOCK();if(sync_entries)for(int i=0;i<ML_MAX_PEERS;i++){
+    SLOCK();if(sync_entries)for(int i=0;i<sync_cap;i++){
         const sync_entry *e=&sync_entries[i];
         if(e->used&&e->desired.node_id==u->node_id&&!memcmp(e->desired.public_key,key,32)){*u=e->desired;u->action=action;found=true;break;}
     }SUNLOCK();
     uint8_t current[32];return found&&ml_policy_peer_key(u->node_id,current)==1&&!memcmp(key,current,32);
+}
+/* Entry `index` (0..) of the mailbox, for the WireGuard slot manager to find
+ * map peers without a tunnel. false past the end; *used tells a free entry. */
+bool ml_peer_sync_entry(int index,ml_peer_update_t *out,bool *used){
+    bool ok=false;
+    SLOCK();if(sync_entries&&index>=0&&index<sync_cap){ok=true;*used=sync_entries[index].used;if(*used)*out=sync_entries[index].desired;}SUNLOCK();
+    return ok;
 }

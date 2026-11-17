@@ -684,6 +684,38 @@ static int find_peer_by_node_id(microlink_t *ml, uint64_t node_id) {
     return -1;
 }
 
+/* Tunnel slots (ML_MAX_PEERS, internal RAM) are fewer than the peers a
+ * tailnet can have; the map and policy hold every peer (PSRAM). When the
+ * slots are full, a peer that needs one takes the slot of a peer that is
+ * offline (by the map) or quiet for ML_WG_IDLE_EVICT_MS, never of one in use
+ * or the priority peer. The peer that gave its slot keeps its metadata and
+ * gets a slot again when it comes online (fill_tunnel_slots). */
+#define ML_WG_IDLE_EVICT_MS 120000ULL
+static uint64_t peer_activity_ms(const ml_peer_t *p) {
+    uint64_t t = p->peer_added_ms;
+    if (p->last_send_ms > t) t = p->last_send_ms;
+    if (p->last_pong_recv_ms > t) t = p->last_pong_recv_ms;
+    if (p->last_init_handshake_ms > t) t = p->last_init_handshake_ms;
+    return t;
+}
+static int tunnel_slot_to_give(microlink_t *ml, const ml_peer_update_t *update) {
+    if (update->has_online && !update->online) return -1;   /* offline: no tunnel needed now */
+    uint64_t now = ml_get_time_ms();
+    int best = -1; bool best_offline = false; uint64_t best_act = UINT64_MAX;
+    for (int i = 0; i < ML_MAX_PEERS; i++) {
+        const ml_peer_t *c = &ml->peers[i];
+        if (!c->active) continue;
+        if (ml->config.priority_peer_ip != 0 && c->vpn_ip == ml->config.priority_peer_ip) continue;
+        uint64_t act = peer_activity_ms(c);
+        bool offline = !c->online, idle = now - act >= ML_WG_IDLE_EVICT_MS;
+        if (!offline && !idle) continue;   /* in use: keep */
+        if (best < 0 || (offline && !best_offline) || (offline == best_offline && act < best_act)) {
+            best = i; best_offline = offline; best_act = act;
+        }
+    }
+    return best;
+}
+
 static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
      * Still process updates for existing peers (they may become allowed later). */
@@ -734,8 +766,26 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         }
 
         if (idx < 0) {
-            ESP_LOGW(TAG, "Peer table full (%d slots), cannot add peer",
-                     ML_MAX_PEERS);
+            int give = tunnel_slot_to_give(ml, update);
+            if (give >= 0) {
+                ESP_LOGI(TAG, "Tunnel slot %d: %s (%s) replaces %s (%s)", give, update->hostname,
+                         update->has_online && update->online ? "online" : "needed",
+                         ml->peers[give].hostname, ml->peers[give].online ? "idle" : "offline");
+                if (ml->peers[give].wg_peer_index >= 0 && ml->wg_netif) {
+                    wireguardif_remove_peer((struct netif *)ml->wg_netif,
+                                            ml->peers[give].wg_peer_index);
+                }
+                ml->peers[give].active = false;   /* metadata stays in the mailbox */
+                idx = give;
+            }
+        }
+        if (idx < 0) {
+            if (update->has_online && !update->online) {
+                ESP_LOGD(TAG, "%s is offline: no tunnel slot until it comes online", update->hostname);
+            } else {
+                ESP_LOGW(TAG, "All %d tunnel slots are in use by active peers; %s waits",
+                         ML_MAX_PEERS, update->hostname);
+            }
             return -1;
         }
         if (idx >= ml->peer_count) {
@@ -1021,8 +1071,32 @@ static void prune_peer_cache(microlink_t *ml) {
     }
 }
 
+/* Every 30 s: map peers that are online, authorized and without a tunnel slot
+ * get one (from an offline or idle peer). A few per round. */
+#define ML_WG_FILL_EVERY_MS 30000ULL
+static void fill_tunnel_slots(microlink_t *ml) {
+    static uint64_t last_ms;
+    uint64_t now = ml_get_time_ms();
+    if (last_ms && now - last_ms < ML_WG_FILL_EVERY_MS) return;
+    last_ms = now;
+    ml_peer_update_t *u = malloc(sizeof *u);
+    if (!u) return;
+    int added = 0;
+    bool used;
+    for (int i = 0; added < 4 && ml_peer_sync_entry(i, u, &used); i++) {
+        if (!used || (u->has_online && !u->online) || find_peer_by_key(ml, u->public_key) >= 0) continue;
+        if (ml_policy_peer_status(u->public_key) != 1) continue;
+        u->action = ML_PEER_ADD;
+        if (!ml_peer_sync_resolve(u)) continue;
+        if (add_peer(ml, u) < 0) break;   /* no slot to give this round */
+        added++;
+    }
+    free(u);
+}
+
 static void process_peer_updates(microlink_t *ml) {
     prune_peer_cache(ml); /* Also reconciles a known-empty map with no jobs. */
+    fill_tunnel_slots(ml);
     ml_peer_update_t *update;
     while (xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
         if (!update) continue;
@@ -1056,6 +1130,13 @@ static void process_peer_updates(microlink_t *ml) {
                     if (memcmp(update->public_key, zero_key, 32) != 0) {
                         idx = find_peer_by_key(ml, update->public_key);
                     }
+                }
+                if (idx < 0 && update->has_online && update->online
+                    && ml_policy_peer_status(update->public_key) == 1) {
+                    /* Came online without a tunnel slot: take one now. */
+                    update->action = ML_PEER_ADD;
+                    if (ml_peer_sync_resolve(update)) add_peer(ml, update);
+                    break;
                 }
                 if (idx >= 0) {
                     ml_peer_t *p = &ml->peers[idx];

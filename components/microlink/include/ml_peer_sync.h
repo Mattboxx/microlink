@@ -5,3 +5,4 @@
 #endif
 bool ml_peer_sync_record(const ml_peer_update_t *update);
 bool ml_peer_sync_resolve(ml_peer_update_t *update);
+bool ml_peer_sync_entry(int index, ml_peer_update_t *out, bool *used);

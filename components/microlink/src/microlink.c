@@ -37,6 +37,7 @@ static const char *TAG = "microlink";
 #define NVS_KEY_WG_PUB      "wg_public"
 #define NVS_KEY_DISCO_PRI   "disco_pri"
 #define NVS_KEY_DISCO_PUB   "disco_pub"
+#define NVS_KEY_REG_MARKER  "reg_marker"  /* ml_reg_auth.h: node key + key hash */
 
 /* X25519 from ml_x25519.h */
 #include "ml_x25519.h"
@@ -53,11 +54,33 @@ static void generate_keypair(uint8_t *private_key, uint8_t *public_key) {
     ml_x25519_base(public_key, private_key, 1);
 }
 
+/* One keypair: the private key from NVS (its public key is derived, never
+ * trusted from a separate blob), else a new one. Returns true if it was read. */
+static bool load_keypair(nvs_handle_t nvs, const char *pri_name, uint8_t pri[32], uint8_t pub[32])
+{
+    size_t len = 32;
+    if (nvs_get_blob(nvs, pri_name, pri, &len) == ESP_OK && len == 32) {
+        ml_x25519_base(pub, pri, 1);
+        return true;
+    }
+    generate_keypair(pri, pub);
+    return false;
+}
+
+static esp_err_t save_keypair(nvs_handle_t nvs, const char *pri_name, const char *pub_name,
+                              const uint8_t pri[32], const uint8_t pub[32])
+{
+    esp_err_t err = nvs_set_blob(nvs, pri_name, pri, 32);
+    if (err == ESP_OK) err = nvs_set_blob(nvs, pub_name, pub, 32);
+    return err;
+}
+
 static esp_err_t load_or_generate_keys(microlink_t *ml) {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS open failed (%d), generating ephemeral keys", err);
+        ESP_LOGW(TAG, "NVS open failed (%s): this identity lasts until restart only",
+                 esp_err_to_name(err));
         generate_keypair(ml->machine_private_key, ml->machine_public_key);
         generate_keypair(ml->wg_private_key, ml->wg_public_key);
         generate_keypair(ml->disco_private_key, ml->disco_public_key);
@@ -65,60 +88,68 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
         return ESP_OK;
     }
 
-    size_t key_len = 32;
-    bool need_save = false;
+    bool loaded = load_keypair(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, ml->machine_public_key);
+    loaded &= load_keypair(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, ml->wg_public_key);
+    loaded &= load_keypair(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, ml->disco_public_key);
 
-    /* Machine key */
-    if (nvs_get_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->machine_private_key, ml->machine_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new machine key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, &key_len);
-    }
-
-    /* WireGuard key */
-    key_len = 32;
-    if (nvs_get_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->wg_private_key, ml->wg_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new WireGuard key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, &key_len);
-    }
-
-    /* DISCO key */
-    key_len = 32;
-    if (nvs_get_blob(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->disco_private_key, ml->disco_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new DISCO key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, &key_len);
-    }
-
-    if (need_save) {
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, 32);
-        nvs_commit(nvs);
-        ESP_LOGI(TAG, "Keys saved to NVS");
+    if (!loaded) {
+        /* A failed save used to be logged as saved: the next boot then made
+         * another identity, i.e. a new device in the tailnet, which a used
+         * single-use auth key can no longer register. */
+        err = save_keypair(nvs, NVS_KEY_MACHINE_PRI, NVS_KEY_MACHINE_PUB, ml->machine_private_key, ml->machine_public_key);
+        if (err == ESP_OK) err = save_keypair(nvs, NVS_KEY_WG_PRI, NVS_KEY_WG_PUB, ml->wg_private_key, ml->wg_public_key);
+        if (err == ESP_OK) err = save_keypair(nvs, NVS_KEY_DISCO_PRI, NVS_KEY_DISCO_PUB, ml->disco_private_key, ml->disco_public_key);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "New identity keys saved to NVS");
+        } else {
+            ESP_LOGE(TAG, "Saving the identity keys failed (%s): a new identity (a new device "
+                          "in the tailnet) would be made at the next restart", esp_err_to_name(err));
+        }
     } else {
         ESP_LOGI(TAG, "Keys loaded from NVS");
     }
     /* All three keypairs survived = persistent identity. Surfaced to
      * applications via microlink_diag_t so the UI can tell the operator
      * whether the device is registered-but-stale vs genuinely fresh. */
-    ml->identity_persistent = !need_save;
-
+    ml->identity_persistent = loaded;
     nvs_close(nvs);
     return ESP_OK;
+}
+
+/* Was this identity accepted with the configured auth key (ml_reg_auth.h)?
+ * Read at the first registration, after the NVS auth key override. */
+bool ml_identity_registered(microlink_t *ml)
+{
+    uint8_t want[ML_REG_MARKER_LEN], have[ML_REG_MARKER_LEN];
+    size_t len = sizeof have;
+    nvs_handle_t nvs;
+    if (!ml->identity_persistent || nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return false;
+    ml_reg_marker(want, ml->wg_public_key, ml->config.auth_key);
+    bool same = nvs_get_blob(nvs, NVS_KEY_REG_MARKER, have, &len) == ESP_OK
+                && len == sizeof have && !memcmp(have, want, sizeof want);
+    nvs_close(nvs);
+    return same;
+}
+
+/* The control server accepted this identity: record it (once per identity
+ * and key, so reconnects do not write flash). Never stores the auth key. */
+void ml_identity_mark_registered(microlink_t *ml)
+{
+    uint8_t want[ML_REG_MARKER_LEN], have[ML_REG_MARKER_LEN];
+    size_t len = sizeof have;
+    nvs_handle_t nvs;
+    ml_reg_marker(want, ml->wg_public_key, ml->config.auth_key);
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    if (nvs_get_blob(nvs, NVS_KEY_REG_MARKER, have, &len) != ESP_OK || len != sizeof have
+        || memcmp(have, want, sizeof want)) {
+        esp_err_t err = nvs_set_blob(nvs, NVS_KEY_REG_MARKER, want, sizeof want);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        if (err != ESP_OK)
+            ESP_LOGW(TAG, "Recording the registration failed (%s): the auth key will be "
+                          "presented again at the next restart", esp_err_to_name(err));
+    }
+    nvs_close(nvs);
 }
 
 /* ============================================================================

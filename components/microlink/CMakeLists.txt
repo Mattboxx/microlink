@@ -1,6 +1,7 @@
 set(SRCS
     "src/microlink.c"
     "src/ml_coord.c"
+    "src/ml_reg_auth.c"
     "src/ml_policy.c"
     "src/ml_reassembly.c"
     "src/ml_peer_sync.c"

@@ -40,8 +40,11 @@ static portMUX_TYPE policy_lock = portMUX_INITIALIZER_UNLOCKED;
 
 #define GROUPS 8
 #define ENTRIES 128
-#define PEERS 16
-#define PREFIXES 16
+/* Peers and prefixes have no fixed count: each snapshot is sized by the map
+ * (PSRAM). These bounds only guard size arithmetic; a map that large could
+ * not be received by an ESP32 anyway. */
+#define MAX_PEERS 65536u
+#define MAX_PREFIXES 1048576u
 #define FLOWS 32
 #define NAME_LEN 64
 
@@ -54,8 +57,7 @@ typedef struct {
 typedef struct {
     uint64_t id;
     uint8_t key[32];
-    ip_range ips[PREFIXES];
-    unsigned count;
+    uint32_t first, count;   /* prefixes: pool[first .. first+count) */
     time_t expires;
     bool active;
 } peer;
@@ -74,10 +76,16 @@ typedef struct {
     bool filters_known, peers_known, local_known;
     char groups[GROUPS][NAME_LEN];
     entry entries[ENTRIES];
-    peer peers[PEERS];
-    ip_range local[PREFIXES];
-    unsigned local_count;
+    uint32_t local_first, local_count;   /* own prefixes in pool */
     time_t expires;
+    uint32_t peer_count, pool_count;     /* used entries */
+    /* Everything above (and peers[0..peer_count), pool[0..pool_count)) is the
+     * authority; published snapshots are canonical (active peers in map
+     * order, each one's prefixes, then the own ones), so equal authority
+     * compares equal. */
+    uint32_t peer_cap, pool_cap;
+    peer *peers;                         /* inside this allocation */
+    ip_range *pool;
     uint32_t epoch;
     /* Everything above is immutable once published. Never copy mutable reader
      * references or flow state while concurrent packet readers update them. */
@@ -138,6 +146,47 @@ static void publish(policy *p) {
     if (dispose) free(old);
 }
 void ml_policy_reset(void) { publish(NULL); }
+
+/* One block: the policy, then peer_cap peers, then pool_cap prefixes. */
+static policy *policy_alloc(uint32_t peer_cap, uint32_t pool_cap) {
+    if (peer_cap > MAX_PEERS || pool_cap > MAX_PREFIXES) return NULL;
+    size_t bytes = sizeof(policy) + (size_t)peer_cap * sizeof(peer) + (size_t)pool_cap * sizeof(ip_range);
+    policy *p = ALLOC(bytes);
+    if (!p) return NULL;
+    memset(p, 0, bytes);
+    p->peer_cap = peer_cap; p->pool_cap = pool_cap;
+    p->peers = (peer *)(p + 1);
+    p->pool = (ip_range *)(p->peers + peer_cap);
+    return p;
+}
+/* Canonical copy: header, active peers in order with their prefixes packed,
+ * then the own prefixes. extra_* reserve room for an update. */
+static policy *policy_canonical(const policy *src, uint32_t extra_peers, uint32_t extra_pool) {
+    uint32_t peers = 0, pool = src->local_count;
+    for (uint32_t i = 0; i < src->peer_count; i++)
+        if (src->peers[i].active) { peers++; pool += src->peers[i].count; }
+    if (extra_peers > MAX_PEERS - peers || extra_pool > MAX_PREFIXES - pool) return NULL;
+    policy *p = policy_alloc(peers + extra_peers, pool + extra_pool);
+    if (!p) return NULL;
+    memcpy(p, src, offsetof(policy, peer_cap));
+    p->peer_count = 0; p->pool_count = 0;
+    for (uint32_t i = 0; i < src->peer_count; i++) {
+        const peer *a = &src->peers[i];
+        if (!a->active) continue;
+        peer *b = &p->peers[p->peer_count++];
+        memcpy(b, a, sizeof *b); b->first = p->pool_count;   /* bytes, padding included */
+        memcpy(&p->pool[p->pool_count], &src->pool[a->first], a->count * sizeof(ip_range));
+        p->pool_count += a->count;
+    }
+    memcpy(&p->pool[p->pool_count], &src->pool[src->local_first], src->local_count * sizeof(ip_range));
+    p->local_first = p->pool_count; p->pool_count += src->local_count;
+    return p;
+}
+static bool same_authority_data(const policy *a, const policy *b) {
+    return !memcmp(a, b, offsetof(policy, peer_cap))
+        && !memcmp(a->peers, b->peers, a->peer_count * sizeof(peer))
+        && !memcmp(a->pool, b->pool, a->pool_count * sizeof(ip_range));
+}
 void ml_policy_suspend(void) {
     LOCK();if(!suspended){suspended=true;suspended_at=NOW();}UNLOCK();
 }
@@ -224,14 +273,65 @@ static bool contains(const ip_range *r, const uint8_t ip[16], uint8_t family) {
     return (!r->family || r->family == family)
         && memcmp(r->lo, ip, bytes) <= 0 && memcmp(ip, r->hi, bytes) <= 0;
 }
-static bool prefixes(const cJSON *a, ip_range *out, unsigned *count) {
-    if (!cJSON_IsArray(a) || cJSON_GetArraySize(a) > PREFIXES) return false;
-    *count = 0;
+/* Why the last update was refused (static text, never map content). */
+static const char *s_detail = "";
+#define REFUSE(why) do { s_detail = (why); return false; } while (0)
+static bool prefixes(policy *p, const cJSON *a, uint32_t *first, uint32_t *count) {
+    if (!cJSON_IsArray(a)) return false;
+    *first = p->pool_count; *count = 0;
     for (const cJSON *v = a->child; v; v = v->next) {
+        if (p->pool_count >= p->pool_cap) return false;
         if (!cJSON_IsString(v) || strchr(v->valuestring, '-')
-            || !strcmp(v->valuestring, "*") || !range_parse(v->valuestring, &out[*count])) return false;
-        (*count)++;
+            || !strcmp(v->valuestring, "*") || !range_parse(v->valuestring, &p->pool[p->pool_count])) return false;
+        p->pool_count++; (*count)++;
     }
+    return true;
+}
+/* AllowedIPs, or Addresses when AllowedIPs is absent/null (as before). */
+static const cJSON *node_ips(const cJSON *n) {
+    const cJSON *ips = cJSON_GetObjectItemCaseSensitive(n, "AllowedIPs");
+    return !ips || cJSON_IsNull(ips) ? cJSON_GetObjectItemCaseSensitive(n, "Addresses") : ips;
+}
+static uint32_t list_size(const cJSON *a) { return cJSON_IsArray(a) ? (uint32_t)cJSON_GetArraySize(a) : 0; }
+/* Room an update can need on top of the copied authority. */
+static bool update_room(const cJSON *map, uint32_t *peers, uint32_t *pool) {
+    const char *lists[] = {"Peers", "PeersChanged"};
+    uint64_t n = 0, ips = 0;
+    for (unsigned l = 0; l < 2; l++) {
+        const cJSON *list = cJSON_GetObjectItemCaseSensitive(map, lists[l]);
+        n += list_size(list);
+        if (cJSON_IsArray(list)) for (const cJSON *v = list->child; v; v = v->next) ips += list_size(node_ips(v));
+    }
+    const cJSON *self = cJSON_GetObjectItemCaseSensitive(map, "Node");
+    if (cJSON_IsObject(self)) ips += list_size(node_ips(self));
+    if (n > MAX_PEERS || ips > MAX_PREFIXES) return false;
+    *peers = (uint32_t)n; *pool = (uint32_t)ips;
+    return true;
+}
+static int key_order(const void *x, const void *y) {
+    const peer *a = *(const peer *const *)x, *b = *(const peer *const *)y;
+    return memcmp(a->key, b->key, 32);
+}
+static int id_order(const void *x, const void *y) {
+    const peer *a = *(const peer *const *)x, *b = *(const peer *const *)y;
+    return a->id < b->id ? -1 : a->id > b->id;
+}
+/* Two active peers with one ID or one key: refuse (sorted, not quadratic). */
+static bool active_unique(const policy *p) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < p->peer_count; i++) n += p->peers[i].active;
+    if (n < 2) return true;
+    const peer **v = ALLOC(n * sizeof *v);
+    if (!v) REFUSE("no-memory");
+    n = 0;
+    for (uint32_t i = 0; i < p->peer_count; i++) if (p->peers[i].active) v[n++] = &p->peers[i];
+    bool ok = true;
+    qsort(v, n, sizeof *v, key_order);
+    for (uint32_t i = 1; ok && i < n; i++) ok = memcmp(v[i - 1]->key, v[i]->key, 32) != 0;
+    qsort(v, n, sizeof *v, id_order);
+    for (uint32_t i = 1; ok && i < n; i++) ok = v[i - 1]->id != v[i]->id;
+    free(v);
+    if (!ok) REFUSE("duplicate-peer");
     return true;
 }
 static bool key_parse(const cJSON *v, uint8_t out[32]) {
@@ -293,7 +393,7 @@ static bool peer_updates(policy *p, const cJSON *map) {
     const cJSON *full = get(map,"Peers"), *changed = get(map,"PeersChanged");
     const cJSON *removed=get(map,"PeersRemoved"), *patches=get(map,"PeersChangedPatch");
     if (full && !cJSON_IsNull(full)) {
-        if (!cJSON_IsArray(full)) return false;
+        if (!cJSON_IsArray(full)) REFUSE("peers-shape");
         if (full->child) {
             /* A nonempty full map precludes peer deltas (tailcfg/mapSession). */
             changed=removed=patches=NULL;
@@ -301,73 +401,68 @@ static bool peer_updates(policy *p, const cJSON *map) {
             /* Some serializers include Peers:[] on a genuine delta. */
             full=NULL;
         }
-        if (full) {memset(p->peers,0,sizeof p->peers);p->peers_known=true;}
+        if (full) {for (uint32_t i=0;i<p->peer_count;i++) p->peers[i].active=false; p->peers_known=true;}
     } else full = NULL;
     /* Remove BEFORE upsert, matching the reference mapSession. Slot reuse is
      * private to the unpublished candidate: no permissive intermediate state.
      * If an ID is removed and re-added in this map, the new Node wins. */
     if (removed && !cJSON_IsNull(removed)) {
-        if (!cJSON_IsArray(removed)) return false;
+        if (!cJSON_IsArray(removed)) REFUSE("removed-shape");
         for (const cJSON *v=removed->child;v;v=v->next) {
-            uint64_t id;if (!number(v,9007199254740991ULL,&id)) return false;
-            for (unsigned i=0;i<PEERS;i++) if (p->peers[i].id==id) p->peers[i].active=false;
+            uint64_t id;if (!number(v,9007199254740991ULL,&id)) REFUSE("peer-id");
+            for (uint32_t i=0;i<p->peer_count;i++) if (p->peers[i].id==id) p->peers[i].active=false;
         }
     }
     for (unsigned pass=0;pass<2;pass++) {
         const cJSON *list = pass ? changed : full;
         if (!list || cJSON_IsNull(list)) continue;
-        if (!cJSON_IsArray(list) || cJSON_GetArraySize(list)>PEERS) return false;
+        if (!cJSON_IsArray(list)) REFUSE("peers-shape");
         for (const cJSON *v=list->child;v;v=v->next) {
             uint64_t id;
-            if (!cJSON_IsObject(v) || !unique(v) || !exact_auth_fields(v)
-                || !number(get(v,"ID"),9007199254740991ULL,&id) || !id) return false;
-            int slot=-1;
-            for (unsigned i=0;i<PEERS;i++) if (p->peers[i].active && p->peers[i].id==id) slot=(int)i;
-            if (!pass && slot>=0) return false; /* Duplicate ID in full map. */
-            if (slot<0) for (unsigned i=0;i<PEERS;i++) if (!p->peers[i].active) {slot=(int)i;break;}
-            if (slot<0) return false;
+            if (!cJSON_IsObject(v) || !unique(v) || !exact_auth_fields(v)) REFUSE("peer-shape");
+            if (!number(get(v,"ID"),9007199254740991ULL,&id) || !id) REFUSE("peer-id");
+            int64_t slot=-1;
+            for (uint32_t i=0;i<p->peer_count;i++) if (p->peers[i].active && p->peers[i].id==id) slot=i;
+            if (!pass && slot>=0) REFUSE("duplicate-peer"); /* Duplicate ID in full map. */
+            if (slot<0) {
+                if (p->peer_count>=p->peer_cap) REFUSE("peer-room");
+                slot=p->peer_count++;
+            }
             peer *a=&p->peers[slot]; memset(a,0,sizeof *a); a->id=id;
-            if (!key_parse(get(v,"Key"),a->key) || !expiration(get(v,"KeyExpiry"),&a->expires)) return false;
-            const cJSON *ips=get(v,"AllowedIPs");
-            if (!ips || cJSON_IsNull(ips)) ips=get(v,"Addresses");
-            if (!prefixes(ips,a->ips,&a->count)) return false;
+            if (!key_parse(get(v,"Key"),a->key)) REFUSE("peer-key");
+            if (!expiration(get(v,"KeyExpiry"),&a->expires)) REFUSE("peer-expiry");
+            if (!prefixes(p,node_ips(v),&a->first,&a->count)) REFUSE("peer-prefixes");
             a->active=usable(v);
-            for (unsigned i=0;i<PEERS;i++) if ((int)i!=slot && a->active && p->peers[i].active
-                && !memcmp(a->key,p->peers[i].key,32)) return false;
         }
     }
     if (patches && !cJSON_IsNull(patches)) {
-        if (!cJSON_IsArray(patches)) return false;
+        if (!cJSON_IsArray(patches)) REFUSE("patch-shape");
         for (const cJSON *v=patches->child;v;v=v->next) {
             uint64_t id; if (!cJSON_IsObject(v)||!unique(v)||!exact_auth_fields(v)
-                || get(v,"AllowedIPs") || get(v,"Addresses") || !number(get(v,"NodeID"),9007199254740991ULL,&id)) return false;
-            for (unsigned i=0;i<PEERS;i++) if (p->peers[i].active && p->peers[i].id==id) {
+                || get(v,"AllowedIPs") || get(v,"Addresses") || !number(get(v,"NodeID"),9007199254740991ULL,&id)) REFUSE("patch-shape");
+            for (uint32_t i=0;i<p->peer_count;i++) if (p->peers[i].active && p->peers[i].id==id) {
                 const cJSON *key=get(v,"Key"), *exp=get(v,"KeyExpiry");
                 if (key && !cJSON_IsNull(key)) {
                     uint8_t rotated[32];
-                    if (!key_parse(key,rotated)) return false;
+                    if (!key_parse(key,rotated)) REFUSE("peer-key");
                     /* The legacy endpoint-only WG patch handler does not
                      * install rotated keys. Force a fresh full map instead
                      * of trusting the old key or wedging indefinitely. */
-                    if (memcmp(rotated,p->peers[i].key,32)) return false;
+                    if (memcmp(rotated,p->peers[i].key,32)) REFUSE("key-rotation");
                 }
-                if (exp && !cJSON_IsNull(exp) && !expiration(exp,&p->peers[i].expires)) return false;
+                if (exp && !cJSON_IsNull(exp) && !expiration(exp,&p->peers[i].expires)) REFUSE("peer-expiry");
                 if (!usable(v)) p->peers[i].active=false;
             }
         }
     }
     const cJSON *node=get(map,"Node");
     if (node && !cJSON_IsNull(node)) {
-        if (!cJSON_IsObject(node)||!unique(node)||!exact_auth_fields(node)||!expiration(get(node,"KeyExpiry"),&p->expires)) return false;
-        const cJSON *ips=get(node,"AllowedIPs");
-        if (!ips || cJSON_IsNull(ips)) ips=get(node,"Addresses");
-        if (!prefixes(ips,p->local,&p->local_count)) return false;
+        if (!cJSON_IsObject(node)||!unique(node)||!exact_auth_fields(node)) REFUSE("self-shape");
+        if (!expiration(get(node,"KeyExpiry"),&p->expires)) REFUSE("self-expiry");
+        if (!prefixes(p,node_ips(node),&p->local_first,&p->local_count)) REFUSE("self-prefixes");
         p->local_known=usable(node);
     }
-    for (unsigned i=0;i<PEERS;i++) for (unsigned j=i+1;j<PEERS;j++)
-        if (p->peers[i].active && p->peers[j].active
-            && (p->peers[i].id==p->peers[j].id || !memcmp(p->peers[i].key,p->peers[j].key,32))) return false;
-    return true;
+    return active_unique(p);
 }
 static int group_find(policy *p,const char *name) {
     for (unsigned i=0;i<GROUPS;i++) if (!strcmp(p->groups[i],name)) return (int)i;
@@ -413,7 +508,8 @@ static bool group_apply(policy *p,const char *name,const cJSON *rules) {
             }
         }
         for (const cJSON *s=srcs->child;s;s=s->next) for (const cJSON *d=dsts->child;d;d=d->next) {
-            if (p->count>=ENTRIES || !cJSON_IsString(s)||!cJSON_IsObject(d)||!unique(d)) return false;
+            if (p->count>=ENTRIES) REFUSE("filter-rules-limit");
+            if (!cJSON_IsString(s)||!cJSON_IsObject(d)||!unique(d)) return false;
             for (const cJSON *f=d->child;f;f=f->next)
                 if (strcmp(f->string,"IP") && strcmp(f->string,"Ports") && strcmp(f->string,"Bits")) return false;
             const cJSON *ip=get(d,"IP"), *ports=get(d,"Ports"), *dbits=get(d,"Bits");
@@ -444,9 +540,8 @@ bool ml_policy_apply(const cJSON *map) {
         if (v && !cJSON_IsNull(v)) changed=true;
     }
     if (!changed) return true; /* Keepalive/omitted/null fields retain same-session state. */
-    policy *next=ALLOC(sizeof *next);
-    if (!next) {s_reject="no-memory";ml_policy_reset();return false;}
-    memset(next,0,sizeof *next);
+    uint32_t room_peers,room_pool;
+    if (!update_room(map,&room_peers,&room_pool)) {s_reject="too-large";ml_policy_reset();return false;}
     policy *old=acquire();
     LOCK();bool resuming=suspended;uint32_t outage=NOW()-suspended_at;bool was_blocked=blocked();UNLOCK();
     /* Reconnects must not apply deltas to unseen stale authority. A complete
@@ -456,10 +551,14 @@ bool ml_policy_apply(const cJSON *map) {
     /* Never apply a delta to unconfirmed authority. The reconnect asks for a
      * complete map, so a delta (or a malformed partial map) first is an anomaly
      * and fails closed in every control-loss mode. */
-    if(resuming&&!complete){s_reject="delta-while-suspended";release(old);free(next);ml_policy_reset();return false;}
-    if (old&&!resuming) memcpy(next,old,offsetof(policy,flows));
+    if(resuming&&!complete){s_reject="delta-while-suspended";release(old);ml_policy_reset();return false;}
+    /* A complete map is built from empty state; a delta from the current
+     * authority, with room for the update. */
+    policy *next=old&&!resuming ? policy_canonical(old,room_peers,room_pool) : policy_alloc(room_peers,room_pool);
+    if (!next) {s_reject="no-memory";release(old);ml_policy_reset();return false;}
+    s_detail="";
     bool valid=peer_updates(next,map);
-    if(!valid)s_reject="peer-update";
+    if(!valid)s_reject=*s_detail?s_detail:"peer-update";
     const cJSON *base=get(map,"PacketFilter"), *groups=get(map,"PacketFilters");
     bool replace_base=base && !cJSON_IsNull(base);
     if (replace_base) valid=valid && cJSON_IsArray(base);
@@ -489,11 +588,16 @@ bool ml_policy_apply(const cJSON *map) {
     if (groups && !cJSON_IsNull(groups)) for (const cJSON *g=groups->child;valid && g;g=g->next) {
         if (strcmp(g->string,"*") && !cJSON_IsNull(g)) valid=group_apply(next,g->string,g);
     }
-    if (!valid) {if(strcmp(s_reject,"peer-update"))s_reject="packet-filter";release(old);free(next);ml_policy_reset();return false;}
+    if (!valid) {if(!strcmp(s_reject,"none"))s_reject=*s_detail?s_detail:"packet-filter";release(old);free(next);ml_policy_reset();return false;}
+    /* Publish the canonical (compact) form: equal authority compares equal. */
+    policy *canon=policy_canonical(next,0,0);
+    free(next);
+    if (!canon) {s_reject="no-memory";release(old);ml_policy_reset();return false;}
+    next=canon;
     /* Endpoint/Online patches and identical refreshes are not revocations.
      * Do not tear down return traffic on every normal map heartbeat. */
     bool same_authority=old && (!resuming||outage<RESUME_WINDOW_MS||!was_blocked)
-        && !memcmp(next,old,offsetof(policy,epoch));
+        && same_authority_data(next,old);
     release(old);
     if (same_authority) {LOCK();suspended=false;UNLOCK();free(next);return true;}
     publish(next); return true;
@@ -587,11 +691,11 @@ static bool error_tuple(const tuple *t) {
 static bool peer_owns(const policy *p,const uint8_t key[32],const uint8_t ip[16],uint8_t family) {
     int best=-1, owner=-1; bool tied=false;
     time_t now=time(NULL);
-    for (unsigned i=0;i<PEERS;i++) {
+    for (uint32_t i=0;i<p->peer_count;i++) {
         const peer *a=&p->peers[i];
         if (!a->active || (a->expires && (now<1700000000 || now>=a->expires))) continue;
-        for (unsigned j=0;j<a->count;j++) if (contains(&a->ips[j],ip,family)) {
-            int bits=a->ips[j].bits;
+        for (uint32_t j=0;j<a->count;j++) if (contains(&p->pool[a->first+j],ip,family)) {
+            int bits=p->pool[a->first+j].bits;
             if (bits>best) {best=bits;owner=(int)i;tied=false;}
             else if (bits==best && owner!=(int)i) tied=true;
         }
@@ -640,7 +744,7 @@ void ml_policy_get_status(ml_policy_status_t *out) {
     out->authority_ready=ready(p);out->peer_authority=p->peers_known;
     out->filter_authority=p->filters_known;out->self_authority=p->local_known;
     out->expanded_rules=p->count;
-    for(unsigned i=0;i<PEERS;i++)if(p->peers[i].active)out->peers++;
+    for(uint32_t i=0;i<p->peer_count;i++)if(p->peers[i].active)out->peers++;
     uint32_t now=NOW();LOCK();
     out->control_stale=suspended&&!blocked()&&current==p;
     out->stale_ms=suspended?(uint32_t)(now-suspended_at):0;
@@ -656,7 +760,7 @@ int ml_policy_peer_status(const uint8_t key[32]) {
     policy *p=acquire();int status=-1;time_t now=time(NULL);
     if (p && p->peers_known && key) {
         status=0;
-        for (unsigned i=0;i<PEERS;i++) {
+        for (uint32_t i=0;i<p->peer_count;i++) {
             const peer *a=&p->peers[i];
             if (a->active && !memcmp(a->key,key,32)
                 && (!a->expires || (now>=1700000000 && now<a->expires))) {status=1;break;}
@@ -673,7 +777,7 @@ int ml_policy_peer_key(uint64_t id,uint8_t key[32]) {
     policy *p=acquire();int status=-1;time_t now=time(NULL);
     if(p&&p->peers_known){
         status=0;
-        for(unsigned i=0;i<PEERS;i++)if(p->peers[i].active&&p->peers[i].id==id
+        for(uint32_t i=0;i<p->peer_count;i++)if(p->peers[i].active&&p->peers[i].id==id
             &&(!p->peers[i].expires||(now>=1700000000&&now<p->peers[i].expires))){memcpy(key,p->peers[i].key,32);status=1;break;}
     }
     LOCK();if(current!=p||suspended)status=-1;UNLOCK();release(p);return status;
@@ -692,7 +796,7 @@ static bool flow_allowed(policy *p,const tuple *t,const uint8_t key[32],bool rep
     UNLOCK();return ok;
 }
 static bool local_owns(const policy *p,const uint8_t ip[16],unsigned family) {
-    for (unsigned i=0;i<p->local_count;i++) if (contains(&p->local[i],ip,family)) return true;
+    for (uint32_t i=0;i<p->local_count;i++) if (contains(&p->pool[p->local_first+i],ip,family)) return true;
     return false;
 }
 bool ml_policy_fragment_epoch(const uint8_t src[16],const uint8_t dst[16],unsigned family,const uint8_t key[32],uint32_t *out) {

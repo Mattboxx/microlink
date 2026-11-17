@@ -96,7 +96,10 @@ typedef struct {
     uint8_t  prefix_len; /* CIDR prefix length, 0–32 */
 } microlink_route_t;
 
-#define MICROLINK_MAX_PEER_ROUTES 8
+/* Subnet routes kept per peer for the data plane (WireGuard allowed IPs and
+ * the gateway route table). Larger lists are cut with a warning, never
+ * silently (the map/policy keep every route). */
+#define MICROLINK_MAX_PEER_ROUTES 16
 
 /* Peer info (read-only snapshot) */
 typedef struct {
@@ -309,7 +312,27 @@ typedef struct {
     /* Last reconnect after a loss: total and per-stage milliseconds. */
     uint32_t ctrl_last_reconnect_ms;
     char     ctrl_reconnect_stages[112];
+
+    /* Registration and tailnet state for the UI. */
+    uint8_t  reg_state;           /* microlink_reg_state_t */
+    int64_t  key_expiry;          /* this node key's expiry (unix s); 0 = never or unknown */
+    bool     tailnet_lock;        /* the tailnet uses Tailnet Lock (TKAInfo in the map) */
+    char     node_key[73];        /* "nodekey:" + hex, public (for `tailscale lock sign`) */
+    uint32_t map_peers;           /* peers in the authorized map (no fixed limit) */
+    uint16_t tunnels_active;      /* peers holding a tunnel slot now */
+    uint16_t tunnel_slots;        /* tunnel slots (internal RAM) */
 } microlink_diag_t;
+
+/* Why the device is not (or not fully) registered, for the UI. */
+typedef enum {
+    ML_REG_STATE_OK = 0,
+    ML_REG_STATE_KEY_RETRY,      /* auth key refused, trying the registered identity */
+    ML_REG_STATE_NEED_NEW_KEY,   /* not authorized and the auth key was refused */
+    ML_REG_STATE_NEED_KEY,       /* not authorized and no auth key */
+    ML_REG_STATE_APPROVAL,       /* registered, waiting for approval in the admin console */
+    ML_REG_STATE_KEY_EXPIRED,    /* node key expired: renewed at the next start with a valid auth key */
+    ML_REG_STATE_REFUSED,        /* registration refused for another reason */
+} microlink_reg_state_t;
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);
 

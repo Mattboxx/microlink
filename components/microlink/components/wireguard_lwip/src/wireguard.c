@@ -150,7 +150,7 @@ struct wireguard_peer *peer_lookup_by_handshake(struct wireguard_device *device,
 		tmp = &device->peers[x];
 		if (tmp->valid) {
 			wireguard_expire_handshake(tmp);
-			if (tmp->handshake.valid && tmp->handshake.initiator && (tmp->handshake.local_index == receiver)) {
+			if (tmp->handshake->valid && tmp->handshake->initiator && (tmp->handshake->local_index == receiver)) {
 				result = tmp;
 				break;
 			}
@@ -412,7 +412,7 @@ static uint32_t wireguard_generate_unique_index(struct wireguard_device *device)
 			existing = (result == peer->curr_keypair.local_index) ||
 					(result == peer->prev_keypair.local_index) ||
 					(result == peer->next_keypair.local_index) ||
-					(result == peer->handshake.local_index);
+					(peer->handshake && result == peer->handshake->local_index);
 			if (existing) break;   /* a later peer must not overwrite a collision found here */
 		}
 	} while (existing);
@@ -486,13 +486,13 @@ bool wireguard_keypair_expired(const struct wireguard_keypair *keypair) {
 }
 
 void wireguard_destroy_handshake(struct wireguard_peer *peer) {
-	crypto_zero(&peer->handshake, sizeof(peer->handshake));
+	if (peer->handshake) crypto_zero(peer->handshake, sizeof(*peer->handshake));
 	crypto_zero(peer->handshake_mac1, sizeof(peer->handshake_mac1));
 	peer->handshake_mac1_valid = false;
 }
 
 void wireguard_expire_handshake(struct wireguard_peer *peer) {
-	if (peer->handshake.valid && wireguard_expired(peer->handshake.created_millis, REJECT_AFTER_TIME * 3)) {
+	if (peer->handshake && peer->handshake->valid && wireguard_expired(peer->handshake->created_millis, REJECT_AFTER_TIME * 3)) {
 		wireguard_destroy_handshake(peer);
 	}
 }
@@ -526,12 +526,12 @@ volatile uint32_t wireguard_first_session_ms;
 
 bool wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
 	wireguard_expire_handshake(peer);
-	if (!peer->handshake.valid) return false;
+	if (!peer->handshake->valid) return false;
 	if (!wireguard_first_session_ms) {
 		uint32_t now = wireguard_sys_now();
 		wireguard_first_session_ms = now ? now : 1;
 	}
-	struct wireguard_handshake *handshake = &peer->handshake;
+	struct wireguard_handshake *handshake = peer->handshake;
 	struct wireguard_keypair new_keypair;
 
 	crypto_zero(&new_keypair, sizeof(struct wireguard_keypair));
@@ -666,7 +666,7 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 
 			peer = peer_lookup_by_pubkey(device, s);
 			if (peer && peer_static_dh(device, peer)) {
-				handshake = &peer->handshake;
+				handshake = peer->handshake;
 
 				// (Ci,k) := Kdf2(Ci,DH(Sprivi,Spubr))
 				wireguard_kdf2(chaining_key, key, chaining_key, peer->public_key_dh, WIREGUARD_PUBLIC_KEY_LEN);
@@ -727,7 +727,7 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 
 bool wireguard_process_handshake_response(struct wireguard_device *device, struct wireguard_peer *peer, struct message_handshake_response *src) {
 	wireguard_expire_handshake(peer);
-	struct wireguard_handshake *handshake = &peer->handshake;
+	struct wireguard_handshake *handshake = peer->handshake;
 
 	bool result = false;
 	uint8_t key[WIREGUARD_SESSION_KEY_LEN];
@@ -840,7 +840,7 @@ bool wireguard_create_handshake_initiation(struct wireguard_device *device, stru
 	uint8_t dh_calculation[WIREGUARD_PUBLIC_KEY_LEN];
 	bool result = false;
 
-	struct wireguard_handshake *handshake = &peer->handshake;
+	struct wireguard_handshake *handshake = peer->handshake;
 
 	memset(dst, 0, sizeof(struct message_handshake_initiation));
 	if (!peer_static_dh(device, peer)) return false;
@@ -927,7 +927,7 @@ bool wireguard_create_handshake_initiation(struct wireguard_device *device, stru
 
 bool wireguard_create_handshake_response(struct wireguard_device *device, struct wireguard_peer *peer, struct message_handshake_response *dst) {
 	wireguard_expire_handshake(peer);
-	struct wireguard_handshake *handshake = &peer->handshake;
+	struct wireguard_handshake *handshake = peer->handshake;
 	uint8_t key[WIREGUARD_SESSION_KEY_LEN];
 	uint8_t dh_calculation[WIREGUARD_PUBLIC_KEY_LEN];
 	uint8_t tau[WIREGUARD_HASH_LEN];
@@ -1028,6 +1028,14 @@ void wireguard_create_cookie_reply(struct wireguard_device *device, struct messa
 bool wireguard_peer_init(struct wireguard_device *device, struct wireguard_peer *peer, const uint8_t *public_key, const uint8_t *preshared_key) {
 	// Clear out structure
 	memset(peer, 0, sizeof(struct wireguard_peer));
+	/* wireguardif allocates the table in PSRAM with the device; this is the
+	 * fallback for a device initialised directly (host tests). */
+	if (!device->handshakes) device->handshakes = calloc(WIREGUARD_MAX_PEERS, sizeof(struct wireguard_handshake));
+	if (!device->handshakes) return false;
+	uint8_t slot = wireguard_peer_index(device, peer);
+	if (slot >= WIREGUARD_MAX_PEERS) return false;
+	peer->handshake = &device->handshakes[slot];
+	crypto_zero(peer->handshake, sizeof(*peer->handshake));
 
 	if (device->valid) {
 		// Copy across the public key into our peer structure
@@ -1042,8 +1050,8 @@ bool wireguard_peer_init(struct wireguard_device *device, struct wireguard_peer 
 		peer->public_key_dh_ready = false;
 		{
 			// Zero out handshake
-			memset(&peer->handshake, 0, sizeof(struct wireguard_handshake));
-			peer->handshake.valid = false;
+			memset(peer->handshake, 0, sizeof(struct wireguard_handshake));
+			peer->handshake->valid = false;
 
 			// Zero out any cookie info - we haven't received one yet
 			peer->cookie_millis = 0;

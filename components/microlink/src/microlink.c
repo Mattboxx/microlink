@@ -38,9 +38,13 @@ static const char *TAG = "microlink";
 #define NVS_KEY_DISCO_PRI   "disco_pri"
 #define NVS_KEY_DISCO_PUB   "disco_pub"
 #define NVS_KEY_REG_MARKER  "reg_marker"  /* ml_reg_auth.h: node key + key hash */
+#define NVS_KEY_NK_EXPIRED  "nk_expired"  /* node key expired: renew at the next start */
+#define NVS_KEY_NK_OLD      "nk_old"      /* previous node key until the renewal is accepted */
 
 /* X25519 from ml_x25519.h */
 #include "ml_x25519.h"
+#include "ml_policy.h"   /* diag: map peers, own key expiry */
+#include "freertos/idf_additions.h"   /* xQueueCreateWithCaps */
 
 /* ============================================================================
  * Key Management (loaded once at init, read-only after)
@@ -132,6 +136,51 @@ bool ml_identity_registered(microlink_t *ml)
     return same;
 }
 
+void ml_identity_mark_expired(microlink_t *ml)
+{
+    nvs_handle_t nvs;
+    (void)ml;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    if (nvs_set_u8(nvs, NVS_KEY_NK_EXPIRED, 1) != ESP_OK || nvs_commit(nvs) != ESP_OK)
+        ESP_LOGW(TAG, "Recording the node key expiry failed");
+    nvs_close(nvs);
+}
+
+/* At start, before WireGuard uses the key: a node key the control server
+ * reported expired is replaced (the machine and DISCO keys stay), and the
+ * old one is presented as OldNodeKey so the same device is renewed, as the
+ * reference client does (direct.go regen). Needs an auth key: the server
+ * asks to authenticate a renewal. A renewal not accepted yet resumes. */
+static void ml_identity_renew_if_expired(microlink_t *ml)
+{
+    nvs_handle_t nvs;
+    uint8_t expired = 0;
+    size_t len = 32;
+    if (!ml->identity_persistent || nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    if (nvs_get_blob(nvs, NVS_KEY_NK_OLD, ml->old_node_key, &len) == ESP_OK && len == 32) {
+        ml->renewing = true;   /* a renewal from an earlier start, not accepted yet */
+    } else if (nvs_get_u8(nvs, NVS_KEY_NK_EXPIRED, &expired) == ESP_OK && expired
+               && ml->config.auth_key && ml->config.auth_key[0]) {
+        uint8_t pri[32], pub[32];
+        generate_keypair(pri, pub);
+        esp_err_t err = nvs_set_blob(nvs, NVS_KEY_NK_OLD, ml->wg_public_key, 32);
+        if (err == ESP_OK) err = save_keypair(nvs, NVS_KEY_WG_PRI, NVS_KEY_WG_PUB, pri, pub);
+        if (err == ESP_OK) err = nvs_erase_key(nvs, NVS_KEY_NK_EXPIRED);
+        if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) err = nvs_commit(nvs);
+        if (err == ESP_OK) {
+            memcpy(ml->old_node_key, ml->wg_public_key, 32);
+            memcpy(ml->wg_private_key, pri, 32);
+            memcpy(ml->wg_public_key, pub, 32);
+            ml->renewing = true;
+            ESP_LOGW(TAG, "Node key expired: renewing it with the auth key (same device, settings kept)");
+        } else {
+            ESP_LOGE(TAG, "Renewing the expired node key failed (%s)", esp_err_to_name(err));
+        }
+        memset(pri, 0, sizeof pri);
+    }
+    nvs_close(nvs);
+}
+
 /* The control server accepted this identity: record it (once per identity
  * and key, so reconnects do not write flash). Never stores the auth key. */
 void ml_identity_mark_registered(microlink_t *ml)
@@ -148,6 +197,12 @@ void ml_identity_mark_registered(microlink_t *ml)
         if (err != ESP_OK)
             ESP_LOGW(TAG, "Recording the registration failed (%s): the auth key will be "
                           "presented again at the next restart", esp_err_to_name(err));
+    }
+    if (ml->renewing) {   /* the renewal is done */
+        nvs_erase_key(nvs, NVS_KEY_NK_OLD);
+        nvs_erase_key(nvs, NVS_KEY_NK_EXPIRED);
+        nvs_commit(nvs);
+        ml->renewing = false;
     }
     nvs_close(nvs);
 }
@@ -391,6 +446,9 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         return NULL;
     }
 
+    /* After the NVS auth key override, before WireGuard uses the node key. */
+    ml_identity_renew_if_expired(ml);
+
     /* Create queues */
     ml->derp_tx_queue = xQueueCreate(ML_DERP_TX_QUEUE_DEPTH, sizeof(ml_derp_tx_item_t));
     ml->disco_rx_queue = xQueueCreate(ML_DISCO_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
@@ -399,7 +457,10 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->wg_rx_wake = xSemaphoreCreateBinary();
     ml->stun_rx_queue = xQueueCreate(ML_STUN_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
     ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
-    ml->peer_update_queue = xQueueCreate(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *));
+    /* PSRAM storage: a map of thousands of peers queues one job per peer;
+     * only pointers are queued, never from an ISR. Frees internal RAM too. */
+    ml->peer_update_queue = xQueueCreateWithCaps(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue || !ml->wg_rx_prio_queue || !ml->wg_rx_wake ||
         !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue) {
@@ -710,7 +771,7 @@ void microlink_destroy(microlink_t *ml) {
     if (ml->wg_rx_wake) vSemaphoreDelete(ml->wg_rx_wake);
     if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
     if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
-    if (ml->peer_update_queue) vQueueDelete(ml->peer_update_queue);
+    if (ml->peer_update_queue) vQueueDeleteWithCaps(ml->peer_update_queue);
 
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);
@@ -841,6 +902,21 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
     strlcpy(out->register_user_name, ml->register_user_name,
             sizeof out->register_user_name);
     out->identity_persistent = ml->identity_persistent;
+    out->reg_state = ml->reg_state;
+    out->tailnet_lock = ml->tailnet_lock;
+    {
+        char hex[65];
+        for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", ml->wg_public_key[i]);
+        snprintf(out->node_key, sizeof out->node_key, "nodekey:%s", hex);
+        ml_policy_status_t pst;
+        ml_policy_get_status(&pst);
+        out->key_expiry = pst.self_expires;
+        out->map_peers = pst.peers;
+        uint16_t active = 0;
+        for (int i = 0; i < ML_MAX_PEERS; i++) active += ml->peers[i].active;
+        out->tunnels_active = active;
+        out->tunnel_slots = ML_MAX_PEERS;
+    }
     out->rc_coord_stream_wd = ml->rc_coord_stream_wd;
     out->rc_coord_transport = ml->rc_coord_transport;
     out->rc_derp_rx_wd      = ml->rc_derp_rx_wd;

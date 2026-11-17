@@ -12,6 +12,7 @@ typedef struct {
      * bounded mode); stale_ms is how long ago the loss happened. */
     bool control_stale;
     uint32_t stale_ms;
+    int64_t self_expires;   /* own node key expiry from the map (unix s), 0 = never/unknown */
 } ml_policy_status_t;
 
 /* What enforcement does while the control transport is down (the session

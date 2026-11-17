@@ -34,6 +34,7 @@
 #include "esp_timer.h"
 
 #include <string.h>
+#include <stddef.h>
 #include <stdlib.h>
 
 #include "lwip/netif.h"
@@ -203,14 +204,27 @@ static int mask_prefix_len(uint32_t mask_hbo) {
 	return n;
 }
 
+
+/* Allowed IP i of peer slot x: the inline ones, then the extra table. */
+static int peer_allowed_count(const struct wireguard_device *device, int x) {
+	int n = WIREGUARD_MAX_SRC_IPS;
+	if (__atomic_load_n(&device->extra_ips, __ATOMIC_ACQUIRE))
+		n += __atomic_load_n(&device->extra_count[x], __ATOMIC_ACQUIRE);
+	return n;
+}
+static struct wireguard_allowed_ip *peer_allowed(struct wireguard_device *device, int x, int i) {
+	return i < WIREGUARD_MAX_SRC_IPS ? &device->peers[x].allowed_source_ips[i]
+	                                 : &device->extra_ips[x][i - WIREGUARD_MAX_SRC_IPS];
+}
+
 bool wireguardif_has_host_route(struct netif *netif, const ip4_addr_t *ip) {
 	if (!netif || !netif->state || !ip) return false;
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
 	for (int x = 0; x < WIREGUARD_MAX_PEERS; x++) {
 		struct wireguard_peer *peer = &device->peers[x];
 		if (!peer->valid) continue;
-		for (int y = 0; y < WIREGUARD_MAX_SRC_IPS; y++) {
-			struct wireguard_allowed_ip *aip = &peer->allowed_source_ips[y];
+		for (int y = 0; y < peer_allowed_count(device, x); y++) {
+			struct wireguard_allowed_ip *aip = peer_allowed(device, x, y);
 			if (!aip->valid || !IP_IS_V4(&aip->ip)) continue;
 			if (ip4_addr_get_u32(ip_2_ip4(&aip->mask)) != IPADDR_BROADCAST) continue;
 			if (ip4_addr_get_u32(ip_2_ip4(&aip->ip)) == ip4_addr_get_u32(ip)) return true;
@@ -235,8 +249,8 @@ static struct wireguard_peer *peer_lookup_by_allowed_ip(struct wireguard_device 
 	for (x = 0; x < WIREGUARD_MAX_PEERS; x++) {
 		struct wireguard_peer *tmp = &device->peers[x];
 		if (!tmp->valid) continue;
-		for (y = 0; y < WIREGUARD_MAX_SRC_IPS; y++) {
-			struct wireguard_allowed_ip *aip = &tmp->allowed_source_ips[y];
+		for (y = 0; y < peer_allowed_count(device, x); y++) {
+			struct wireguard_allowed_ip *aip = peer_allowed(device, x, y);
 			if (!aip->valid) continue;
 			if (!IP_ADDR_NETCMP_COMPAT(ipaddr, &aip->ip, &aip->mask)) continue;
 
@@ -631,11 +645,11 @@ static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_a
 			if (p->valid) {
 				WG_DEBUG("  peer[%d]: valid=%d, curr_keypair.valid=%d, last_rx=%lu\n",
 				       i, p->valid, p->curr_keypair.valid, (unsigned long)p->curr_keypair.last_rx);
-				for (int j = 0; j < WIREGUARD_MAX_SRC_IPS; j++) {
-					if (p->allowed_source_ips[j].valid) {
+				for (int j = 0; j < peer_allowed_count(device, i); j++) {
+					struct wireguard_allowed_ip *aip = peer_allowed(device, i, j);
+					if (aip->valid) {
 						WG_DEBUG("    allowed[%d]: %s/%s\n", j,
-						       ipaddr_ntoa(&p->allowed_source_ips[j].ip),
-						       ipaddr_ntoa(&p->allowed_source_ips[j].mask));
+						       ipaddr_ntoa(&aip->ip), ipaddr_ntoa(&aip->mask));
 					}
 				}
 			}
@@ -677,32 +691,42 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 	}
 }
 
-static bool peer_add_ip(struct wireguard_peer *peer, ip_addr_t ip, ip_addr_t mask) {
-	bool result = false;
+static bool peer_add_ip(struct wireguard_device *device, int slot, ip_addr_t ip, ip_addr_t mask) {
+	struct wireguard_peer *peer = &device->peers[slot];
 	struct wireguard_allowed_ip *allowed;
 	int x;
 	// Look for existing match first
+	for (x=0; x < peer_allowed_count(device, slot); x++) {
+		allowed = peer_allowed(device, slot, x);
+		if ((allowed->valid) && ip_addr_cmp(&allowed->ip, &ip) && ip_addr_cmp(&allowed->mask, &mask)) {
+			return true;
+		}
+	}
+	// Look for a free inline slot
 	for (x=0; x < WIREGUARD_MAX_SRC_IPS; x++) {
 		allowed = &peer->allowed_source_ips[x];
-		if ((allowed->valid) && ip_addr_cmp(&allowed->ip, &ip) && ip_addr_cmp(&allowed->mask, &mask)) {
-			result = true;
-			break;
+		if (!allowed->valid) {
+			allowed->ip = ip;
+			allowed->mask = mask;
+			__atomic_store_n(&allowed->valid, true, __ATOMIC_RELEASE);
+			return true;
 		}
 	}
-	if (!result) {
-		// Look for a free slot
-		for (x=0; x < WIREGUARD_MAX_SRC_IPS; x++) {
-			allowed = &peer->allowed_source_ips[x];
-			if (!allowed->valid) {
-				allowed->valid = true;
-				allowed->ip = ip;
-				allowed->mask = mask;
-				result = true;
-				break;
-			}
-		}
+	// Then the extra table, allocated at the first need and kept with the device.
+	if (!device->extra_ips) {
+		void *table = heap_caps_calloc(WIREGUARD_MAX_PEERS, sizeof *device->extra_ips, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (!table) table = calloc(WIREGUARD_MAX_PEERS, sizeof *device->extra_ips);
+		if (!table) return false;
+		__atomic_store_n(&device->extra_ips, table, __ATOMIC_RELEASE);
 	}
-	return result;
+	uint8_t n = device->extra_count[slot];
+	if (n >= WIREGUARD_EXTRA_SRC_IPS) return false;
+	allowed = &device->extra_ips[slot][n];
+	allowed->ip = ip;
+	allowed->mask = mask;
+	allowed->valid = true;
+	__atomic_store_n(&device->extra_count[slot], (uint8_t)(n + 1), __ATOMIC_RELEASE);
+	return true;
 }
 
 static void wireguardif_process_data_message(struct wireguard_device *device, struct wireguard_peer *peer, struct message_transport_data *data_hdr, size_t data_len, const ip_addr_t *addr, u16_t port) {
@@ -800,9 +824,11 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 								       ip4_addr4_16(ip_2_ip4(&dest)),
 								       (unsigned)pbuf->tot_len);
 								// Check if SOURCE IP matches this peer's allowed IPs
-								for (x=0; x < WIREGUARD_MAX_SRC_IPS; x++) {
-									if (peer->allowed_source_ips[x].valid) {
-										if (IP_ADDR_NETCMP_COMPAT(&src_ip, &peer->allowed_source_ips[x].ip, &peer->allowed_source_ips[x].mask)) {
+								int rx_slot = (int)(peer - device->peers);
+								for (x=0; x < peer_allowed_count(device, rx_slot); x++) {
+									struct wireguard_allowed_ip *rx_aip = peer_allowed(device, rx_slot, x);
+									if (rx_aip->valid) {
+										if (IP_ADDR_NETCMP_COMPAT(&src_ip, &rx_aip->ip, &rx_aip->mask)) {
 											dest_ok = true;
 											header_len = PP_NTOHS(IPH_LEN(iphdr));
 											WG_DEBUG("[WG_RX_IP] Allowed by rule %d (src matches), header_len=%u\n", x, (unsigned)header_len);
@@ -1333,7 +1359,15 @@ err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
 	if (result == ERR_OK) {
-		crypto_zero(peer, sizeof(struct wireguard_peer));
+		struct wireguard_device *device = (struct wireguard_device *)netif->state;
+		__atomic_store_n(&device->extra_count[peer_index], 0, __ATOMIC_RELEASE);
+		if (device->extra_ips) memset(device->extra_ips[peer_index], 0, sizeof device->extra_ips[peer_index]);
+		/* Zero everything but the handshake pointer: another task may still
+		 * be in a handshake for this peer, and must never see it NULL. */
+		if (peer->handshake) crypto_zero(peer->handshake, sizeof(*peer->handshake));
+		size_t hs_at = offsetof(struct wireguard_peer, handshake), hs_end = hs_at + sizeof(peer->handshake);
+		crypto_zero(peer, hs_at);
+		crypto_zero((uint8_t *)peer + hs_end, sizeof(struct wireguard_peer) - hs_end);
 		peer->valid = false;
 		result = ERR_OK;
 	}
@@ -1365,6 +1399,11 @@ void wireguardif_free(struct netif *netif) {
 		udp_remove(device->udp_pcb);
 		device->udp_pcb = NULL;
 	}
+	free(device->extra_ips);
+	if (device->handshakes) {
+		crypto_zero(device->handshakes, WIREGUARD_MAX_PEERS * sizeof(struct wireguard_handshake));
+		free(device->handshakes);
+	}
 	// The device holds the private key and every peer's session keys.
 	crypto_zero(device, sizeof(struct wireguard_device));
 	mem_free(device);
@@ -1387,7 +1426,7 @@ err_t wireguardif_add_allowed_ip(struct netif *netif, u8_t peer_index,
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
 	if (result == ERR_OK) {
 		if (!ip || !mask) return ERR_ARG;
-		result = peer_add_ip(peer, *ip, *mask) ? ERR_OK : ERR_MEM;
+		result = peer_add_ip((struct wireguard_device *)netif->state, peer_index, *ip, *mask) ? ERR_OK : ERR_MEM;
 	}
 	return result;
 }
@@ -1435,7 +1474,10 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t
 					} else {
 						peer->keepalive_interval = p->keep_alive;
 					}
-					peer_add_ip(peer, p->allowed_ip, p->allowed_mask);
+					/* A fresh slot starts without extra allowed IPs. */
+					int slot = (int)(peer - device->peers);
+					__atomic_store_n(&device->extra_count[slot], 0, __ATOMIC_RELEASE);
+					peer_add_ip(device, slot, p->allowed_ip, p->allowed_mask);
 					memcpy(peer->greatest_timestamp, p->greatest_timestamp, sizeof(peer->greatest_timestamp));
 
 					result = ERR_OK;
@@ -1694,6 +1736,11 @@ err_t wireguardif_init(struct netif *netif) {
 			if (g_disable_socket_bind) {
 				WG_DEBUG("[WG] Socket binding disabled - using magicsock mode\n");
 				device = (struct wireguard_device *)mem_calloc(1, sizeof(struct wireguard_device));
+				if (device) {   /* handshake state in PSRAM (see wireguard.h) */
+					device->handshakes = heap_caps_calloc(WIREGUARD_MAX_PEERS, sizeof(struct wireguard_handshake), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+					if (!device->handshakes) device->handshakes = calloc(WIREGUARD_MAX_PEERS, sizeof(struct wireguard_handshake));
+					if (!device->handshakes) { mem_free(device); device = NULL; }
+				}
 				if (device) {
 					device->netif = netif;
 					device->udp_pcb = NULL;  // No internal socket
@@ -1740,6 +1787,11 @@ err_t wireguardif_init(struct netif *netif) {
 					result = udp_bind(udp, IP_ADDR_ANY, init_data->listen_port); // Note this listens on all interfaces! Really just want the passed netif
 					if (result == ERR_OK) {
 						device = (struct wireguard_device *)mem_calloc(1, sizeof(struct wireguard_device));
+				if (device) {   /* handshake state in PSRAM (see wireguard.h) */
+					device->handshakes = heap_caps_calloc(WIREGUARD_MAX_PEERS, sizeof(struct wireguard_handshake), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+					if (!device->handshakes) device->handshakes = calloc(WIREGUARD_MAX_PEERS, sizeof(struct wireguard_handshake));
+					if (!device->handshakes) { mem_free(device); device = NULL; }
+				}
 						if (device) {
 							device->netif = netif;
 							if (init_data->bind_netif) {

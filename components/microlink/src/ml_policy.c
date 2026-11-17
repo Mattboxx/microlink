@@ -38,8 +38,10 @@ static portMUX_TYPE policy_lock = portMUX_INITIALIZER_UNLOCKED;
 #endif
 #include "lwip/pbuf.h"
 
-#define GROUPS 8
-#define ENTRIES 128
+#define GROUPS 32
+/* Expanded ACL rules (SrcIPs x DstPorts) are sized by the map too; a policy
+ * with groups/grants over a 20-device tailnet passes 128 easily. */
+#define MAX_ENTRIES 262144u
 /* Peers and prefixes have no fixed count: each snapshot is sized by the map
  * (PSRAM). These bounds only guard size arithmetic; a map that large could
  * not be received by an ESP32 anyway. */
@@ -75,7 +77,6 @@ typedef struct {
     unsigned count;
     bool filters_known, peers_known, local_known;
     char groups[GROUPS][NAME_LEN];
-    entry entries[ENTRIES];
     uint32_t local_first, local_count;   /* own prefixes in pool */
     time_t expires;
     uint32_t peer_count, pool_count;     /* used entries */
@@ -83,9 +84,16 @@ typedef struct {
      * authority; published snapshots are canonical (active peers in map
      * order, each one's prefixes, then the own ones), so equal authority
      * compares equal. */
-    uint32_t peer_cap, pool_cap;
+    uint32_t peer_cap, pool_cap, entry_cap;
     peer *peers;                         /* inside this allocation */
     ip_range *pool;
+    entry *entries;                      /* count used (p->count) */
+    /* Ownership index of published snapshots (NULL on working copies):
+     * peer prefixes sorted by family, length (longest first) and network;
+     * one group per (family, length). */
+    struct owner_ix {uint32_t prefix, peer;} *index;
+    struct owner_group {uint8_t family, bits; uint32_t start, end;} *ix_groups;
+    uint32_t index_count, ix_group_count;
     uint32_t epoch;
     /* Everything above is immutable once published. Never copy mutable reader
      * references or flow state while concurrent packet readers update them. */
@@ -147,28 +155,72 @@ static void publish(policy *p) {
 }
 void ml_policy_reset(void) { publish(NULL); }
 
-/* One block: the policy, then peer_cap peers, then pool_cap prefixes. */
-static policy *policy_alloc(uint32_t peer_cap, uint32_t pool_cap) {
-    if (peer_cap > MAX_PEERS || pool_cap > MAX_PREFIXES) return NULL;
-    size_t bytes = sizeof(policy) + (size_t)peer_cap * sizeof(peer) + (size_t)pool_cap * sizeof(ip_range);
+/* One block: the policy, then entry_cap rules, peer_cap peers and pool_cap
+ * prefixes (rules first: they need the strictest alignment of the three). */
+#define IX_MAX_GROUPS (33 + 129)   /* IPv4 /0../32, IPv6 /0../128 */
+static policy *policy_alloc_ix(uint32_t peer_cap, uint32_t pool_cap, uint32_t entry_cap, bool with_index) {
+    if (peer_cap > MAX_PEERS || pool_cap > MAX_PREFIXES || entry_cap > MAX_ENTRIES) return NULL;
+    size_t bytes = sizeof(policy) + (size_t)entry_cap * sizeof(entry) + (size_t)peer_cap * sizeof(peer)
+                 + (size_t)pool_cap * sizeof(ip_range);
+    size_t ix_at = (bytes + 7) & ~(size_t)7;
+    if (with_index) bytes = ix_at + (size_t)pool_cap * sizeof(struct owner_ix) + IX_MAX_GROUPS * sizeof(struct owner_group);
     policy *p = ALLOC(bytes);
     if (!p) return NULL;
     memset(p, 0, bytes);
-    p->peer_cap = peer_cap; p->pool_cap = pool_cap;
-    p->peers = (peer *)(p + 1);
+    p->peer_cap = peer_cap; p->pool_cap = pool_cap; p->entry_cap = entry_cap;
+    p->entries = (entry *)(p + 1);
+    p->peers = (peer *)(p->entries + entry_cap);
     p->pool = (ip_range *)(p->peers + peer_cap);
+    if (with_index) {
+        p->index = (struct owner_ix *)((uint8_t *)p + ix_at);
+        p->ix_groups = (struct owner_group *)(p->index + pool_cap);
+    }
     return p;
+}
+static policy *policy_alloc(uint32_t peer_cap, uint32_t pool_cap, uint32_t entry_cap) {
+    return policy_alloc_ix(peer_cap, pool_cap, entry_cap, false);
+}
+static const ip_range *s_ix_pool;   /* qsort context: the coordinator is the only writer */
+static int ix_order(const void *x, const void *y) {
+    const ip_range *a = &s_ix_pool[((const struct owner_ix *)x)->prefix], *b = &s_ix_pool[((const struct owner_ix *)y)->prefix];
+    if (a->family != b->family) return a->family < b->family ? -1 : 1;
+    if (a->bits != b->bits) return a->bits > b->bits ? -1 : 1;   /* longest first */
+    int c = memcmp(a->lo, b->lo, 16);
+    if (c) return c;
+    uint32_t pa = ((const struct owner_ix *)x)->peer, pb = ((const struct owner_ix *)y)->peer;
+    return pa < pb ? -1 : pa > pb;
+}
+static void build_index(policy *p) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < p->peer_count; i++)
+        for (uint32_t j = 0; j < p->peers[i].count; j++) p->index[n++] = (struct owner_ix){p->peers[i].first + j, i};
+    s_ix_pool = p->pool;
+    qsort(p->index, n, sizeof *p->index, ix_order);
+    s_ix_pool = NULL;
+    uint32_t g = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        const ip_range *r = &p->pool[p->index[k].prefix];
+        if (!g || p->ix_groups[g - 1].family != r->family || p->ix_groups[g - 1].bits != r->bits) {
+            if (g) p->ix_groups[g - 1].end = k;
+            p->ix_groups[g++] = (struct owner_group){r->family, r->bits, k, k};
+        }
+    }
+    if (g) p->ix_groups[g - 1].end = n;
+    p->index_count = n; p->ix_group_count = g;
 }
 /* Canonical copy: header, active peers in order with their prefixes packed,
  * then the own prefixes. extra_* reserve room for an update. */
-static policy *policy_canonical(const policy *src, uint32_t extra_peers, uint32_t extra_pool) {
+static policy *policy_canonical(const policy *src, uint32_t extra_peers, uint32_t extra_pool, uint32_t extra_entries) {
     uint32_t peers = 0, pool = src->local_count;
     for (uint32_t i = 0; i < src->peer_count; i++)
         if (src->peers[i].active) { peers++; pool += src->peers[i].count; }
-    if (extra_peers > MAX_PEERS - peers || extra_pool > MAX_PREFIXES - pool) return NULL;
-    policy *p = policy_alloc(peers + extra_peers, pool + extra_pool);
+    if (extra_peers > MAX_PEERS - peers || extra_pool > MAX_PREFIXES - pool
+        || extra_entries > MAX_ENTRIES - src->count) return NULL;
+    bool final = !extra_peers && !extra_pool && !extra_entries;   /* a snapshot to publish */
+    policy *p = policy_alloc_ix(peers + extra_peers, pool + extra_pool, src->count + extra_entries, final);
     if (!p) return NULL;
     memcpy(p, src, offsetof(policy, peer_cap));
+    memcpy(p->entries, src->entries, src->count * sizeof(entry));
     p->peer_count = 0; p->pool_count = 0;
     for (uint32_t i = 0; i < src->peer_count; i++) {
         const peer *a = &src->peers[i];
@@ -180,10 +232,12 @@ static policy *policy_canonical(const policy *src, uint32_t extra_peers, uint32_
     }
     memcpy(&p->pool[p->pool_count], &src->pool[src->local_first], src->local_count * sizeof(ip_range));
     p->local_first = p->pool_count; p->pool_count += src->local_count;
+    if (p->index) build_index(p);
     return p;
 }
 static bool same_authority_data(const policy *a, const policy *b) {
     return !memcmp(a, b, offsetof(policy, peer_cap))
+        && !memcmp(a->entries, b->entries, a->count * sizeof(entry))
         && !memcmp(a->peers, b->peers, a->peer_count * sizeof(peer))
         && !memcmp(a->pool, b->pool, a->pool_count * sizeof(ip_range));
 }
@@ -294,7 +348,15 @@ static const cJSON *node_ips(const cJSON *n) {
 }
 static uint32_t list_size(const cJSON *a) { return cJSON_IsArray(a) ? (uint32_t)cJSON_GetArraySize(a) : 0; }
 /* Room an update can need on top of the copied authority. */
-static bool update_room(const cJSON *map, uint32_t *peers, uint32_t *pool) {
+/* Expanded rules of one filter list: SrcIPs x DstPorts per rule. */
+static uint64_t rule_room(const cJSON *rules) {
+    uint64_t n = 0;
+    if (cJSON_IsArray(rules)) for (const cJSON *r = rules->child; r; r = r->next)
+        n += (uint64_t)list_size(cJSON_GetObjectItemCaseSensitive(r, "SrcIPs"))
+           * list_size(cJSON_GetObjectItemCaseSensitive(r, "DstPorts"));
+    return n;
+}
+static bool update_room(const cJSON *map, uint32_t *peers, uint32_t *pool, uint32_t *entries) {
     const char *lists[] = {"Peers", "PeersChanged"};
     uint64_t n = 0, ips = 0;
     for (unsigned l = 0; l < 2; l++) {
@@ -304,8 +366,11 @@ static bool update_room(const cJSON *map, uint32_t *peers, uint32_t *pool) {
     }
     const cJSON *self = cJSON_GetObjectItemCaseSensitive(map, "Node");
     if (cJSON_IsObject(self)) ips += list_size(node_ips(self));
-    if (n > MAX_PEERS || ips > MAX_PREFIXES) return false;
-    *peers = (uint32_t)n; *pool = (uint32_t)ips;
+    uint64_t rules = rule_room(cJSON_GetObjectItemCaseSensitive(map, "PacketFilter"));
+    const cJSON *groups = cJSON_GetObjectItemCaseSensitive(map, "PacketFilters");
+    if (cJSON_IsObject(groups)) for (const cJSON *g = groups->child; g; g = g->next) rules += rule_room(g);
+    if (n > MAX_PEERS || ips > MAX_PREFIXES || rules > MAX_ENTRIES) return false;
+    *peers = (uint32_t)n; *pool = (uint32_t)ips; *entries = (uint32_t)rules;
     return true;
 }
 static int key_order(const void *x, const void *y) {
@@ -508,7 +573,7 @@ static bool group_apply(policy *p,const char *name,const cJSON *rules) {
             }
         }
         for (const cJSON *s=srcs->child;s;s=s->next) for (const cJSON *d=dsts->child;d;d=d->next) {
-            if (p->count>=ENTRIES) REFUSE("filter-rules-limit");
+            if (p->count>=p->entry_cap) REFUSE("filter-room");
             if (!cJSON_IsString(s)||!cJSON_IsObject(d)||!unique(d)) return false;
             for (const cJSON *f=d->child;f;f=f->next)
                 if (strcmp(f->string,"IP") && strcmp(f->string,"Ports") && strcmp(f->string,"Bits")) return false;
@@ -540,8 +605,8 @@ bool ml_policy_apply(const cJSON *map) {
         if (v && !cJSON_IsNull(v)) changed=true;
     }
     if (!changed) return true; /* Keepalive/omitted/null fields retain same-session state. */
-    uint32_t room_peers,room_pool;
-    if (!update_room(map,&room_peers,&room_pool)) {s_reject="too-large";ml_policy_reset();return false;}
+    uint32_t room_peers,room_pool,room_entries;
+    if (!update_room(map,&room_peers,&room_pool,&room_entries)) {s_reject="too-large";ml_policy_reset();return false;}
     policy *old=acquire();
     LOCK();bool resuming=suspended;uint32_t outage=NOW()-suspended_at;bool was_blocked=blocked();UNLOCK();
     /* Reconnects must not apply deltas to unseen stale authority. A complete
@@ -554,7 +619,7 @@ bool ml_policy_apply(const cJSON *map) {
     if(resuming&&!complete){s_reject="delta-while-suspended";release(old);ml_policy_reset();return false;}
     /* A complete map is built from empty state; a delta from the current
      * authority, with room for the update. */
-    policy *next=old&&!resuming ? policy_canonical(old,room_peers,room_pool) : policy_alloc(room_peers,room_pool);
+    policy *next=old&&!resuming ? policy_canonical(old,room_peers,room_pool,room_entries) : policy_alloc(room_peers,room_pool,room_entries);
     if (!next) {s_reject="no-memory";release(old);ml_policy_reset();return false;}
     s_detail="";
     bool valid=peer_updates(next,map);
@@ -590,7 +655,7 @@ bool ml_policy_apply(const cJSON *map) {
     }
     if (!valid) {if(!strcmp(s_reject,"none"))s_reject=*s_detail?s_detail:"packet-filter";release(old);free(next);ml_policy_reset();return false;}
     /* Publish the canonical (compact) form: equal authority compares equal. */
-    policy *canon=policy_canonical(next,0,0);
+    policy *canon=policy_canonical(next,0,0,0);
     free(next);
     if (!canon) {s_reject="no-memory";release(old);ml_policy_reset();return false;}
     next=canon;
@@ -687,8 +752,43 @@ static bool error_tuple(const tuple *t) {
     return t->protocol==1 ? t->icmp!=0 && t->icmp!=8
          : t->protocol==58 && t->icmp!=128 && t->icmp!=129;
 }
-/* Longest-prefix ownership, not merely membership in a peer's broad route. */
+static bool peer_owns_scan(const policy *p,const uint8_t key[32],const uint8_t ip[16],uint8_t family);
+/* Longest-prefix ownership through the index: for each prefix length, longest
+ * first, the networks equal to ip masked to that length (one binary search).
+ * Same result as the scan: expired peers are skipped, two peers at the
+ * longest matching length tie (no owner). */
 static bool peer_owns(const policy *p,const uint8_t key[32],const uint8_t ip[16],uint8_t family) {
+    if (!p->index) return peer_owns_scan(p,key,ip,family);
+    time_t now=time(NULL);
+    int best=-1, owner=-1; bool tied=false;
+    unsigned bytes=family==4?4:16;
+    for (uint32_t g=0; g<p->ix_group_count && owner<0; g++) {
+        const struct owner_group *G=&p->ix_groups[g];
+        if (G->family!=family) continue;
+        uint8_t net[16]={0};
+        for (unsigned i=0;i<bytes;i++) {
+            unsigned n=G->bits>i*8?G->bits-i*8:0;
+            net[i]=ip[i]&(n>=8?255:(uint8_t)(255<<(8-n)));
+        }
+        uint32_t lo=G->start, hi=G->end;
+        while (lo<hi) {   /* first entry with network >= net */
+            uint32_t mid=lo+(hi-lo)/2;
+            if (memcmp(p->pool[p->index[mid].prefix].lo,net,16)<0) lo=mid+1; else hi=mid;
+        }
+        for (uint32_t k=lo;k<G->end && !memcmp(p->pool[p->index[k].prefix].lo,net,16);k++) {
+            const peer *a=&p->peers[p->index[k].peer];
+            if (!a->active || (a->expires && (now<1700000000 || now>=a->expires))) continue;
+            if (owner<0) {owner=(int)p->index[k].peer;best=G->bits;}
+            else if (owner!=(int)p->index[k].peer) tied=true;
+        }
+    }
+    if (family==4 && ip[0]==100 && (ip[1]&0xc0)==0x40 && best!=32) return false;
+    static const uint8_t tail6[6]={0xfd,0x7a,0x11,0x5c,0xa1,0xe0};
+    if (family==6 && !memcmp(ip,tail6,6) && best!=128) return false;
+    return owner>=0 && !tied && !memcmp(p->peers[owner].key,key,32);
+}
+/* Reference scan (working copies; the differential host test). */
+static bool peer_owns_scan(const policy *p,const uint8_t key[32],const uint8_t ip[16],uint8_t family) {
     int best=-1, owner=-1; bool tied=false;
     time_t now=time(NULL);
     for (uint32_t i=0;i<p->peer_count;i++) {
@@ -741,7 +841,7 @@ void ml_policy_get_status(ml_policy_status_t *out) {
     if(!out)return;
     memset(out,0,sizeof *out);policy *p=acquire();
     if(!p)return;
-    out->authority_ready=ready(p);out->peer_authority=p->peers_known;
+    out->authority_ready=ready(p);out->peer_authority=p->peers_known;out->self_expires=(int64_t)p->expires;
     out->filter_authority=p->filters_known;out->self_authority=p->local_known;
     out->expanded_rules=p->count;
     for(uint32_t i=0;i<p->peer_count;i++)if(p->peers[i].active)out->peers++;

@@ -105,7 +105,7 @@ extern "C" {
 #define ML_WG_RX_SMALL_MAX         160
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
-#define ML_PEER_UPDATE_QUEUE_DEPTH 400
+#define ML_PEER_UPDATE_QUEUE_DEPTH 4096   /* PSRAM (microlink.c) */
 
 /* Protocol limits */
 #define ML_MAX_PEERS            CONFIG_ML_MAX_PEERS
@@ -509,6 +509,12 @@ struct microlink_s {
      * is read from NVS at the first registration, the rest is per boot. */
     ml_reg_auth_t reg_auth;
     bool reg_auth_loaded;
+    uint8_t reg_state;              /* microlink_reg_state_t */
+    bool registered_this_boot;      /* reconnects skip the RegisterRequest ... */
+    bool force_register;            /* ... until a map exchange fails */
+    bool renewing;                  /* node key renewed after expiry: send OldNodeKey */
+    uint8_t old_node_key[32];
+    bool tailnet_lock;
     /* Why the last registration failed (static text), for ctrl_retry_reason. */
     const char *reg_note;
 
@@ -1033,6 +1039,9 @@ static inline void *ml_psram_calloc(size_t n, size_t size) {
 /* Registration record of this identity and auth key (microlink.c). */
 bool ml_identity_registered(microlink_t *ml);
 void ml_identity_mark_registered(microlink_t *ml);
+/* The control server reported the node key expired: renew it at the next
+ * start (with an auth key). */
+void ml_identity_mark_expired(microlink_t *ml);
 
 #ifdef __cplusplus
 }

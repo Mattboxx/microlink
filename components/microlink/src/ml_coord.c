@@ -1406,8 +1406,15 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
      * reconnect made the control server refuse a registered device. */
     bool have_key = ml->config.auth_key && ml->config.auth_key[0];
     if (!ml->reg_auth_loaded) {
-        ml->reg_auth.registered = ml_identity_registered(ml);
+        ml->reg_auth.registered = !ml->renewing && ml_identity_registered(ml);
         ml->reg_auth_loaded = true;
+    }
+    if (ml->renewing) {
+        /* Renewal of an expired node key: the server links it to this device. */
+        char old_hex[65], old_str[80];
+        bytes_to_hex(ml->old_node_key, 32, old_hex);
+        snprintf(old_str, sizeof old_str, "nodekey:%s", old_hex);
+        cJSON_AddStringToObject(root, "OldNodeKey", old_str);
     }
     bool sent_key = ml_reg_auth_send_key(&ml->reg_auth, have_key);
     ml->reg_note = NULL;
@@ -1685,6 +1692,9 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
                           "Approve it at: %s", url_j->valuestring);
         }
         if (outcome != ML_REG_ACCEPTED) {
+            ml->reg_state = outcome == ML_REG_RETRY ? ML_REG_STATE_KEY_RETRY
+                          : needs_auth ? (have_key ? ML_REG_STATE_NEED_NEW_KEY : ML_REG_STATE_NEED_KEY)
+                          : ML_REG_STATE_REFUSED;
             ESP_LOGE(TAG, "  %s", note);
             ml->reg_note = note;
             cJSON_Delete(resp_json);
@@ -1697,9 +1707,12 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
              * automatically here (direct.go:890-897 returns regen=true). We do
              * not implement automatic regeneration, so this is fatal and needs
              * operator action - a microlink divergence, not reference behaviour. */
-            ESP_LOGE(TAG, "RegisterResponse.NodeKeyExpired - this node key is no "
-                          "longer accepted. microlink does not regenerate keys "
-                          "automatically: run microlink_factory_reset + reboot.");
+            ESP_LOGE(TAG, "RegisterResponse.NodeKeyExpired - this node key is no longer "
+                          "accepted. It is renewed at the next start with a valid auth key "
+                          "(same device, settings kept).");
+            ml->reg_state = ML_REG_STATE_KEY_EXPIRED;
+            ml->reg_note = "node key expired: renewal needs an auth key";
+            ml_identity_mark_expired(ml);
             cJSON_Delete(resp_json);
             return -1;
         }
@@ -1708,7 +1721,12 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         if (auth_j && cJSON_IsFalse(auth_j)) {
             ESP_LOGW(TAG, "RegisterResponse.MachineAuthorized=false - waiting for approval "
                           "of this device in the admin console");
+            ml->reg_state = ML_REG_STATE_APPROVAL;
+        } else {
+            ml->reg_state = ML_REG_STATE_OK;
         }
+        ml->registered_this_boot = true;
+        ml->force_register = false;
         /* Accepted (the key, if presented, is consumed now): from here on
          * reconnects and restarts register without it. */
         ml_identity_mark_registered(ml);
@@ -1978,6 +1996,9 @@ static bool parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
                     update->subnet_routes[update->subnet_route_count].network = net;
                     update->subnet_routes[update->subnet_route_count].prefix_len = (uint8_t)n;
                     update->subnet_route_count++;
+                } else {
+                    ESP_LOGW(TAG, "Peer advertises more than %d subnet routes: %u.%u.%u.%u/%u and later "
+                                  "ones are not routed", MICROLINK_MAX_PEER_ROUTES, a, b, c, d, n);
                 }
             }
         }
@@ -2134,6 +2155,15 @@ check_removed:
 /* One owner/writer for both map paths. A partial peer installation request
  * must cause a blocked full refresh, not a falsely successful control update. */
 static bool apply_peer_map(microlink_t *ml,cJSON *map) {
+    /* Tailnet Lock: this client does not verify node signatures (it trusts
+     * the control server for peer keys) and must be signed to be reachable. */
+    const cJSON *tka=cJSON_GetObjectItemCaseSensitive(map,"TKAInfo");
+    if (cJSON_IsObject(tka)) {
+        bool on=!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(tka,"Disabled"));
+        if (on && !ml->tailnet_lock) ESP_LOGW(TAG,"Tailnet Lock is enabled: sign this device from a signing node; "
+                                                  "this device does not verify node signatures itself");
+        ml->tailnet_lock=on;
+    }
     bool policy_ok=ml_policy_apply(map);
     bool peers_ok=policy_ok && parse_peers_from_map_response(ml,map);
     if (!peers_ok) {
@@ -3725,7 +3755,10 @@ void ml_coord_task(void *arg) {
                 state = COORD_RECONNECTING;
                 break;
             }
-            state = COORD_REGISTER;
+            /* Registered this boot: a reconnect goes straight to the map, as
+             * the reference client's map loop does. A failed map exchange
+             * registers again (device deleted, key expired ...). */
+            state = ml->registered_this_boot && !ml->force_register ? COORD_FETCH_PEERS : COORD_REGISTER;
             break;
 
         case COORD_REGISTER:
@@ -3753,6 +3786,7 @@ void ml_coord_task(void *arg) {
                 int fp_rc = do_map_exchange(ml, &noise, true);
                 ml->rt_fetch_ms = ml_get_time_ms();
                 if (fp_rc < 0) {
+                    ml->force_register = true;
                     ESP_LOGW(TAG, "MapRequest failed, will retry");
                     note_ctrl_retry(ml, "MapRequest failed");
                     ml_conn_close(ml);
@@ -3769,6 +3803,7 @@ void ml_coord_task(void *arg) {
                     ESP_LOGI(TAG, "Reading initial netmap from the long-poll stream");
                     if (do_start_long_poll(ml, &noise) < 0) {
                         ESP_LOGW(TAG, "Failed to start long-poll");
+                        ml->force_register = true;
                     note_ctrl_retry(ml, "long-poll start failed");
                         ml_conn_close(ml);
                         state = COORD_RECONNECTING;

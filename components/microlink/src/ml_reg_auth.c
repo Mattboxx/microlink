@@ -22,7 +22,7 @@ ml_reg_outcome_t ml_reg_auth_result(ml_reg_auth_t *s, bool have_key, bool sent_k
              * or a new key was entered for a registered device). */
             s->refused = true;
             s->needed = false;
-            why = "auth key refused (used, expired or revoked); retrying without it";
+            why = "auth key refused; retrying without it";
             out = ML_REG_RETRY;
         } else {
             why = "registration refused by the control server";
@@ -32,12 +32,12 @@ ml_reg_outcome_t ml_reg_auth_result(ml_reg_auth_t *s, bool have_key, bool sent_k
         if (!sent_key && have_key && !s->refused) {
             s->needed = true;
             s->registered = false;
-            why = "device not registered with this server; retrying with the auth key";
+            why = "not registered; retrying with the auth key";
             out = ML_REG_RETRY;
         } else {
             s->registered = false;
-            why = have_key ? "device not authorized and the auth key was refused: enter a new auth key"
-                           : "device not authorized: enter an auth key";
+            why = have_key ? "not authorized: a new auth key is needed"
+                           : "not authorized: an auth key is needed";
             out = ML_REG_REFUSED;
         }
     } else {

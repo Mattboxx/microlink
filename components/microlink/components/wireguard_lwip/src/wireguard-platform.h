@@ -39,8 +39,25 @@
 
 // Peers are allocated statically inside the device structure to avoid malloc
 // Increased from 1 to support multiple Tailscale peers (10 peers for larger networks)
+/* Tunnel slots: the same count as MicroLink's peer table. */
+#if defined(__has_include)
+#if __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
+#endif
+#ifndef WIREGUARD_MAX_PEERS
+#ifdef CONFIG_ML_MAX_PEERS
+#define WIREGUARD_MAX_PEERS CONFIG_ML_MAX_PEERS
+#else
 #define WIREGUARD_MAX_PEERS 16
+#endif
+#endif
 #define WIREGUARD_MAX_SRC_IPS 2
+/* More allowed IPs per peer (subnet routes, exit route) live in a device
+ * table in PSRAM, allocated at the first need: the inline two kept every
+ * peer to its own address plus ONE route, so a second advertised subnet or
+ * an exit node with a subnet was silently unreachable. */
+#define WIREGUARD_EXTRA_SRC_IPS 30
 
 // Per device limit on accepting (valid) initiation requests - per peer
 #define MAX_INITIATIONS_PER_SECOND	(2)

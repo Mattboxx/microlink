@@ -170,7 +170,10 @@ struct wireguard_peer {
 	uint8_t greatest_timestamp[WIREGUARD_TAI64N_LEN];
 
 	// The active handshake that is happening
-	struct wireguard_handshake handshake;
+	/* Handshake state is cold (used while negotiating, not per packet): it
+	 * lives in device->handshakes (PSRAM), so more tunnel slots fit in the
+	 * same internal RAM. Set by wireguard_peer_init for a valid peer. */
+	struct wireguard_handshake *handshake;
 
 	// Decrypted cookie from the responder
 	uint32_t cookie_millis;
@@ -227,6 +230,12 @@ struct wireguard_device {
 
 	// List of peers associated with this device
  	struct wireguard_peer peers[WIREGUARD_MAX_PEERS];
+	struct wireguard_handshake *handshakes;   /* WIREGUARD_MAX_PEERS, PSRAM */
+	/* Extra allowed IPs per peer slot (see WIREGUARD_EXTRA_SRC_IPS); NULL
+	 * until first needed, freed with the device. Entries are written before
+	 * extra_count publishes them (readers run on other tasks). */
+	struct wireguard_allowed_ip (*extra_ips)[WIREGUARD_EXTRA_SRC_IPS];
+	uint8_t extra_count[WIREGUARD_MAX_PEERS];
 
 	// DERP relay output callback for peers without direct endpoints
 	wireguard_derp_output_fn derp_output_fn;

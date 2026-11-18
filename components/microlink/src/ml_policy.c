@@ -519,10 +519,11 @@ static bool peer_updates(policy *p, const cJSON *map, bool session_full) {
                 if (key && !cJSON_IsNull(key)) {
                     uint8_t rotated[32];
                     if (!key_parse(key,rotated)) REFUSE("peer-key");
-                    /* The legacy endpoint-only WG patch handler does not
-                     * install rotated keys. Force a fresh full map instead
-                     * of trusting the old key or wedging indefinitely. */
-                    if (memcmp(rotated,p->peers[i].key,32)) REFUSE("key-rotation");
+                    /* Key rotation (seamless renewal): the new key replaces
+                     * the old one in this snapshot, so the old key loses
+                     * authority now. A key held by another active peer is
+                     * refused by active_unique() below. */
+                    memcpy(p->peers[i].key,rotated,32);
                 }
                 if (exp && !cJSON_IsNull(exp) && !expiration(exp,&p->peers[i].expires)) REFUSE("peer-expiry");
                 if (!usable(v)) p->peers[i].active=false;

@@ -1067,7 +1067,21 @@ static void prune_peer_cache(microlink_t *ml) {
         if (!ml->peers[i].active || ml_policy_peer_status(ml->peers[i].public_key)!=0) continue;
         ml_peer_update_t removal={0};
         memcpy(removal.public_key,ml->peers[i].public_key,32);
+        /* Same node, new authorized key (rotation, seamless renewal): the
+         * tunnel is replaced now with the new key, not left to the 30 s
+         * refill. */
+        uint8_t rotated[32];
+        ml_peer_update_t *again=NULL;
+        if (ml->peers[i].node_id && ml_policy_peer_key(ml->peers[i].node_id,rotated)==1
+            && memcmp(rotated,ml->peers[i].public_key,32) && (again=calloc(1,sizeof *again))) {
+            again->action=ML_PEER_ADD;again->has_node_id=true;again->node_id=ml->peers[i].node_id;
+            memcpy(again->public_key,rotated,32);
+        }
         remove_peer(ml,&removal);
+        if (again) {
+            if (ml_peer_sync_resolve(again)) add_peer(ml,again);
+            free(again);
+        }
     }
 }
 
@@ -1130,6 +1144,18 @@ static void process_peer_updates(microlink_t *ml) {
                     if (memcmp(update->public_key, zero_key, 32) != 0) {
                         idx = find_peer_by_key(ml, update->public_key);
                     }
+                }
+                static const uint8_t no_key[32] = {0};
+                if (idx >= 0 && memcmp(update->public_key, no_key, 32)
+                    && memcmp(ml->peers[idx].public_key, update->public_key, 32)) {
+                    /* Key rotated: the tunnel of the old key goes, the peer
+                     * comes back with its new key. */
+                    ml_peer_update_t old = {0};
+                    memcpy(old.public_key, ml->peers[idx].public_key, 32);
+                    remove_peer(ml, &old);
+                    update->action = ML_PEER_ADD;
+                    if (ml_policy_peer_status(update->public_key) == 1) add_peer(ml, update);
+                    break;
                 }
                 if (idx < 0 && update->has_online && update->online
                     && ml_policy_peer_status(update->public_key) == 1) {
@@ -1637,6 +1663,30 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
     }
 }
 
+/* A DISCO message from a disco key with no tunnel slot: if it belongs to an
+ * authorized peer of the map (mailbox), give that peer a slot now, as the
+ * reference client configures peers lazily when they reach out. At most one
+ * mailbox search per second, so unknown keys cannot cost more. */
+static int slot_for_disco_key(microlink_t *ml, const uint8_t *disco_key) {
+    static uint64_t last_ms;
+    uint64_t now = ml_get_time_ms();
+    if (last_ms && now - last_ms < 1000) return -1;
+    last_ms = now ? now : 1;
+    ml_peer_update_t *u = malloc(sizeof *u);
+    if (!u) return -1;
+    int idx = -1;
+    bool used;
+    for (int i = 0; ml_peer_sync_entry(i, u, &used); i++) {
+        if (!used || memcmp(u->disco_key, disco_key, 32)) continue;
+        if (ml_policy_peer_status(u->public_key) != 1) break;
+        u->action = ML_PEER_ADD;
+        if (ml_peer_sync_resolve(u) && add_peer(ml, u) >= 0) idx = find_peer_by_disco_key(ml, disco_key);
+        break;
+    }
+    free(u);
+    return idx;
+}
+
 static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     if (pkt->len < 62) return;  /* magic(6) + key(32) + nonce(24) = 62 minimum */
 
@@ -1665,6 +1715,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
      * has not delivered yet, or a stranger -- is dropped without an X25519;
      * the handlers below could do nothing with it anyway. */
     int sender_idx = find_peer_by_disco_key(ml, sender_disco_key);
+    if (sender_idx < 0) sender_idx = slot_for_disco_key(ml, sender_disco_key);
     if (sender_idx < 0) {
         static uint64_t last_unknown_log_ms = 0;
         static uint32_t unknown_suppressed = 0;

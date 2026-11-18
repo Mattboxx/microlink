@@ -847,10 +847,30 @@ static int do_tcp_connect(microlink_t *ml) {
 
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
+    /* DNS failed: the last address that worked for this host (the Noise
+     * handshake still authenticates the server by its key). */
+    struct addrinfo cached_ai;
+    struct sockaddr_in cached_sa;
+    bool res_cached = false;
 
     if (ml_getaddrinfo(ml->ctrl_host_parsed, ml->ctrl_port_str, &hints, &res) != 0 || !res) {
-        ESP_LOGE(TAG, "DNS resolve failed for %s", ml->ctrl_host_parsed);
-        return -1;
+        uint32_t last = ml_ctrl_addr_load(ml, ml->ctrl_host_parsed);
+        if (!last) {
+            ESP_LOGE(TAG, "DNS resolve failed for %s", ml->ctrl_host_parsed);
+            return -1;
+        }
+        memset(&cached_ai, 0, sizeof cached_ai);
+        memset(&cached_sa, 0, sizeof cached_sa);
+        cached_sa.sin_family = AF_INET;
+        cached_sa.sin_port = htons((uint16_t)atoi(ml->ctrl_port_str));
+        cached_sa.sin_addr.s_addr = htonl(last);
+        cached_ai.ai_family = AF_INET;
+        cached_ai.ai_socktype = SOCK_STREAM;
+        cached_ai.ai_addr = (struct sockaddr *)&cached_sa;
+        cached_ai.ai_addrlen = sizeof cached_sa;
+        res = &cached_ai;
+        res_cached = true;
+        ESP_LOGW(TAG, "DNS failed for %s: using its last working address", ml->ctrl_host_parsed);
     }
 
     int64_t t_dns = esp_timer_get_time();
@@ -858,7 +878,7 @@ static int do_tcp_connect(microlink_t *ml) {
 
     int sock = ml_socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
-        ml_freeaddrinfo(res);
+        if (!res_cached) ml_freeaddrinfo(res);
         ESP_LOGE(TAG, "Socket creation failed");
         return -1;
     }
@@ -886,10 +906,12 @@ static int do_tcp_connect(microlink_t *ml) {
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
         ml_close_sock(sock);
-        ml_freeaddrinfo(res);
+        if (!res_cached) ml_freeaddrinfo(res);
         return -1;
     }
-    ml_freeaddrinfo(res);
+    if (!res_cached && res->ai_family == AF_INET)   /* remember a working address */
+        ml_ctrl_addr_save(ml, ml->ctrl_host_parsed, ntohl(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr));
+    if (!res_cached) ml_freeaddrinfo(res);
 
     int64_t t_tcp = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] TCP connect: %lld ms (total: %lld ms)",

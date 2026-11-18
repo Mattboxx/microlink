@@ -40,6 +40,7 @@ static const char *TAG = "microlink";
 #define NVS_KEY_REG_MARKER  "reg_marker"  /* ml_reg_auth.h: node key + key hash */
 #define NVS_KEY_NK_EXPIRED  "nk_expired"  /* node key expired: renew at the next start */
 #define NVS_KEY_NK_OLD      "nk_old"      /* previous node key until the renewal is accepted */
+#define NVS_KEY_CTRL_ADDR   "ctrl_addr"   /* last working control host IPv4 (DNS failure fallback) */
 
 /* X25519 from ml_x25519.h */
 #include "ml_x25519.h"
@@ -134,6 +135,40 @@ bool ml_identity_registered(microlink_t *ml)
                 && len == sizeof have && !memcmp(have, want, sizeof want);
     nvs_close(nvs);
     return same;
+}
+
+typedef struct { char host[64]; uint32_t ip; } ctrl_addr_rec_t;
+
+uint32_t ml_ctrl_addr_load(microlink_t *ml, const char *host)
+{
+    if (!host || !host[0]) return 0;
+    if (ml->ctrl_addr_ip && !strcmp(ml->ctrl_addr_host, host)) return ml->ctrl_addr_ip;
+    ctrl_addr_rec_t rec;
+    size_t len = sizeof rec;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return 0;
+    bool ok = nvs_get_blob(nvs, NVS_KEY_CTRL_ADDR, &rec, &len) == ESP_OK && len == sizeof rec;
+    nvs_close(nvs);
+    rec.host[sizeof rec.host - 1] = '\0';
+    if (!ok || strcmp(rec.host, host) || !rec.ip) return 0;
+    strlcpy(ml->ctrl_addr_host, rec.host, sizeof ml->ctrl_addr_host);
+    ml->ctrl_addr_ip = rec.ip;
+    return rec.ip;
+}
+
+void ml_ctrl_addr_save(microlink_t *ml, const char *host, uint32_t ip)
+{
+    if (!host || !host[0] || !ip || strlen(host) >= sizeof ml->ctrl_addr_host) return;
+    if (ml->ctrl_addr_ip == ip && !strcmp(ml->ctrl_addr_host, host)) return;   /* no flash write */
+    if (ml_ctrl_addr_load(ml, host) == ip) return;
+    strlcpy(ml->ctrl_addr_host, host, sizeof ml->ctrl_addr_host);
+    ml->ctrl_addr_ip = ip;
+    ctrl_addr_rec_t rec = {{0}, ip};
+    strlcpy(rec.host, host, sizeof rec.host);
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    if (nvs_set_blob(nvs, NVS_KEY_CTRL_ADDR, &rec, sizeof rec) == ESP_OK) nvs_commit(nvs);
+    nvs_close(nvs);
 }
 
 void ml_identity_mark_expired(microlink_t *ml)

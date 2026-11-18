@@ -62,7 +62,11 @@ bool ml_peer_sync_record(const ml_peer_update_t *u){
         e->desired=*u;e->used=true;e->desired.has_endpoints=e->desired.has_derp_region=true;
         if(keep_online){e->desired.has_online=true;e->desired.online=online;}
     }
-    else if(u->action==ML_PEER_UPDATE_ENDPOINT && e->used && e->desired.node_id==u->node_id&&!memcmp(e->desired.public_key,key,32)){
+    else if(u->action==ML_PEER_UPDATE_ENDPOINT && e->used && e->desired.node_id==u->node_id
+            && (!memcmp(e->desired.public_key,key,32)||!memcmp(u->public_key,key,32))){
+        /* A patch with a rotated key (checked against the authority above)
+         * moves the peer to its new key. */
+        memcpy(e->desired.public_key,key,32);
         if(u->has_endpoints){e->desired.endpoint_count=u->endpoint_count;memcpy(e->desired.endpoints,u->endpoints,sizeof u->endpoints);}
         if(u->has_derp_region)e->desired.derp_region=u->derp_region;
         if(u->has_online){e->desired.has_online=true;e->desired.online=u->online;}

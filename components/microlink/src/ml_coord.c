@@ -978,8 +978,31 @@ static int do_tcp_connect(microlink_t *ml) {
 static uint8_t *s_server_extra_data = NULL;
 static int s_server_extra_data_len = 0;
 
+/* The answer to the Noise upgrade request: NULL for "HTTP/1.x 101", else a
+ * short reason (static text, under 48 characters) for the Tailscale page and
+ * the event history. Only the status code counts: the old check accepted
+ * "101" anywhere in the answer (a length, a date, an HTML page). */
+static const char *upgrade_refusal(const char *resp)
+{
+    int status = 0;
+    if (!strncmp(resp, "HTTP/1.", 7) && resp[7] && resp[8] == ' ') status = atoi(resp + 9);
+    if (status == 101) return NULL;
+    if (strstr(resp, "unsupported client version")) return "server: client version not supported";
+    if (status == 0) return "control answer is not HTTP";
+    if (status >= 200 && status < 400) return "no upgrade: check the URL or proxy";
+    switch (status) {
+    case 400: return "control refused the request (HTTP 400)";
+    case 401: case 403: return "control refused access (HTTP 401/403)";
+    case 404: return "control API not found at this URL (404)";
+    case 429: return "control server rate limit (HTTP 429)";
+    default: break;
+    }
+    return status >= 500 ? "control server or proxy error (HTTP 5xx)" : "control refused the upgrade (HTTP 4xx)";
+}
+
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
+    ml->noise_note = NULL;
 
     /* For custom control planes (Headscale / Ionscale / dev coordinators),
      * each instance generates its own Noise keypair, so the hardcoded
@@ -1061,8 +1084,9 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     ESP_LOGI(TAG, "HTTP response received: %d bytes", total);
 
     /* Verify 101 Switching Protocols */
-    if (strstr((char *)resp, "101") == NULL) {
-        ESP_LOGE(TAG, "Noise upgrade rejected: %.200s", resp);
+    ml->noise_note = upgrade_refusal((const char *)resp);
+    if (ml->noise_note) {
+        ESP_LOGE(TAG, "Noise upgrade rejected (%s): %.200s", ml->noise_note, resp);
         free(resp);
         return -1;
     }
@@ -3974,7 +3998,7 @@ void ml_coord_task(void *arg) {
             ml->state = ML_STATE_REGISTERING;
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
-                    note_ctrl_retry(ml, "Noise handshake failed");
+                    note_ctrl_retry(ml, ml->noise_note ? ml->noise_note : "Noise handshake failed");
                 ctrl_transport_failed(ml);
                 saas_refresh_key(ml);
                 /* A custom server's key is fetched once and kept in RAM: if

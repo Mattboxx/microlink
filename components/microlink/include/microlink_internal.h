@@ -522,11 +522,13 @@ struct microlink_s {
     char ping_path[200];            /* liveness PingRequest to answer over Noise ("" = none) */
     char ping_last[200];            /* the last one answered (duplicates are ignored) */
     uint8_t ctrl_transport_failures;
-    uint64_t ctrl_saas_key_ms;
+    uint64_t ctrl_saas_key_ms;      /* last HTTPS fetch of Tailscale's control key (after a Noise failure) */
     char ctrl_addr_host[64];        /* ml_ctrl_addr_*: cached host ... */
-    uint32_t ctrl_addr_ip;          /* ... and its last working IPv4 */      /* last HTTPS fetch of Tailscale's control key (after a Noise failure) */
+    uint32_t ctrl_addr_ip;          /* ... and its last working IPv4 */
     /* Why the last registration failed (static text), for ctrl_retry_reason. */
     const char *reg_note;
+    /* Why the control server refused the Noise upgrade (static text), likewise. */
+    const char *noise_note;
 
     /* Identity from the last RegisterResponse — for display only. A failed
      * registration is detected from RegisterResponse.Error / NodeKeyExpired /

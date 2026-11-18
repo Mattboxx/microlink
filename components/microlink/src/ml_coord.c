@@ -926,6 +926,8 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
             }
         }
         server_pubkey = ml->ctrl_noise_pubkey;
+    } else if (ml->ctrl_noise_pubkey_valid) {
+        server_pubkey = ml->ctrl_noise_pubkey;   /* fetched over HTTPS after a failure (saas_refresh_key) */
     }
 
     /* Initialize Noise state with our machine key and the server's Noise
@@ -3066,7 +3068,13 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
             /* Check Expired flag */
             cJSON *expired = cJSON_GetObjectItem(node, "Expired");
             if (expired && cJSON_IsTrue(expired)) {
+                if (!ml->key_expired) {
+                    /* Renewed at the next start with an auth key (OldNodeKey). */
+                    ml->reg_state = ML_REG_STATE_KEY_EXPIRED;
+                    ml_identity_mark_expired(ml);
+                }
                 ml->key_expired = true;
+                ml->force_register = true;   /* the server answers NodeKeyExpired */
                 ESP_LOGW(TAG, "Node key is EXPIRED — re-registration needed");
             } else {
                 ml->key_expired = false;
@@ -3741,6 +3749,28 @@ static void note_ctrl_retry(microlink_t *ml, const char *why)
     ml->ctrl_retry_failures++;
 }
 
+/* Tailscale's control Noise key is built in. After a failed Noise
+ * handshake on Tailscale's server, fetch the current key over verified HTTPS
+ * (at most every 10 minutes) and use it from then on: a rotated key no longer
+ * breaks every device. Never over plain HTTP: a substituted key would let a
+ * man in the middle impersonate the control server. */
+static void saas_refresh_key(microlink_t *ml)
+{
+    if (ml->ctrl_host[0]) return;
+    uint64_t now = ml_get_time_ms();
+    if (ml->ctrl_saas_key_ms && now - ml->ctrl_saas_key_ms < 600000) return;
+    ml->ctrl_saas_key_ms = now ? now : 1;
+    bool tls = ml->use_tls;
+    char host_hdr[sizeof ml->ctrl_host_hdr];
+    strlcpy(host_hdr, ml->ctrl_host_hdr, sizeof host_hdr);
+    ml->use_tls = true;
+    strlcpy(ml->ctrl_host_hdr, ML_CTRL_HOST, sizeof ml->ctrl_host_hdr);
+    if (fetch_server_pubkey(ml, ML_CTRL_HOST, "443") == 0)
+        ESP_LOGW(TAG, "Noise handshake failed: using Tailscale's current control key (fetched over HTTPS)");
+    ml->use_tls = tls;
+    strlcpy(ml->ctrl_host_hdr, host_hdr, sizeof ml->ctrl_host_hdr);
+}
+
 /* The login server is Tailscale's control host on a default port. */
 static bool ctrl_is_tailscale(const microlink_t *ml)
 {
@@ -3875,6 +3905,7 @@ void ml_coord_task(void *arg) {
                 ESP_LOGE(TAG, "Noise handshake failed");
                     note_ctrl_retry(ml, "Noise handshake failed");
                 ctrl_transport_failed(ml);
+                saas_refresh_key(ml);
                 ml_conn_close(ml);
                 state = COORD_RECONNECTING;
                 break;
@@ -4244,6 +4275,7 @@ void ml_coord_task(void *arg) {
                         if (ml->key_expired) {
                             if (ml->config.auth_key) {
                                 ESP_LOGW(TAG, "Key expired, re-registering with auth_key...");
+                                ml->force_register = true;   /* not straight to the map */
                                 note_ctrl_loss(ml, "node key expired, re-registering");
                                 state = COORD_RECONNECTING;
                                 break;

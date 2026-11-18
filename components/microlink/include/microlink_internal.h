@@ -522,6 +522,7 @@ struct microlink_s {
     char ping_path[200];            /* liveness PingRequest to answer over Noise ("" = none) */
     char ping_last[200];            /* the last one answered (duplicates are ignored) */
     uint8_t ctrl_transport_failures;
+    uint64_t ctrl_saas_key_ms;      /* last HTTPS fetch of Tailscale's control key (after a Noise failure) */
     /* Why the last registration failed (static text), for ctrl_retry_reason. */
     const char *reg_note;
 

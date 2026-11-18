@@ -38,6 +38,7 @@
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
 #include "ml_tls_distrust.h"
+#include "ml_json_id.h"
 #include "ml_dns_config.h"
 #include <string.h>
 #include <errno.h>
@@ -2127,9 +2128,10 @@ static bool parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         /* NodeID — Tailscale int64 wire ID. Needed so PeersChangedPatch
          * deltas (which key off ID, not nodekey) can find the peer slot. */
         cJSON *id_item = cJSON_GetObjectItem(peer, "ID");
-        if (id_item && cJSON_IsNumber(id_item)) {
+        uint64_t node_id;
+        if (ml_json_u64(id_item, INT64_MAX, &node_id)) {   /* exact above 2^53 too */
             update->has_node_id = true;
-            update->node_id = (uint64_t)(int64_t)id_item->valuedouble;
+            update->node_id = node_id;
         }
 
         /* Hostname */
@@ -2287,9 +2289,11 @@ check_removed:
 
             update->action = ML_PEER_REMOVE;
 
+            uint64_t removed_id;
             if (cJSON_IsNumber(key_item)) {
+                if (!ml_json_u64(key_item, INT64_MAX, &removed_id)) { free(update); continue; }
                 update->has_node_id = true;
-                update->node_id = (uint64_t)(int64_t)key_item->valuedouble;
+                update->node_id = removed_id;
                 ESP_LOGI(TAG, "  Remove peer: NodeID=%llu",
                          (unsigned long long)update->node_id);
             } else {
@@ -2329,9 +2333,10 @@ check_removed:
 
             /* NodeID is the primary peer key in PeersChangedPatch. */
             cJSON *id_item = cJSON_GetObjectItem(patch, "NodeID");
-            if (id_item && cJSON_IsNumber(id_item)) {
+            uint64_t patch_id;
+            if (ml_json_u64(id_item, INT64_MAX, &patch_id)) {
                 update->has_node_id = true;
-                update->node_id = (uint64_t)(int64_t)id_item->valuedouble;
+                update->node_id = patch_id;
             }
 
             /* Key (nodekey) — only sent when the peer rotates keys. */
@@ -3162,6 +3167,8 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     char saved = parse_start[parse_len];
     parse_start[parse_len] = '\0';
 
+    /* Node IDs above 2^53 are kept exact (ml_json_id.h). */
+    if (!ml_json_ids_scan(parse_start, parse_len)) ESP_LOGW(TAG, "MapResponse: too many large IDs to keep exact");
     cJSON *map_json = cJSON_Parse(parse_start);
     parse_start[parse_len] = saved;
 
@@ -3865,6 +3872,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             char *ps = (char *)m + 4;
             char saved = ps[size];
             ps[size] = '\0';
+            if (!ml_json_ids_scan(ps, size)) ESP_LOGW(TAG, "long-poll: too many large IDs to keep exact");
             cJSON *update_json = cJSON_Parse(ps);
             ps[size] = saved;
             if (update_json) {

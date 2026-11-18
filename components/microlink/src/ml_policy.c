@@ -4,6 +4,7 @@
  * No allocation, logging, network I/O or blocking mutex on the packet path.
  */
 #include "ml_policy.h"
+#include "ml_json_id.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -534,7 +535,7 @@ static bool peer_updates(policy *p, const cJSON *map, bool session_full) {
     if (removed && !cJSON_IsNull(removed)) {
         if (!cJSON_IsArray(removed)) REFUSE("removed-shape");
         for (const cJSON *v=removed->child;v;v=v->next) {
-            uint64_t id;if (!number(v,9007199254740991ULL,&id)) REFUSE("peer-id");
+            uint64_t id;if (!ml_json_u64(v,INT64_MAX,&id)) REFUSE("peer-id");
             for (uint32_t i=0;i<p->peer_count;i++) if (p->peers[i].id==id) p->peers[i].active=false;
         }
     }
@@ -545,7 +546,8 @@ static bool peer_updates(policy *p, const cJSON *map, bool session_full) {
         for (const cJSON *v=list->child;v;v=v->next) {
             uint64_t id;
             if (!cJSON_IsObject(v) || !unique(v) || !exact_auth_fields(v)) REFUSE("peer-shape");
-            if (!number(get(v,"ID"),9007199254740991ULL,&id) || !id) REFUSE("peer-id");
+            /* Node IDs are int64; new ones are above 2^53 (exact via ml_json_id). */
+            if (!ml_json_u64(get(v,"ID"),INT64_MAX,&id) || !id) REFUSE("peer-id");
             int64_t slot=-1;
             for (uint32_t i=0;i<p->peer_count;i++) if (p->peers[i].active && p->peers[i].id==id) slot=i;
             if (!pass && slot>=0) REFUSE("duplicate-peer"); /* Duplicate ID in full map. */
@@ -565,7 +567,7 @@ static bool peer_updates(policy *p, const cJSON *map, bool session_full) {
         if (!cJSON_IsArray(patches)) REFUSE("patch-shape");
         for (const cJSON *v=patches->child;v;v=v->next) {
             uint64_t id; if (!cJSON_IsObject(v)||!unique(v)||!exact_auth_fields(v)
-                || get(v,"AllowedIPs") || get(v,"Addresses") || !number(get(v,"NodeID"),9007199254740991ULL,&id)) REFUSE("patch-shape");
+                || get(v,"AllowedIPs") || get(v,"Addresses") || !ml_json_u64(get(v,"NodeID"),INT64_MAX,&id)) REFUSE("patch-shape");
             for (uint32_t i=0;i<p->peer_count;i++) if (p->peers[i].active && p->peers[i].id==id) {
                 const cJSON *key=get(v,"Key"), *exp=get(v,"KeyExpiry");
                 if (key && !cJSON_IsNull(key)) {

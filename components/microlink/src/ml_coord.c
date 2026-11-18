@@ -342,10 +342,108 @@ static int parse_pubkey_response(const char *resp, uint8_t pubkey_out[32]) {
  * server is still authenticated: by its Noise key, or by its certificate for
  * the name over TLS, so a stale address can only fail to connect. NULL when
  * no address is known. */
+/* Bootstrap DNS, as the official client does when DNS does not work: ask
+ * a Tailscale DERP relay at a built-in address for the control server's
+ * addresses (GET /bootstrap-dns over TLS, the relay's certificate checked for
+ * its name). Only for the Tailscale control server, only when DNS failed and
+ * no last working address is known, at most once per ML_BOOTSTRAP_RETRY_US.
+ * The answer is kept in RAM only (never written to flash); the control
+ * server is still verified by its certificate (TLS) and Noise key, so a wrong
+ * or stale answer can only fail to connect. */
+#define ML_BOOTSTRAP_RESP_MAX 4096
+#define ML_BOOTSTRAP_RETRY_US (5LL * 60 * 1000000)
+static const struct { const char *name; const char *ip; } ml_bootstrap_derp[] = {
+    { "derp1.tailscale.com",  "159.89.225.99" },
+    { "derp2.tailscale.com",  "167.172.206.31" },
+    { "derp4.tailscale.com",  "167.172.182.26" },
+    { "derp9.tailscale.com",  "207.148.3.137" },
+    { "derp10.tailscale.com", "137.220.36.168" },
+};
+
+/* The first public IPv4 address listed for host in a bootstrap-dns HTTP
+ * response (status 200, JSON body {"host":["addr",...]}); 0 when none. */
+static uint32_t bootstrap_pick_ipv4(const char *response, const char *host)
+{
+    if (!response || !host || strncmp(response, "HTTP/1.", 7) || strncmp(response + 8, " 200", 4)) return 0;
+    const char *body = strstr(response, "\r\n\r\n");
+    if (!body) return 0;
+    cJSON *root = cJSON_Parse(body + 4);
+    const cJSON *list = root ? cJSON_GetObjectItemCaseSensitive(root, host) : NULL;
+    uint32_t found = 0;
+    for (const cJSON *it = cJSON_IsArray(list) ? list->child : NULL; it && !found; it = it->next) {
+        unsigned a, b, c, d;
+        char tail;
+        if (!cJSON_IsString(it) || sscanf(it->valuestring, "%3u.%3u.%3u.%3u%c", &a, &b, &c, &d, &tail) != 4
+            || a > 255 || b > 255 || c > 255 || d > 255 || !isdigit((unsigned char)it->valuestring[0])) continue;
+        /* Not an address of this network, loopback, link-local, CGNAT/tailnet or multicast. */
+        if (a == 0 || a == 10 || a == 127 || a >= 224 || (a == 169 && b == 254) || (a == 172 && (b & 0xf0) == 16)
+            || (a == 192 && b == 168) || (a == 100 && (b & 0xc0) == 64)) continue;
+        found = (uint32_t)a << 24 | (uint32_t)b << 16 | (uint32_t)c << 8 | (uint32_t)d;
+    }
+    cJSON_Delete(root);
+    return found;
+}
+
+static uint32_t ctrl_bootstrap(microlink_t *ml, const char *host)
+{
+    static int64_t s_last_try;
+    static unsigned s_next;
+    if (!host || strcmp(host, ML_CTRL_HOST)) return 0;
+    int64_t now = esp_timer_get_time();
+    if (s_last_try && now - s_last_try < ML_BOOTSTRAP_RETRY_US) return 0;
+    s_last_try = now;
+    char *buf = ml_psram_malloc(ML_BOOTSTRAP_RESP_MAX + 1);
+    if (!buf) return 0;
+    uint32_t ip = 0;
+    const unsigned relays = sizeof ml_bootstrap_derp / sizeof ml_bootstrap_derp[0];
+    if (!s_next) s_next = esp_random();
+    for (unsigned attempt = 0; attempt < 2 && !ip; attempt++) {
+        unsigned i = s_next++ % relays;
+        esp_tls_cfg_t cfg = {
+            .crt_bundle_attach = ml_tls_bundle_attach,
+            .common_name       = ml_bootstrap_derp[i].name,
+            .timeout_ms        = 5000,
+        };
+        esp_tls_t *tls = esp_tls_init();
+        if (!tls) break;
+        const char *addr = ml_bootstrap_derp[i].ip;
+        size_t used = 0;
+        if (esp_tls_conn_new_sync(addr, (int)strlen(addr), 443, &cfg, tls) == 1) {
+            char req[192];
+            int len = snprintf(req, sizeof req, "GET /bootstrap-dns?q=%s HTTP/1.0\r\nHost: %s\r\n\r\n",
+                               host, ml_bootstrap_derp[i].name);
+            int sent = 0;
+            while (len > 0 && sent < len) {
+                ssize_t w = esp_tls_conn_write(tls, req + sent, (size_t)(len - sent));
+                if (w <= 0) break;
+                sent += (int)w;
+            }
+            while (sent == len && used < ML_BOOTSTRAP_RESP_MAX) {
+                ssize_t r = esp_tls_conn_read(tls, buf + used, ML_BOOTSTRAP_RESP_MAX - used);
+                if (r <= 0) break;
+                used += (size_t)r;
+            }
+        }
+        buf[used] = '\0';
+        esp_tls_conn_destroy(tls);
+        ip = bootstrap_pick_ipv4(buf, host);
+        if (!ip) ESP_LOGW(TAG, "Bootstrap DNS via %s gave no address", ml_bootstrap_derp[i].name);
+    }
+    free(buf);
+    if (ip && strlen(host) < sizeof ml->ctrl_addr_host) {
+        strlcpy(ml->ctrl_addr_host, host, sizeof ml->ctrl_addr_host);
+        ml->ctrl_addr_ip = ip;   /* RAM only: never written to flash */
+        ESP_LOGW(TAG, "DNS failed for %s: bootstrap DNS via a relay found %u.%u.%u.%u", host,
+                 (unsigned)(ip >> 24) & 255u, (unsigned)(ip >> 16) & 255u, (unsigned)(ip >> 8) & 255u, (unsigned)ip & 255u);
+    }
+    return ip;
+}
+
 static struct addrinfo *ctrl_cached_addr(microlink_t *ml, const char *host, const char *port,
                                          struct addrinfo *ai, struct sockaddr_in *sa)
 {
     uint32_t last = ml_ctrl_addr_load(ml, host);
+    if (!last) last = ctrl_bootstrap(ml, host);
     if (!last) return NULL;
     memset(ai, 0, sizeof *ai);
     memset(sa, 0, sizeof *sa);
@@ -373,6 +471,7 @@ static int ctrl_tls_connect(microlink_t *ml, esp_tls_t *tls, const char *host, c
     char ip[16] = "";
     if (ml_getaddrinfo(host, port, &hints, &res) != 0 || !res) {
         uint32_t last = ml_ctrl_addr_load(ml, host);
+        if (!last) last = ctrl_bootstrap(ml, host);
         if (last) {
             snprintf(ip, sizeof ip, "%u.%u.%u.%u", (unsigned)(last >> 24) & 255u,
                      (unsigned)(last >> 16) & 255u, (unsigned)(last >> 8) & 255u, (unsigned)last & 255u);

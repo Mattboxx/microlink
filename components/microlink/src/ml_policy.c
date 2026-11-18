@@ -51,8 +51,14 @@ static portMUX_TYPE policy_lock = portMUX_INITIALIZER_UNLOCKED;
 #define NAME_LEN 64
 
 typedef struct { uint8_t lo[16], hi[16], family, bits; } ip_range;
+/* "cap:<name>" sources: a peer's node capabilities (CapMap keys and the
+ * legacy Capabilities list) are kept as 64-bit FNV-1a hashes, the smallest
+ * PEER_CAPS of them (sorted, so the snapshot is canonical). A capability
+ * not kept only makes a cap: rule admit less, never more. */
+#define PEER_CAPS 8
 typedef struct {
     ip_range src, dst;
+    uint64_t src_cap;        /* nonzero: source is "cap:<name>" (hash), src unused */
     uint8_t protocols[32], group;
     uint16_t first, last;
 } entry;
@@ -61,6 +67,8 @@ typedef struct {
     uint8_t key[32];
     uint32_t first, count;   /* prefixes: pool[first .. first+count) */
     time_t expires;
+    uint64_t caps[PEER_CAPS];   /* ascending; cap_count used */
+    uint8_t cap_count;
     bool active;
 } peer;
 typedef struct {
@@ -281,7 +289,7 @@ static bool same_casefold(const char *a,const char *b) {
  * security fields rather than giving it a different interpretation. */
 static bool exact_auth_fields(const cJSON *o) {
     const char *names[]={"KeepAlive","PacketFilter","PacketFilters","Node","Peers","PeersChanged","PeersRemoved","PeersChangedPatch",
-        "ID","NodeID","Key","KeyExpiry","Addresses","AllowedIPs","Expired","IsJailed","UnsignedPeerAPIOnly"};
+        "ID","NodeID","Key","KeyExpiry","Addresses","AllowedIPs","Expired","IsJailed","UnsignedPeerAPIOnly","CapMap","Capabilities"};
     for (const cJSON *v=o->child;v;v=v->next) for (unsigned i=0;i<sizeof names/sizeof names[0];i++)
         if (same_casefold(v->string,names[i]) && strcmp(v->string,names[i])) return false;
     return true;
@@ -458,6 +466,40 @@ static bool expiration(const cJSON *v, time_t *out) {
     for (unsigned mo=1;mo<m;mo++) n += days[mo-1]+(mo==2 && leap);
     *out = (time_t)(((n+d-1)*24+h)*3600+min*60+sec); return true;
 }
+static uint64_t cap_hash(const char *s) {
+    uint64_t h=1469598103934665603ULL;
+    while (*s) {h^=(uint8_t)*s++;h*=1099511628211ULL;}
+    return h?h:1;   /* 0 means "not a cap: rule" */
+}
+static void cap_add(peer *a,uint64_t h) {
+    unsigned i=0;
+    while (i<a->cap_count && a->caps[i]<h) i++;
+    if (i<a->cap_count && a->caps[i]==h) return;
+    if (i>=PEER_CAPS) return;                                /* larger than every kept one */
+    unsigned n=a->cap_count<PEER_CAPS ? a->cap_count : PEER_CAPS-1;   /* drop the largest when full */
+    memmove(&a->caps[i+1],&a->caps[i],(n-i)*sizeof a->caps[0]);
+    a->caps[i]=h; a->cap_count=(uint8_t)(n+1);
+}
+/* A node's capabilities: CapMap (object of name -> values) and the legacy
+ * Capabilities list, as tailcfg Node.HasCap() reads them. Wrong shapes are
+ * refused (the map is malformed). */
+static bool peer_caps(peer *a,const cJSON *capmap,const cJSON *legacy) {
+    if (capmap && !cJSON_IsNull(capmap)) {
+        if (!cJSON_IsObject(capmap) || !unique(capmap)) return false;
+        for (const cJSON *c=capmap->child;c;c=c->next) {
+            if (!c->string || !*c->string) return false;
+            cap_add(a,cap_hash(c->string));
+        }
+    }
+    if (legacy && !cJSON_IsNull(legacy)) {
+        if (!cJSON_IsArray(legacy)) return false;
+        for (const cJSON *c=legacy->child;c;c=c->next) {
+            if (!cJSON_IsString(c) || !*c->valuestring) return false;
+            cap_add(a,cap_hash(c->valuestring));
+        }
+    }
+    return true;
+}
 static bool usable(const cJSON *node) {
     const char *flags[] = {"Expired", "IsJailed", "UnsignedPeerAPIOnly"};
     for (unsigned i=0;i<3;i++) {
@@ -515,6 +557,7 @@ static bool peer_updates(policy *p, const cJSON *map, bool session_full) {
             if (!key_parse(get(v,"Key"),a->key)) REFUSE("peer-key");
             if (!expiration(get(v,"KeyExpiry"),&a->expires)) REFUSE("peer-expiry");
             if (!prefixes(p,node_ips(v),&a->first,&a->count)) REFUSE("peer-prefixes");
+            if (!peer_caps(a,get(v,"CapMap"),get(v,"Capabilities"))) REFUSE("peer-caps");
             a->active=usable(v);
         }
     }
@@ -535,6 +578,14 @@ static bool peer_updates(policy *p, const cJSON *map, bool session_full) {
                     memcpy(p->peers[i].key,rotated,32);
                 }
                 if (exp && !cJSON_IsNull(exp) && !expiration(exp,&p->peers[i].expires)) REFUSE("peer-expiry");
+                /* A CapMap in a patch replaces the node's whole CapMap
+                 * (tailcfg.PeerChange); the legacy list is not patched, so
+                 * what came from it is dropped too (admits less, not more). */
+                const cJSON *capmap=get(v,"CapMap");
+                if (capmap && !cJSON_IsNull(capmap)) {
+                    p->peers[i].cap_count=0; memset(p->peers[i].caps,0,sizeof p->peers[i].caps);
+                    if (!peer_caps(&p->peers[i],capmap,NULL)) REFUSE("peer-caps");
+                }
                 if (!usable(v)) p->peers[i].active=false;
             }
         }
@@ -592,11 +643,10 @@ static bool group_apply(policy *p,const char *name,const cJSON *rules) {
             }
         }
         for (const cJSON *s=srcs->child;s;s=s->next) for (const cJSON *d=dsts->child;d;d=d->next) {
-            /* "cap:<name>" matches peers holding a node capability; this
-             * client does not track peer capabilities, so such a source
-             * admits nobody (never more than the policy allows), and the
-             * rest of the policy still applies. */
-            if (cJSON_IsString(s) && !strncmp(s->valuestring,"cap:",4)) continue;
+            /* "cap:<name>" matches packets from a tailnet address of a peer
+             * that holds that node capability (rule_allowed()). */
+            bool cap_src=cJSON_IsString(s) && !strncmp(s->valuestring,"cap:",4);
+            if (cap_src && !s->valuestring[4]) return false;
             if (p->count>=p->entry_cap) REFUSE("filter-room");
             if (!cJSON_IsString(s)||!cJSON_IsObject(d)||!unique(d)) return false;
             for (const cJSON *f=d->child;f;f=f->next)
@@ -607,7 +657,9 @@ static bool group_apply(policy *p,const char *name,const cJSON *rules) {
                 || !number(get(ports,"First"),65535,&first)||!number(get(ports,"Last"),65535,&last)
                 || first>last || (dbits && !cJSON_IsNull(dbits))) return false;
             entry *e=&p->entries[p->count++]; memset(e,0,sizeof *e);
-            if (!range_parse(s->valuestring,&e->src)||!range_parse(ip->valuestring,&e->dst)) return false;
+            if (cap_src) e->src_cap=cap_hash(s->valuestring+4);
+            else if (!range_parse(s->valuestring,&e->src)) return false;
+            if (!range_parse(ip->valuestring,&e->dst)) return false;
             memcpy(e->protocols,mask,32); e->group=id; e->first=first; e->last=last;
         }
     }
@@ -950,11 +1002,28 @@ bool ml_policy_tx_fragment_epoch(const uint8_t src[16],const uint8_t dst[16],uns
     policy *p=acquire();bool ok=ready(p)&&peer_owns(p,key,dst,(uint8_t)family);
     LOCK();ok=ok&&current==p&&!blocked();if(ok)*out=p->epoch;UNLOCK();release(p);return ok;
 }
-static bool rule_allowed(const policy *p,const tuple *t) {
+/* Does the peer with this key hold the capability, and is src one of its
+ * own tailnet addresses (as tailcfg's lookup by node address: not a subnet
+ * route behind it)? The caller has checked that the key owns src. */
+static bool peer_has_cap(const policy *p,const uint8_t key[32],const tuple *t,uint64_t cap,int *slot) {
+    static const uint8_t tail6[6]={0xfd,0x7a,0x11,0x5c,0xa1,0xe0};
+    if (!key || !(t->family==4 ? t->src[0]==100 && (t->src[1]&0xc0)==0x40 : !memcmp(t->src,tail6,6))) return false;
+    if (*slot==-1) {
+        *slot=-2;
+        for (uint32_t i=0;i<p->peer_count;i++)
+            if (p->peers[i].active && !memcmp(p->peers[i].key,key,32)) {*slot=(int)i;break;}
+    }
+    if (*slot<0) return false;
+    const peer *a=&p->peers[*slot];
+    for (unsigned i=0;i<a->cap_count;i++) if (a->caps[i]==cap) return true;
+    return false;
+}
+static bool rule_allowed(const policy *p,const tuple *t,const uint8_t key[32]) {
+    int slot=-1;   /* the sender's peer, looked up once and only for cap: rules */
     for (unsigned i=0;i<p->count;i++) {
         const entry *e=&p->entries[i];
-        if (!(e->protocols[t->protocol/8] & (1<<(t->protocol%8))) || !contains(&e->src,t->src,t->family)
-            || !contains(&e->dst,t->dst,t->family)) continue;
+        if (!(e->protocols[t->protocol/8] & (1<<(t->protocol%8))) || !contains(&e->dst,t->dst,t->family)) continue;
+        if (e->src_cap ? !peer_has_cap(p,key,t,e->src_cap,&slot) : !contains(&e->src,t->src,t->family)) continue;
         if (t->protocol==1 || t->protocol==58 || (t->dport>=e->first && t->dport<=e->last)) return true;
     }
     return false;
@@ -968,7 +1037,7 @@ static bool related_error(policy *p,const struct pbuf *packet,const tuple *outer
     if (!decode_at(packet,off+8,end,true,&quote,NULL) || quote.family!=outer->family
         || memcmp(outer->dst,quote.src,16)) return false;
     if (!inbound) return peer_owns(p,key,quote.src,quote.family) && local_owns(p,quote.dst,quote.family)
-                         && (rule_allowed(p,&quote) || flow_allowed(p,&quote,key,false));
+                         && (rule_allowed(p,&quote,key) || flow_allowed(p,&quote,key,false));
     if (!local_owns(p,quote.src,quote.family) || !peer_owns(p,key,quote.dst,quote.family)) return false;
     tuple reverse=quote;memcpy(reverse.src,quote.dst,16);memcpy(reverse.dst,quote.src,16);
     reverse.sport=quote.dport;reverse.dport=quote.sport;
@@ -989,7 +1058,7 @@ bool ml_policy_rx(const struct pbuf *packet,const uint8_t key[32]) {
     if (!local_owns(p,t.dst,t.family)) goto done;
     if (error_tuple(&t)) {ok=related_error(p,packet,&t,key,true);goto done;}
     if (flow_allowed(p,&t,key,true)) {ok=true;goto done;}
-    ok=rule_allowed(p,&t);
+    ok=rule_allowed(p,&t,key);
 done:
     /* A concurrently revoked snapshot cannot grant a new packet. Admission is
      * linearized here, BEFORE translation/queueing, not at socket delivery. */

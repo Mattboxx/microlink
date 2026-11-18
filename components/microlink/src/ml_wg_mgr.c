@@ -57,9 +57,13 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force);
  * unlinked it from netif_list -- a use-after-free seen as heap corruption in
  * ip4_route / dhcp_coarse_tmr / nd6_tmr on uplink roams (2026-10-20). */
 struct wg_tcpip_call { void (*fn)(void *); void *arg; };
+/* The TCPIP task, learned on the first call that runs there; see
+ * wg_udp_sendto_tcpip() for why the output path needs to know it. */
+static TaskHandle_t s_tcpip_task;
 static esp_err_t wg_tcpip_exec_wrap(void *ctx)
 {
     struct wg_tcpip_call *c = (struct wg_tcpip_call *)ctx;
+    s_tcpip_task = xTaskGetCurrentTaskHandle();
     c->fn(c->arg);
     return ESP_OK;
 }
@@ -68,6 +72,52 @@ static void wg_tcpip_sync(void (*fn)(void *), void *arg)
     struct wg_tcpip_call c = { .fn = fn, .arg = arg };
     esp_err_t e = esp_netif_tcpip_exec(wg_tcpip_exec_wrap, &c);
     if (e != ESP_OK) ESP_LOGE(TAG, "esp_netif_tcpip_exec failed: %s", esp_err_to_name(e));
+}
+
+/* udp_sendto on the raw WG output PCB from any task (upstream MicroLink
+ * 0.1.39, 6f92800).
+ *
+ * Without lwIP core locking (this build) a raw-API call is only safe on the
+ * TCPIP thread. The data path already runs there (wireguardif_output from
+ * netif output, wireguardif_tmr from sys_timeout), but the handshakes the
+ * wg_mgr task starts (wireguardif_connect / _connect_derp on DISCO decisions)
+ * and the replies it sends from process_wg_packet (handshake response,
+ * cookie, keepalive after a handshake) reached udp_sendto on the wg_mgr task,
+ * racing the TCPIP thread on the ARP table and its pending-packet queue (an
+ * upstream 0.1.38 router rebooted in free_etharp_q under etharp_query). Off
+ * the TCPIP thread the send is posted there with its own copy of the packet
+ * (ip4_output_if prepends headers in place and asserts p->ref == 1, so the
+ * caller's pbuf cannot be shared). The copy costs a few hundred bytes per
+ * handshake or keepalive; the data path never takes this branch.
+ * tcpip_callback does not block, so wg_mgr cannot deadlock against TCPIP. */
+static struct udp_pcb *s_wg_output_pcb;   /* defined below, with the pin callback */
+static struct pbuf *ml_spiram_pbuf_new(u16_t len);
+struct wg_udp_send_msg { struct pbuf *p; ip_addr_t dst; u16_t port; };
+static void wg_udp_send_on_tcpip_cb(void *arg)
+{
+    struct wg_udp_send_msg *m = (struct wg_udp_send_msg *)arg;
+    if (s_wg_output_pcb) udp_sendto(s_wg_output_pcb, m->p, &m->dst, m->port);
+    pbuf_free(m->p);
+    free(m);
+}
+static err_t wg_udp_sendto_tcpip(struct pbuf *p, const ip_addr_t *dst, u16_t port)
+{
+    if (s_tcpip_task == NULL || xTaskGetCurrentTaskHandle() == s_tcpip_task) {
+        return udp_sendto(s_wg_output_pcb, p, dst, port);
+    }
+    struct wg_udp_send_msg *m = (struct wg_udp_send_msg *)malloc(sizeof(*m));
+    if (!m) return ERR_MEM;
+    struct pbuf *copy = ml_spiram_pbuf_new(p->tot_len);
+    if (!copy) { free(m); return ERR_MEM; }
+    pbuf_copy_partial(p, copy->payload, p->tot_len, 0);
+    m->p = copy; m->dst = *dst; m->port = port;
+    err_t e = tcpip_callback(wg_udp_send_on_tcpip_cb, m);
+    if (e != ERR_OK) {
+        pbuf_free(copy);
+        free(m);
+        ESP_LOGW(TAG, "WG UDP TX: tcpip_callback failed (%d), packet dropped", (int)e);
+    }
+    return e;
 }
 
 static void wg_netif_bring_up_cb(void *ctx)
@@ -446,7 +496,7 @@ static err_t wg_udp_pbuf_output_cb(uint32_t dest_ip, uint16_t dest_port, struct 
     ip_addr_t dst;
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
-    err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+    err_t err = wg_udp_sendto_tcpip(p, &dst, dest_port);
     wg_send_both_relay(ml, dest_ip, data, len);
     return err;
 }
@@ -465,7 +515,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
              (int)dest_port,
              len >= 1 ? data[0] : -1);
 
-    /* Use raw PCB to send — safe from any thread context */
+    /* Raw PCB send; off the TCPIP thread it is posted there (wg_udp_sendto_tcpip) */
     if (!s_wg_output_pcb) return ERR_CONN;
 
     /* Throughput-stability fix (2026-05-24, re-applied after the WiFi
@@ -496,7 +546,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
 
-    err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+    err_t err = wg_udp_sendto_tcpip(p, &dst, dest_port);
     pbuf_free(p);
 
     wg_send_both_relay(ml, dest_ip, data, len);
@@ -2164,23 +2214,28 @@ static void disco_periodic_probes(microlink_t *ml) {
          *   3. If data is ALSO stale, then the path really is dead and the
          *      old behaviour (zero endpoint + DERP handshake) is correct.
          */
-        if (p->has_direct_path && now > p->trust_until_ms) {
-            /* Look up WG-side last_rx age before deciding. */
+        /* An endpoint kept above (PING-stale, direct data flowing) is
+         * re-checked on every tick, not only at the next trust expiry: with
+         * has_direct_path false this block never ran again, so if the peer
+         * then went quiet (no relay packet either, which would drop the
+         * endpoint in update_peer_addr) the gateway kept writing to an
+         * address that delivered nothing. Upstream MicroLink 0.1.39. */
+        struct wireguard_peer *kwp = NULL;
+        if (ml->wg_netif && p->wg_peer_index >= 0 && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
+            struct wireguard_device *kdev = (struct wireguard_device *)((struct netif *)ml->wg_netif)->state;
+            if (kdev) kwp = &kdev->peers[p->wg_peer_index];
+        }
+        bool trust_expired = p->has_direct_path && now > p->trust_until_ms;
+        bool kept_endpoint = !p->has_direct_path && kwp != NULL &&
+                             !ip_addr_isany(&kwp->ip) && kwp->port != 0;
+        if (trust_expired || kept_endpoint) {
+            /* Age of the last authenticated packet that came in directly. */
             uint32_t last_rx_age_ms = 0xFFFFFFFF;
-            if (ml->wg_netif && p->wg_peer_index >= 0 &&
-                p->wg_peer_index < WIREGUARD_MAX_PEERS) {
-                struct netif *netif = (struct netif *)ml->wg_netif;
-                struct wireguard_device *dev = (struct wireguard_device *)netif->state;
-                if (dev) {
-                    struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
-                    if (wp->last_direct_rx) {
-                        uint32_t now_wg = wireguard_sys_now();
-                        uint32_t age = now_wg - wp->last_direct_rx;
-                        /* Saturate against the unsigned wrap that fires
-                         * when last_rx is updated mid-read. */
-                        last_rx_age_ms = (age > 0x7FFFFFFFu) ? 0 : age;
-                    }
-                }
+            if (kwp && kwp->last_direct_rx) {
+                uint32_t age = wireguard_sys_now() - kwp->last_direct_rx;
+                /* Saturate against the unsigned wrap that fires when the
+                 * stamp is updated mid-read. */
+                last_rx_age_ms = (age > 0x7FFFFFFFu) ? 0 : age;
             }
 
             bool data_flowing = (last_rx_age_ms < 30000);
@@ -2197,11 +2252,13 @@ static void disco_periodic_probes(microlink_t *ml) {
                      * and with 11 peers triggering at the same tick blocked
                      * disco_periodic_probes for 280+ ms — that was the
                      * remaining stutter source the operator was seeing). */
-                    ESP_LOGI(TAG, "Direct path PING-stale for %s but data flowing "
-                                  "(last_rx=%ums) - keeping endpoint, single PING",
-                             p->hostname, (unsigned)last_rx_age_ms);
-                    if (!ml_at_socket_is_ready()) {
-                        disco_send_ping_to_peer(ml, i, true);
+                    if (trust_expired) {   /* a kept endpoint still carrying data needs nothing */
+                        ESP_LOGI(TAG, "Direct path PING-stale for %s but data flowing "
+                                      "(last_rx=%ums) - keeping endpoint, single PING",
+                                 p->hostname, (unsigned)last_rx_age_ms);
+                        if (!ml_at_socket_is_ready()) {
+                            disco_send_ping_to_peer(ml, i, true);
+                        }
                     }
                 } else {
                     /* Encrypted data ALSO stopped — the direct path is really
@@ -2212,23 +2269,30 @@ static void disco_periodic_probes(microlink_t *ml) {
                         session_up = (wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
                                                              NULL, NULL) == ERR_OK);
                         if (session_up) {
-                            ESP_LOGI(TAG, "Direct path to %s expired (last_rx=%ums), "
-                                          "reverting to DERP", p->hostname,
-                                     (unsigned)last_rx_age_ms);
+                            ESP_LOGI(TAG, "%s %s carries no direct traffic (last_rx=%ums), "
+                                          "reverting to DERP",
+                                     kept_endpoint ? "Kept direct endpoint for" : "Direct path to",
+                                     p->hostname, (unsigned)last_rx_age_ms);
                             wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                             ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
                         }
                     }
-                    if (!session_up) {
-                        /* No WireGuard session behind this path, nothing to
-                         * fall back: this is the once-a-minute re-probe of a
-                         * session-less peer (see the heartbeat gate below). */
-                        ESP_LOGD(TAG, "Direct path to %s (no WG session): re-probe after %u s",
-                                 p->hostname, (unsigned)(ML_DISCO_TRUST_DURATION_MS / 1000));
-                    }
-                    /* One force-ping to try re-establishing direct path. */
-                    if (!ml_at_socket_is_ready()) {
-                        disco_send_ping_to_peer(ml, i, true);
+                    /* A kept endpoint without a session is left to the
+                     * DERP-only fallback below (it zeroes the endpoint on its
+                     * 30 s retry) and the regular upgrade probe re-probes a
+                     * reverted peer; only a fresh expiry gets the ping here. */
+                    if (trust_expired) {
+                        if (!session_up) {
+                            /* No WireGuard session behind this path, nothing to
+                             * fall back: this is the once-a-minute re-probe of a
+                             * session-less peer (see the heartbeat gate below). */
+                            ESP_LOGD(TAG, "Direct path to %s (no WG session): re-probe after %u s",
+                                     p->hostname, (unsigned)(ML_DISCO_TRUST_DURATION_MS / 1000));
+                        }
+                        /* One force-ping to try re-establishing direct path. */
+                        if (!ml_at_socket_is_ready()) {
+                            disco_send_ping_to_peer(ml, i, true);
+                        }
                     }
                 }
             }

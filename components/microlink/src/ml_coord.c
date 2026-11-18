@@ -2191,6 +2191,24 @@ static bool apply_peer_map(microlink_t *ml,cJSON *map) {
         ml->tailnet_lock=on;
     }
     clock_from_control(map);
+    /* Not answered yet: logged (rate limited) to learn whether and how
+     * often the control server asks, before implementing replies. */
+    if (cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(map,"PingRequest"))) {
+        static uint64_t last_ping_log_ms;
+        uint64_t now_ms=ml_get_time_ms();
+        if (!last_ping_log_ms || now_ms-last_ping_log_ms>600000) {
+            last_ping_log_ms=now_ms;
+            const cJSON *types=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(map,"PingRequest"),"Types");
+            ESP_LOGW(TAG,"Control server sent a PingRequest (types: %s); not answered by this client",
+                     cJSON_IsString(types)&&types->valuestring[0]?types->valuestring:"liveness");
+        }
+    }
+    const cJSON *self_node=cJSON_GetObjectItemCaseSensitive(map,"Node");
+    if (cJSON_IsObject(self_node)) {
+        const cJSON *ma=cJSON_GetObjectItemCaseSensitive(self_node,"MachineAuthorized");
+        if (cJSON_IsTrue(ma) && ml->reg_state==ML_REG_STATE_APPROVAL) ml->reg_state=ML_REG_STATE_OK;
+        else if (cJSON_IsFalse(ma) && ml->reg_state==ML_REG_STATE_OK) ml->reg_state=ML_REG_STATE_APPROVAL;
+    }
     bool policy_ok=ml_policy_apply(map);
     bool peers_ok=policy_ok && parse_peers_from_map_response(ml,map);
     if (!peers_ok) {

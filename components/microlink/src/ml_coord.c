@@ -337,6 +337,62 @@ static int parse_pubkey_response(const char *resp, uint8_t pubkey_out[32]) {
  * ml->use_tls), GET /key?v=<ML_CTRL_PROTOCOL_VER>, parse the JSON body, extract publicKey,
  * hex-decode into ml->ctrl_noise_pubkey.  Returns 0 on success, -1 on any
  * failure.  Closes its own socket / destroys its own transient TLS handle. */
+/* DNS failed for the control host: the last address that connected to it
+ * (ml_ctrl_addr_*), as a one-entry addrinfo in the caller's storage. The
+ * server is still authenticated: by its Noise key, or by its certificate for
+ * the name over TLS, so a stale address can only fail to connect. NULL when
+ * no address is known. */
+static struct addrinfo *ctrl_cached_addr(microlink_t *ml, const char *host, const char *port,
+                                         struct addrinfo *ai, struct sockaddr_in *sa)
+{
+    uint32_t last = ml_ctrl_addr_load(ml, host);
+    if (!last) return NULL;
+    memset(ai, 0, sizeof *ai);
+    memset(sa, 0, sizeof *sa);
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons((uint16_t)atoi(port));
+    sa->sin_addr.s_addr = htonl(last);
+    ai->ai_family = AF_INET;
+    ai->ai_socktype = SOCK_STREAM;
+    ai->ai_addr = (struct sockaddr *)sa;
+    ai->ai_addrlen = sizeof *sa;
+    ESP_LOGW(TAG, "DNS failed for %s: using its last working address", host);
+    return ai;
+}
+
+/* TLS to the control host. When the name does not resolve, connect to the
+ * last working address while the certificate check and SNI keep using the
+ * name (esp-tls common_name): the server is verified exactly as by name.
+ * A connection made by name records its IPv4 address for next time.
+ * Returns esp_tls_conn_new_sync()'s result (1 = connected). */
+static int ctrl_tls_connect(microlink_t *ml, esp_tls_t *tls, const char *host, const char *port,
+                            esp_tls_cfg_t cfg)
+{
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    char ip[16] = "";
+    if (ml_getaddrinfo(host, port, &hints, &res) != 0 || !res) {
+        uint32_t last = ml_ctrl_addr_load(ml, host);
+        if (last) {
+            snprintf(ip, sizeof ip, "%u.%u.%u.%u", (unsigned)(last >> 24) & 255u,
+                     (unsigned)(last >> 16) & 255u, (unsigned)(last >> 8) & 255u, (unsigned)last & 255u);
+            cfg.common_name = host;
+            ESP_LOGW(TAG, "DNS failed for %s: TLS to its last working address", host);
+        }
+    }
+    if (res) ml_freeaddrinfo(res);
+    const char *target = ip[0] ? ip : host;
+    int rc = esp_tls_conn_new_sync(target, (int)strlen(target), atoi(port), &cfg, tls);
+    int fd = -1;
+    if (rc == 1 && !ip[0] && esp_tls_get_conn_sockfd(tls, &fd) == ESP_OK && fd >= 0) {
+        struct sockaddr_storage peer;
+        socklen_t len = sizeof peer;
+        if (getpeername(fd, (struct sockaddr *)&peer, &len) == 0 && peer.ss_family == AF_INET)
+            ml_ctrl_addr_save(ml, host, ntohl(((struct sockaddr_in *)&peer)->sin_addr.s_addr));
+    }
+    return rc;
+}
+
 static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *port) {
     /* ------------------------------------------------------------------ */
     /* TLS branch: use esp_tls for a short-lived, transient connection.    */
@@ -356,8 +412,7 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
             ESP_LOGE(TAG, "fetch_server_pubkey: esp_tls_init failed");
             return -1;
         }
-        int port_i = atoi(port);
-        int rc_tls = esp_tls_conn_new_sync(host, (int)strlen(host), port_i, &cfg, tls);
+        int rc_tls = ctrl_tls_connect(ml, tls, host, port, cfg);
         if (rc_tls != 1) {
             ESP_LOGE(TAG, "fetch_server_pubkey: TLS handshake failed (rc=%d)", rc_tls);
             esp_tls_conn_destroy(tls);
@@ -428,14 +483,21 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
     int sock = -1;
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
+    struct addrinfo cached_ai;
+    struct sockaddr_in cached_sa;
+    bool res_cached = false;
     int rc = -1;
 
     ESP_LOGI(TAG, "Fetching Noise server pubkey from http://%s:%s/key?v=%d", host, port,
              ML_CTRL_PROTOCOL_VER);
 
     if (ml_getaddrinfo(host, port, &hints, &res) != 0 || !res) {
-        ESP_LOGE(TAG, "fetch_server_pubkey: DNS resolve failed for %s", host);
-        goto out;
+        res = ctrl_cached_addr(ml, host, port, &cached_ai, &cached_sa);
+        res_cached = res != NULL;
+        if (!res) {
+            ESP_LOGE(TAG, "fetch_server_pubkey: DNS resolve failed for %s", host);
+            goto out;
+        }
     }
 
     sock = ml_socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP);
@@ -497,7 +559,7 @@ static int fetch_server_pubkey(microlink_t *ml, const char *host, const char *po
 
 out:
     if (sock >= 0) ml_close_sock(sock);
-    if (res) ml_freeaddrinfo(res);
+    if (res && !res_cached) ml_freeaddrinfo(res);
     return rc;
 }
 
@@ -825,9 +887,7 @@ static int do_tcp_connect(microlink_t *ml) {
             return -1;
         }
         int port_i = atoi(ml->ctrl_port_str);
-        int rc = esp_tls_conn_new_sync(ml->ctrl_host_parsed,
-                                       (int)strlen(ml->ctrl_host_parsed),
-                                       port_i, &cfg, tls);
+        int rc = ctrl_tls_connect(ml, tls, ml->ctrl_host_parsed, ml->ctrl_port_str, cfg);
         if (rc != 1) {
             ESP_LOGE(TAG, "do_tcp_connect: TLS handshake to %s:%d failed (rc=%d)",
                      ml->ctrl_host_parsed, port_i, rc);
@@ -854,23 +914,12 @@ static int do_tcp_connect(microlink_t *ml) {
     bool res_cached = false;
 
     if (ml_getaddrinfo(ml->ctrl_host_parsed, ml->ctrl_port_str, &hints, &res) != 0 || !res) {
-        uint32_t last = ml_ctrl_addr_load(ml, ml->ctrl_host_parsed);
-        if (!last) {
+        res = ctrl_cached_addr(ml, ml->ctrl_host_parsed, ml->ctrl_port_str, &cached_ai, &cached_sa);
+        if (!res) {
             ESP_LOGE(TAG, "DNS resolve failed for %s", ml->ctrl_host_parsed);
             return -1;
         }
-        memset(&cached_ai, 0, sizeof cached_ai);
-        memset(&cached_sa, 0, sizeof cached_sa);
-        cached_sa.sin_family = AF_INET;
-        cached_sa.sin_port = htons((uint16_t)atoi(ml->ctrl_port_str));
-        cached_sa.sin_addr.s_addr = htonl(last);
-        cached_ai.ai_family = AF_INET;
-        cached_ai.ai_socktype = SOCK_STREAM;
-        cached_ai.ai_addr = (struct sockaddr *)&cached_sa;
-        cached_ai.ai_addrlen = sizeof cached_sa;
-        res = &cached_ai;
         res_cached = true;
-        ESP_LOGW(TAG, "DNS failed for %s: using its last working address", ml->ctrl_host_parsed);
     }
 
     int64_t t_dns = esp_timer_get_time();
@@ -3928,6 +3977,10 @@ void ml_coord_task(void *arg) {
                     note_ctrl_retry(ml, "Noise handshake failed");
                 ctrl_transport_failed(ml);
                 saas_refresh_key(ml);
+                /* A custom server's key is fetched once and kept in RAM: if
+                 * the server got a new key (reinstall, lost key file), every
+                 * handshake failed until a restart. Fetch it again. */
+                if (ml->ctrl_host[0]) ml->ctrl_noise_pubkey_valid = false;
                 ml_conn_close(ml);
                 state = COORD_RECONNECTING;
                 break;

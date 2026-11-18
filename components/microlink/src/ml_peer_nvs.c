@@ -187,6 +187,16 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
     }
 
     if (slot >= 0) {
+        /* Unchanged apart from the LRU counter: keep the counter in RAM and
+         * write nothing. Every full map re-adds every peer, and a tunnel
+         * slot can change hands; rewriting the whole blob each time wore the
+         * flash and stalled the WireGuard task during reconnects. */
+        peer_nvs_entry_t same = s_table->entries[slot];
+        same.lru_counter = entry.lru_counter;
+        if (!memcmp(&same, &entry, sizeof entry)) {
+            s_table->entries[slot].lru_counter = entry.lru_counter;
+            return ESP_OK;
+        }
         /* Update existing entry */
         s_table->entries[slot] = entry;
     } else if (s_table->count < ML_NVS_MAX_PEERS) {
@@ -195,17 +205,21 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
         s_table->entries[slot] = entry;
         s_table->count++;
     } else {
-        /* LRU eviction: find entry with lowest lru_counter */
+        /* LRU eviction: the entry unused for the most saves. The age is
+         * taken modulo 2^16 so the 16-bit clock may wrap (every full map
+         * advances it once per peer): comparing raw counters evicted the
+         * most recent peers right after a wrap. */
         int lru_idx = 0;
-        uint16_t min_lru = s_table->entries[0].lru_counter;
+        uint16_t max_age = (uint16_t)(s_table->lru_clock - s_table->entries[0].lru_counter);
         for (int i = 1; i < s_table->count; i++) {
-            if (s_table->entries[i].lru_counter < min_lru) {
-                min_lru = s_table->entries[i].lru_counter;
+            uint16_t age = (uint16_t)(s_table->lru_clock - s_table->entries[i].lru_counter);
+            if (age > max_age) {
+                max_age = age;
                 lru_idx = i;
             }
         }
-        ESP_LOGI(TAG, "LRU evict: %s (slot=%d lru=%d)",
-                 s_table->entries[lru_idx].hostname_short, lru_idx, min_lru);
+        ESP_LOGI(TAG, "LRU evict: %s (slot=%d age=%u)",
+                 s_table->entries[lru_idx].hostname_short, lru_idx, (unsigned)max_age);
         s_table->entries[lru_idx] = entry;
         slot = lru_idx;
     }

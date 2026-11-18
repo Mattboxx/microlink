@@ -163,20 +163,29 @@ void ml_policy_reset(void) { publish(NULL); }
 #define IX_MAX_GROUPS (33 + 129)   /* IPv4 /0../32, IPv6 /0../128 */
 static policy *policy_alloc_ix(uint32_t peer_cap, uint32_t pool_cap, uint32_t entry_cap, bool with_index) {
     if (peer_cap > MAX_PEERS || pool_cap > MAX_PREFIXES || entry_cap > MAX_ENTRIES) return NULL;
-    size_t bytes = sizeof(policy) + (size_t)entry_cap * sizeof(entry) + (size_t)peer_cap * sizeof(peer)
-                 + (size_t)pool_cap * sizeof(ip_range);
-    size_t ix_at = (bytes + 7) & ~(size_t)7;
-    if (with_index) bytes = ix_at + (size_t)pool_cap * sizeof(struct owner_ix) + IX_MAX_GROUPS * sizeof(struct owner_group);
+    /* Every array starts on a 16-byte boundary: an entry is 106 bytes with
+     * 2-byte alignment, so with an odd number of rules the peer table (64-bit
+     * fields) used to start on a 2-byte boundary -- a LoadStoreAlignment
+     * exception (restart) on the ESP32-S3, undefined behaviour anywhere. */
+    #define POLICY_ALIGN(x) (((x) + (size_t)15) & ~(size_t)15)
+    size_t at_entries = POLICY_ALIGN(sizeof(policy));
+    size_t at_peers = POLICY_ALIGN(at_entries + (size_t)entry_cap * sizeof(entry));
+    size_t at_pool = POLICY_ALIGN(at_peers + (size_t)peer_cap * sizeof(peer));
+    size_t bytes = at_pool + (size_t)pool_cap * sizeof(ip_range);
+    size_t ix_at = POLICY_ALIGN(bytes);
+    size_t groups_at = POLICY_ALIGN(ix_at + (size_t)pool_cap * sizeof(struct owner_ix));
+    if (with_index) bytes = groups_at + IX_MAX_GROUPS * sizeof(struct owner_group);
+    #undef POLICY_ALIGN
     policy *p = ALLOC(bytes);
     if (!p) return NULL;
     memset(p, 0, bytes);
     p->peer_cap = peer_cap; p->pool_cap = pool_cap; p->entry_cap = entry_cap;
-    p->entries = (entry *)(p + 1);
-    p->peers = (peer *)(p->entries + entry_cap);
-    p->pool = (ip_range *)(p->peers + peer_cap);
+    p->entries = (entry *)((uint8_t *)p + at_entries);
+    p->peers = (peer *)((uint8_t *)p + at_peers);
+    p->pool = (ip_range *)((uint8_t *)p + at_pool);
     if (with_index) {
         p->index = (struct owner_ix *)((uint8_t *)p + ix_at);
-        p->ix_groups = (struct owner_group *)(p->index + pool_cap);
+        p->ix_groups = (struct owner_group *)((uint8_t *)p + groups_at);
     }
     return p;
 }

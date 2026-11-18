@@ -192,6 +192,7 @@ static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t length) {
  * Default port is "80" for http:// / bare hosts and "443" for https://.
  * If use_tls_out is non-NULL it is set to true iff the scheme is https://.
  * Returns 0 on success, -1 on error. */
+static bool ctrl_is_tailscale(const microlink_t *ml);   /* with the transport fallback */
 static int parse_host_port(const char *in,
                            char *host_out, size_t host_sz,
                            char *port_out, size_t port_sz,
@@ -775,6 +776,12 @@ static int do_tcp_connect(microlink_t *ml) {
                             &ml->use_tls) != 0) {
             ESP_LOGE(TAG, "Invalid login_server '%s'", ml->ctrl_host);
             return -1;
+        }
+        /* Tailscale's own control host entered by hand: same 80/443 fallback
+         * as the default (an explicit non-default port is kept). */
+        if (ctrl_is_tailscale(ml)) {
+            strlcpy(ml->ctrl_port_str, ml->ctrl_saas_tls ? "443" : "80", sizeof ml->ctrl_port_str);
+            ml->use_tls = ml->ctrl_saas_tls;
         }
     } else {
         strncpy(ml->ctrl_host_parsed, ML_CTRL_HOST, sizeof(ml->ctrl_host_parsed) - 1);
@@ -2180,6 +2187,93 @@ check_removed:
 
 /* One owner/writer for both map paths. A partial peer installation request
  * must cause a blocked full refresh, not a falsely successful control update. */
+/* A liveness PingRequest (no Types) is answered with a HEAD to its URL over
+ * Noise, as the reference client does, to prove the long-poll is alive.
+ * Other types (disco, TSMP, c2n) and plain-TLS URLs are not supported here:
+ * logged, rate limited. Duplicate URLs are ignored. */
+static void note_ping_request(microlink_t *ml, const cJSON *pr) {
+    if (!cJSON_IsObject(pr)) return;
+    const cJSON *url = cJSON_GetObjectItemCaseSensitive(pr, "URL");
+    const cJSON *types = cJSON_GetObjectItemCaseSensitive(pr, "Types");
+    const cJSON *noise = cJSON_GetObjectItemCaseSensitive(pr, "URLIsNoise");
+    bool liveness = !types || cJSON_IsNull(types) || (cJSON_IsString(types) && !types->valuestring[0]);
+    const char *path = NULL;
+    if (cJSON_IsString(url) && url->valuestring) {
+        const char *u = url->valuestring, *scheme = strstr(u, "://");
+        path = scheme ? strchr(scheme + 3, '/') : (u[0] == '/' ? u : NULL);
+    }
+    if (liveness && cJSON_IsTrue(noise) && path && strlen(path) < sizeof ml->ping_path) {
+        if (strcmp(path, ml->ping_last)) strlcpy(ml->ping_path, path, sizeof ml->ping_path);
+        return;
+    }
+    static uint64_t last_log_ms;
+    uint64_t now_ms = ml_get_time_ms();
+    if (!last_log_ms || now_ms - last_log_ms > 600000) {
+        last_log_ms = now_ms;
+        ESP_LOGW(TAG, "Control server PingRequest not supported here (types: %s, noise: %d)",
+                 cJSON_IsString(types) && types->valuestring[0] ? types->valuestring : "liveness",
+                 cJSON_IsTrue(noise));
+    }
+}
+
+/* MapResponse.DisplayMessages: a patch (null deletes an ID, "*": null clears
+ * all first). At most MICROLINK_MAX_DISPLAY_MESSAGES, texts truncated. */
+static void apply_display_messages(microlink_t *ml, const cJSON *dm) {
+    if (!cJSON_IsObject(dm)) return;
+    const cJSON *all = cJSON_GetObjectItemCaseSensitive(dm, "*");
+    if (all && cJSON_IsNull(all)) ml->display_msg_count = 0;
+    for (const cJSON *e = dm->child; e; e = e->next) {
+        if (!e->string || !strcmp(e->string, "*")) continue;
+        int at = -1;
+        for (int i = 0; i < ml->display_msg_count; i++)
+            if (!strncmp(ml->display_msgs[i].id, e->string, sizeof ml->display_msgs[i].id - 1)) at = i;
+        if (cJSON_IsNull(e)) {
+            if (at >= 0) {
+                for (int i = at; i + 1 < ml->display_msg_count; i++) ml->display_msgs[i] = ml->display_msgs[i + 1];
+                ml->display_msg_count--;
+            }
+            continue;
+        }
+        if (!cJSON_IsObject(e)) continue;
+        if (at < 0) {
+            if (ml->display_msg_count >= MICROLINK_MAX_DISPLAY_MESSAGES) continue;   /* bounded */
+            at = ml->display_msg_count++;
+        }
+        microlink_display_message_t *m = &ml->display_msgs[at];
+        memset(m, 0, sizeof *m);
+        strlcpy(m->id, e->string, sizeof m->id);
+        const cJSON *t = cJSON_GetObjectItemCaseSensitive(e, "Title"), *x = cJSON_GetObjectItemCaseSensitive(e, "Text");
+        const cJSON *sv = cJSON_GetObjectItemCaseSensitive(e, "Severity");
+        if (cJSON_IsString(t)) strlcpy(m->title, t->valuestring, sizeof m->title);
+        if (cJSON_IsString(x)) strlcpy(m->text, x->valuestring, sizeof m->text);
+        if (cJSON_IsString(sv)) strlcpy(m->severity, sv->valuestring, sizeof m->severity);
+        m->impacts_connectivity = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(e, "ImpactsConnectivity"));
+    }
+}
+
+int microlink_get_display_messages(const microlink_t *ml, microlink_display_message_t *out, int max) {
+    if (!ml || !out || max <= 0) return 0;
+    int n = ml->display_msg_count < max ? ml->display_msg_count : max;
+    memcpy(out, ml->display_msgs, (size_t)n * sizeof *out);
+    return n;
+}
+
+/* Answer a recorded liveness PingRequest: HEAD on a new stream of this Noise
+ * connection; the response is not needed (only its arrival matters). */
+static void answer_ping_request(microlink_t *ml, ml_noise_state_t *noise) {
+    if (!ml->ping_path[0]) return;
+    uint8_t buf[512];
+    if (ml->h2_next_stream_id < 7) ml->h2_next_stream_id = 7;
+    uint32_t sid = ml->h2_next_stream_id;
+    ml->h2_next_stream_id += 2;
+    int len = ml_h2_build_headers_frame(buf, sizeof buf, "HEAD", ml->ping_path, CTRL_HOST_HDR(ml), NULL, sid, true);
+    if (len > 0 && noise_send(ml, noise, buf, len) >= 0) {
+        ESP_LOGI(TAG, "Answered a control server liveness ping (stream %lu)", (unsigned long)sid);
+        strlcpy(ml->ping_last, ml->ping_path, sizeof ml->ping_last);
+    }
+    ml->ping_path[0] = '\0';
+}
+
 static bool apply_peer_map(microlink_t *ml,cJSON *map) {
     /* Tailnet Lock: this client does not verify node signatures (it trusts
      * the control server for peer keys) and must be signed to be reachable. */
@@ -2191,18 +2285,8 @@ static bool apply_peer_map(microlink_t *ml,cJSON *map) {
         ml->tailnet_lock=on;
     }
     clock_from_control(map);
-    /* Not answered yet: logged (rate limited) to learn whether and how
-     * often the control server asks, before implementing replies. */
-    if (cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(map,"PingRequest"))) {
-        static uint64_t last_ping_log_ms;
-        uint64_t now_ms=ml_get_time_ms();
-        if (!last_ping_log_ms || now_ms-last_ping_log_ms>600000) {
-            last_ping_log_ms=now_ms;
-            const cJSON *types=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(map,"PingRequest"),"Types");
-            ESP_LOGW(TAG,"Control server sent a PingRequest (types: %s); not answered by this client",
-                     cJSON_IsString(types)&&types->valuestring[0]?types->valuestring:"liveness");
-        }
-    }
+    note_ping_request(ml,cJSON_GetObjectItemCaseSensitive(map,"PingRequest"));
+    apply_display_messages(ml,cJSON_GetObjectItemCaseSensitive(map,"DisplayMessages"));
     const cJSON *self_node=cJSON_GetObjectItemCaseSensitive(map,"Node");
     if (cJSON_IsObject(self_node)) {
         const cJSON *ma=cJSON_GetObjectItemCaseSensitive(self_node,"MachineAuthorized");
@@ -3574,6 +3658,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                  * reconnect. (The full-netmap path is followed by the
                  * initial endpoint update anyway.) */
                 if (ml->netinfo_dirty) do_send_endpoint_update(ml, noise);
+                answer_ping_request(ml, noise);
             } else {
                 ESP_LOGW(TAG, "long-poll: %lu-byte message failed to parse", (unsigned long)size);
                 ml_policy_reset();
@@ -3656,12 +3741,19 @@ static void note_ctrl_retry(microlink_t *ml, const char *why)
     ml->ctrl_retry_failures++;
 }
 
+/* The login server is Tailscale's control host on a default port. */
+static bool ctrl_is_tailscale(const microlink_t *ml)
+{
+    return ml->ctrl_host[0] && !strcasecmp(ml->ctrl_host_parsed, ML_CTRL_HOST)
+        && (!strcmp(ml->ctrl_port_str, "80") || !strcmp(ml->ctrl_port_str, "443"));
+}
+
 /* Two failed control connections in a row on Tailscale's default server:
  * switch between port 80 and TLS on 443. A custom login server keeps the
  * address and scheme the user entered. */
 static void ctrl_transport_failed(microlink_t *ml)
 {
-    if (ml->ctrl_host[0] || ++ml->ctrl_transport_failures < 2) return;
+    if ((ml->ctrl_host[0] && !ctrl_is_tailscale(ml)) || ++ml->ctrl_transport_failures < 2) return;
     ml->ctrl_transport_failures = 0;
     ml->ctrl_saas_tls = !ml->ctrl_saas_tls;
     ESP_LOGW(TAG, "Control server unreachable on port %s: trying port %s",

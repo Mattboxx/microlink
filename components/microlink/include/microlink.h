@@ -323,6 +323,19 @@ typedef struct {
     uint16_t tunnel_slots;        /* tunnel slots (internal RAM) */
 } microlink_diag_t;
 
+/* A health message from the control server for the user (DisplayMessages):
+ * text as received, truncated; shown as plain text. */
+#define MICROLINK_MAX_DISPLAY_MESSAGES 4
+typedef struct {
+    char id[48];
+    char title[96];
+    char text[320];
+    char severity[8];          /* "high", "medium", "low" */
+    bool impacts_connectivity;
+} microlink_display_message_t;
+/* Copies up to max current messages; returns how many. */
+int microlink_get_display_messages(const microlink_t *ml, microlink_display_message_t *out, int max);
+
 /* Why the device is not (or not fully) registered, for the UI. */
 typedef enum {
     ML_REG_STATE_OK = 0,

@@ -517,6 +517,10 @@ struct microlink_s {
     bool tailnet_lock;
     bool ctrl_saas_tls;             /* Tailscale control over TLS 443 (port 80 failed) */
     uint8_t derp_node_pick;         /* which node of the home DERP region (moves on failure) */
+    microlink_display_message_t display_msgs[MICROLINK_MAX_DISPLAY_MESSAGES];
+    uint8_t display_msg_count;
+    char ping_path[200];            /* liveness PingRequest to answer over Noise ("" = none) */
+    char ping_last[200];            /* the last one answered (duplicates are ignored) */
     uint8_t ctrl_transport_failures;
     /* Why the last registration failed (static text), for ctrl_retry_reason. */
     const char *reg_note;

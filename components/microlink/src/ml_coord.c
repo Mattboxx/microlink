@@ -1857,6 +1857,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     char saved = parse_start[parse_len];
     parse_start[parse_len] = '\0';
 
+    (void)ml_json_ids_scan(parse_start, parse_len);   /* exact User.ID */
     cJSON *resp_json = cJSON_Parse(parse_start);
     if (!resp_json) {
         ESP_LOGW(TAG, "Failed to parse RegisterResponse JSON (len=%d)", (int)parse_len);
@@ -1963,10 +1964,13 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON *user  = cJSON_GetObjectItem(resp_json, "User");
         cJSON *login = cJSON_GetObjectItem(resp_json, "Login");
         int id_val = 0;
+        uint64_t user_id = 0;
         const char *name_val = "";
         if (user) {
+            /* Exact (user IDs are int64 like node IDs); the int field keeps
+             * its -1/0/>0 meaning, the log shows the real value. */
             cJSON *id_j = cJSON_GetObjectItem(user, "ID");
-            if (id_j && cJSON_IsNumber(id_j)) id_val = id_j->valueint;
+            if (ml_json_u64(id_j, INT64_MAX, &user_id)) id_val = user_id > INT32_MAX ? INT32_MAX : (int)user_id;
         }
         if (login) {
             cJSON *n = cJSON_GetObjectItem(login, "DisplayName");
@@ -1983,7 +1987,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         strlcpy(ml->register_user_name, name_val, sizeof ml->register_user_name);
 
         if (id_val > 0 || *name_val) {
-            ESP_LOGI(TAG, "Registered as User.ID=%d \"%s\"", id_val, name_val);
+            ESP_LOGI(TAG, "Registered as User.ID=%llu \"%s\"", (unsigned long long)user_id, name_val);
         } else {
             /* Normal for auth-key and tag-owned registrations. */
             ESP_LOGI(TAG, "Registered (no bound user - auth-key or tag-owned node)");
@@ -3258,28 +3262,13 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
                 ESP_LOGI(TAG, "Our WG pubkey (local):  nodekey:%.32s...", our_hex);
             }
 
-            /* Parse KeyExpiry (ISO 8601: "YYYY-MM-DDTHH:MM:SSZ") */
+            /* KeyExpiry: RFC 3339, also with an offset (ml_rfc3339_utc). */
             cJSON *key_expiry = cJSON_GetObjectItem(node, "KeyExpiry");
-            if (key_expiry && key_expiry->valuestring) {
-                int yr, mo, dy, hr, mn, sc;
-                if (sscanf(key_expiry->valuestring, "%d-%d-%dT%d:%d:%d",
-                           &yr, &mo, &dy, &hr, &mn, &sc) >= 6) {
-                    /* Simple epoch calculation (approximate, no leap second) */
-                    /* Days from year 1970 */
-                    int64_t days = 0;
-                    for (int y = 1970; y < yr; y++) {
-                        days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
-                    }
-                    static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-                    for (int m = 1; m < mo; m++) {
-                        days += mdays[m];
-                        if (m == 2 && (yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0))) days++;
-                    }
-                    days += dy - 1;
-                    ml->key_expiry_epoch = days * 86400 + hr * 3600 + mn * 60 + sc;
-                    ESP_LOGI(TAG, "Key expiry: %s (epoch: %lld)", key_expiry->valuestring,
-                             (long long)ml->key_expiry_epoch);
-                }
+            int64_t expiry_epoch;
+            if (cJSON_IsString(key_expiry) && ml_rfc3339_utc(key_expiry->valuestring, &expiry_epoch)) {
+                ml->key_expiry_epoch = expiry_epoch;
+                ESP_LOGI(TAG, "Key expiry: %s (epoch: %lld)", key_expiry->valuestring,
+                         (long long)ml->key_expiry_epoch);
             }
 
             /* Check Expired flag */

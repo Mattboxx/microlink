@@ -439,33 +439,61 @@ static bool key_parse(const cJSON *v, uint8_t out[32]) {
     }
     return nonzero != 0;
 }
-/* tailcfg uses UTC RFC3339 timestamps. Unsupported offsets fail closed. */
-static bool expiration(const cJSON *v, time_t *out) {
+/* Days from 1970-01-01 to a proleptic Gregorian date (H. Hinnant). */
+static int64_t days_from_civil(int64_t y, int m, int d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+bool ml_rfc3339_utc(const char *s, int64_t *out) {
     *out = 0;
-    if (!v || cJSON_IsNull(v)) return true;
-    if (!cJSON_IsString(v)) return false;
-    const char *s = v->valuestring;
+    if (!s) return false;
     size_t len = strlen(s);
     if (len < 20 || s[4]!='-' || s[7]!='-' || s[10]!='T' || s[13]!=':' || s[16]!=':') return false;
     for (unsigned i = 0; i < 19; i++)
         if (i!=4 && i!=7 && i!=10 && i!=13 && i!=16 && (s[i]<'0'||s[i]>'9')) return false;
-    unsigned y = (s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+s[3]-'0';
-    unsigned m = (s[5]-'0')*10+s[6]-'0', d = (s[8]-'0')*10+s[9]-'0';
-    unsigned h = (s[11]-'0')*10+s[12]-'0', min = (s[14]-'0')*10+s[15]-'0', sec = (s[17]-'0')*10+s[18]-'0';
-    if (len > 20) {
-        if (s[19] != '.' || len < 22) return false;
-        for (size_t i=20;i<len-1;i++) if (s[i]<'0'||s[i]>'9') return false;
+    int y = (s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+s[3]-'0';
+    int m = (s[5]-'0')*10+s[6]-'0', d = (s[8]-'0')*10+s[9]-'0';
+    int h = (s[11]-'0')*10+s[12]-'0', min = (s[14]-'0')*10+s[15]-'0', sec = (s[17]-'0')*10+s[18]-'0';
+    size_t i = 19;
+    if (s[i] == '.') {
+        size_t first = ++i;
+        while (i < len && s[i] >= '0' && s[i] <= '9') i++;
+        if (i == first) return false;
     }
-    if (s[len-1]!='Z' || m<1 || m>12 || d<1 || d>31 || h>23 || min>59 || sec>59) return false;
-    if (y == 1) return !strcmp(s,"0001-01-01T00:00:00Z");
-    if (y < 1970 || y > 2099) return false;
+    int64_t offset = 0;
+    if (i + 1 == len && s[i] == 'Z') {
+        /* UTC */
+    } else if (i + 6 == len && (s[i] == '+' || s[i] == '-') && s[i+3] == ':'
+               && s[i+1]>='0' && s[i+1]<='9' && s[i+2]>='0' && s[i+2]<='9'
+               && s[i+4]>='0' && s[i+4]<='9' && s[i+5]>='0' && s[i+5]<='9') {
+        int oh = (s[i+1]-'0')*10+s[i+2]-'0', om = (s[i+4]-'0')*10+s[i+5]-'0';
+        if (oh > 23 || om > 59) return false;
+        offset = (int64_t)(oh * 3600 + om * 60) * (s[i] == '+' ? 1 : -1);
+    } else return false;
+    if (m<1 || m>12 || d<1 || d>31 || h>23 || min>59 || sec>59) return false;
+    if (y == 1) return !strcmp(s, "0001-01-01T00:00:00Z");   /* Go zero time (exactly): no expiry */
+    if (y < 1970) return false;
     static const unsigned days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
     bool leap = y%4==0 && (y%100!=0 || y%400==0);
-    if (d > days[m-1]+(m==2 && leap)) return false;
-    uint64_t n = 0;
-    for (unsigned yr=1970;yr<y;yr++) n += 365+(yr%4==0 && (yr%100!=0 || yr%400==0));
-    for (unsigned mo=1;mo<m;mo++) n += days[mo-1]+(mo==2 && leap);
-    *out = (time_t)(((n+d-1)*24+h)*3600+min*60+sec); return true;
+    if ((unsigned)d > days[m-1]+(m==2 && leap)) return false;
+    *out = days_from_civil(y, m, d) * 86400 + h * 3600 + min * 60 + sec - offset;
+    return true;
+}
+/* tailcfg times are RFC 3339: UTC from Tailscale, sometimes with an offset
+ * from other control servers (accepted and converted). Malformed ones fail
+ * closed. */
+static bool expiration(const cJSON *v, time_t *out) {
+    *out = 0;
+    if (!v || cJSON_IsNull(v)) return true;
+    if (!cJSON_IsString(v)) return false;
+    int64_t t;
+    if (!ml_rfc3339_utc(v->valuestring, &t)) return false;
+    *out = (time_t)t;
+    return true;
 }
 static uint64_t cap_hash(const char *s) {
     uint64_t h=1469598103934665603ULL;

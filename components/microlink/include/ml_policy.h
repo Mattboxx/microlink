@@ -34,6 +34,11 @@ void ml_policy_get_status(ml_policy_status_t *out);
 /* The next map with a Node is the complete first map of a session (a
  * MapRequest without OmitPeers): absent Peers/PacketFilter mean empty. */
 void ml_policy_expect_full_map(void);
+/* An RFC 3339 time as Go writes it, YYYY-MM-DDTHH:MM:SS[.frac] followed by
+ * Z or +-HH:MM, as seconds since 1970 UTC; Go's zero time
+ * "0001-01-01T00:00:00Z" is 0 ("no expiry"). Years 1970-9999. False when
+ * malformed (callers fail closed). */
+bool ml_rfc3339_utc(const char *s, int64_t *out);
 /* Age of the newest reply ADMITTED from remote ip:port (IPv4, network-order
  * bytes) on a flow this node sent, current epoch only. Evidence that the
  * service answered recently; never a grant and not per-LAN-client. */

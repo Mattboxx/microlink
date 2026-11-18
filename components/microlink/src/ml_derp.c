@@ -1255,7 +1255,7 @@ static esp_err_t derp_open(microlink_t *ml, ml_derp_conn_t *c, const char *derp_
     /* Always authenticate the relay, including with a custom DERP map. */
     const char *tls_name = (derp_node && derp_node->cert_name[0]) ? derp_node->cert_name : derp_host;
     mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-    esp_err_t cb = ml_tls_bundle_attach(&c->ssl_conf);
+    esp_err_t cb = ml_tls_tailnet_attach(&c->ssl_conf);
     if (cb != ESP_OK) {
         ESP_LOGE(TAG, "DERP TLS: CA bundle attach failed (%s)", esp_err_to_name(cb));
         goto fail_tls;

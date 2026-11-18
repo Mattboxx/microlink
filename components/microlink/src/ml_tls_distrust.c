@@ -98,6 +98,69 @@ static int distrust_verify(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t
 esp_err_t esp_crt_bundle_attach(void *conf);
 #endif
 
+/* Parses PEM text into crt with the rules of ml_tls_set_tailnet_ca();
+ * returns the certificate count, 0 when refused (crt is then freed). */
+static int tailnet_ca_parse(const char *pem, mbedtls_x509_crt *crt)
+{
+    mbedtls_x509_crt_init(crt);
+    if (!pem) return 0;
+    size_t len = strnlen(pem, ML_TLS_TAILNET_CA_MAX + 1);
+    if (!len || len > ML_TLS_TAILNET_CA_MAX || !strstr(pem, "-----BEGIN CERTIFICATE-----")) return 0;
+    /* Every block must parse (a return above 0 counts failed blocks). */
+    if (mbedtls_x509_crt_parse(crt, (const unsigned char *)pem, len + 1) != 0) { mbedtls_x509_crt_free(crt); return 0; }
+    int n = 0;
+    for (const mbedtls_x509_crt *c = crt; c && c->raw.len; c = c->next) {
+        if (++n > ML_TLS_TAILNET_CA_CERTS || ml_tls_spki_distrusted(c->pk_raw.p, c->pk_raw.len)) {
+            mbedtls_x509_crt_free(crt);
+            return 0;
+        }
+    }
+    if (!n) mbedtls_x509_crt_free(crt);
+    return n;
+}
+
+static mbedtls_x509_crt s_tailnet_ca;
+static bool s_tailnet_ca_loaded;
+
+esp_err_t ml_tls_set_tailnet_ca(const char *pem)
+{
+    if (s_tailnet_ca_loaded) { mbedtls_x509_crt_free(&s_tailnet_ca); s_tailnet_ca_loaded = false; }
+    if (!pem || !pem[0]) return ESP_OK;
+    if (!tailnet_ca_parse(pem, &s_tailnet_ca)) return ESP_FAIL;
+    s_tailnet_ca_loaded = true;
+    return ESP_OK;
+}
+
+bool ml_tls_tailnet_ca_set(void) { return s_tailnet_ca_loaded; }
+
+int ml_tls_check_tailnet_ca(const char *pem, char fingerprint_hex[65], char *subject, size_t subject_size)
+{
+    mbedtls_x509_crt crt;
+    int n = tailnet_ca_parse(pem, &crt);
+    if (fingerprint_hex) fingerprint_hex[0] = 0;
+    if (subject && subject_size) subject[0] = 0;
+    if (!n) return 0;
+    uint8_t digest[32];
+    bool hashed;
+#if MBEDTLS_VERSION_MAJOR >= 4
+    size_t written = 0;
+    hashed = psa_hash_compute(PSA_ALG_SHA_256, crt.raw.p, crt.raw.len, digest, sizeof digest, &written) == PSA_SUCCESS
+             && written == sizeof digest;
+#else
+    hashed = mbedtls_sha256(crt.raw.p, crt.raw.len, digest, 0) == 0;
+#endif
+    if (fingerprint_hex && hashed)
+        for (int i = 0; i < 32; i++) {
+            static const char hex[] = "0123456789abcdef";
+            fingerprint_hex[2 * i] = hex[digest[i] >> 4];
+            fingerprint_hex[2 * i + 1] = hex[digest[i] & 15];
+            fingerprint_hex[64] = 0;
+        }
+    if (subject && subject_size && mbedtls_x509_dn_gets(subject, subject_size, &crt.subject) < 0) subject[0] = 0;
+    mbedtls_x509_crt_free(&crt);
+    return n;
+}
+
 esp_err_t ml_tls_bundle_attach(void *conf)
 {
     esp_err_t err = esp_crt_bundle_attach(conf);
@@ -108,5 +171,16 @@ esp_err_t ml_tls_bundle_attach(void *conf)
         s_bundle_verify = ssl_conf->f_vrfy;
     }
     mbedtls_ssl_conf_verify(ssl_conf, distrust_verify, ssl_conf->p_vrfy);
+    return ESP_OK;
+}
+
+esp_err_t ml_tls_tailnet_attach(void *conf)
+{
+    esp_err_t err = ml_tls_bundle_attach(conf);
+    if (err != ESP_OK || !conf || !s_tailnet_ca_loaded) return err;
+    /* The private anchors replace the bundle's placeholder chain: chains
+     * ending at them are trusted by mbedTLS itself; any other chain still
+     * reaches the bundle callback (its top certificate stays untrusted). */
+    mbedtls_ssl_conf_ca_chain((mbedtls_ssl_config *)conf, &s_tailnet_ca, NULL);
     return ESP_OK;
 }

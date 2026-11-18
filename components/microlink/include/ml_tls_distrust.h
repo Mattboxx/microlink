@@ -35,6 +35,28 @@ esp_err_t ml_tls_bundle_attach(void *conf);
 /* Chains refused because of a distrusted certificate since boot. */
 uint32_t ml_tls_distrust_refusals(void);
 
+/* Private trust anchors for the tailnet's own TLS connections only: a
+ * Headscale login server over HTTPS and its DERP relays, with a private CA or
+ * a self-signed certificate. ml_tls_tailnet_attach() is ml_tls_bundle_attach()
+ * plus these anchors; it is used by the control and DERP connections and
+ * nowhere else, so firmware updates, MQTT and notifications keep the public
+ * bundle only. The certificate name, validity and the distrust list are still
+ * checked: these anchors add trust, they never turn verification off.
+ *
+ * ml_tls_set_tailnet_ca(): PEM text with 1 to ML_TLS_TAILNET_CA_CERTS
+ * certificates (at most ML_TLS_TAILNET_CA_MAX bytes); NULL or "" removes them.
+ * Call it before the tailnet connections start (the gateway does at boot).
+ * Fails (and keeps nothing) on invalid, empty, oversized or distrusted input. */
+#define ML_TLS_TAILNET_CA_MAX   3999   /* one NVS string with its terminator */
+#define ML_TLS_TAILNET_CA_CERTS 4
+esp_err_t ml_tls_set_tailnet_ca(const char *pem);
+bool ml_tls_tailnet_ca_set(void);
+esp_err_t ml_tls_tailnet_attach(void *conf);
+/* Checks PEM text as ml_tls_set_tailnet_ca() would, without keeping it:
+ * returns the number of certificates (0 when invalid) and the SHA-256 of the
+ * first one in hex (65 bytes) and its subject (subject_size bytes). */
+int ml_tls_check_tailnet_ca(const char *pem, char fingerprint_hex[65], char *subject, size_t subject_size);
+
 #ifdef __cplusplus
 }
 #endif

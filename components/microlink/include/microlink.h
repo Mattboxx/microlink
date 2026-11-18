@@ -274,6 +274,8 @@ typedef struct {
     uint16_t derp_home_region;     /* currently active DERP region (netcheck may have overridden the default) */
     uint16_t derp_region_default;  /* configured default region (user pick from /tailscale form, or ML_DERP_REGION fallback) */
     bool     derp_connected;       /* DERP relay connection to the home region is up */
+    uint16_t derp_aux_region;      /* second relay (a peer's home region) connected, 0 = none */
+    uint32_t derp_aux_opens;       /* times that second relay was opened */
     int      peer_count;
     int      peer_online;       /* peers currently marked active */
     uint32_t uptime_sec;        /* seconds in ML_STATE_CONNECTED; 0 if not connected */

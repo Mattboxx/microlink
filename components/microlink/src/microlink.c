@@ -332,6 +332,10 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_sock = -1;
     ml->stun_sock6 = -1;
     ml->derp.sockfd = -1;
+#if ML_DERP_AUX
+    ml->derp_aux.sockfd = -1;
+    ml->derp_aux.rx_parked = true;
+#endif
 
     /* Resolve timing (0 = use defaults from #defines) */
     ml->t_disco_heartbeat_ms = ml->config.disco_heartbeat_ms ? ml->config.disco_heartbeat_ms : ML_DISCO_HEARTBEAT_MS;
@@ -920,6 +924,10 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
     out->wan_public_ip = ml->stun_public_ip;
     out->derp_home_region = ml->derp_home_region;
     out->derp_connected = ml->derp.connected;
+#if ML_DERP_AUX
+    out->derp_aux_region = ml->derp_aux.connected ? ml->derp_aux_region : 0;
+    out->derp_aux_opens = ml->derp_aux_opens;
+#endif
     out->derp_region_default = ml->derp_region_default;
     out->peer_count = ml->peer_count;
     int online = 0;

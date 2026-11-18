@@ -473,6 +473,15 @@ typedef struct {
  * DERP Connection State
  * ========================================================================== */
 
+/* A second, on-demand DERP connection for peers homed on another region
+ * (CONFIG_ML_DERP_AUX, default on; costs nothing until a relay reports a
+ * peer missing). */
+#if defined(CONFIG_ML_DERP_AUX) && CONFIG_ML_DERP_AUX
+#define ML_DERP_AUX 1
+#else
+#define ML_DERP_AUX 0
+#endif
+
 typedef struct {
     int sockfd;                     /* Raw TCP socket */
     mbedtls_ssl_context ssl;        /* TLS context (owned exclusively by DERP I/O task) */
@@ -611,6 +620,15 @@ struct microlink_s {
     /* DERP connection (owned exclusively by DERP I/O task after connect) */
     /* Connection setup by coord task, then handed to DERP I/O task */
     ml_derp_conn_t derp;
+#if ML_DERP_AUX
+    /* Second relay connection, to the home region of a peer that our home
+     * relay reported absent (ml_derp.c). Opened on demand by the DERP writer,
+     * read by the DERP reader, closed after 60 s idle. */
+    ml_derp_conn_t derp_aux;
+    volatile uint16_t derp_aux_region;      /* region it is connected to (0 = none) */
+    volatile uint32_t derp_aux_used_s;      /* last packet either way, ml_get_time_ms()/1000 */
+    volatile uint32_t derp_aux_opens;       /* connections opened (diagnostics) */
+#endif
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */

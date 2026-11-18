@@ -20,6 +20,15 @@ menu "MicroLink V2 Configuration"
 
             Zero-copy mode contributed by dj-oyu (https://github.com/dj-oyu/microlink)
 
+    config ML_DERP_AUX
+        bool "Relay to peers homed on another DERP region"
+        default y
+        help
+            A DERP relay only delivers to clients connected to it. When the
+            home relay reports a peer missing, open one more relay connection
+            to that peer's home region (as the reference client does) and
+            close it after 60 s idle. Nothing is opened otherwise.
+
     config ML_MAX_PEERS
         int "Maximum simultaneous WireGuard peers"
         default 16

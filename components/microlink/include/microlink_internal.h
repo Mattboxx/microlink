@@ -264,6 +264,7 @@ typedef struct {
 #define ML_EVT_DERP_RECONNECT       BIT7
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
 #define ML_EVT_TASKS_READY          BIT9 /* all worker stacks reserved */
+#define ML_EVT_LOGOUT_DONE          BIT10 /* the logout request got an answer (microlink_logout) */
 
 /* ============================================================================
  * Queue Message Types
@@ -296,6 +297,7 @@ typedef enum {
     ML_CMD_DISCONNECT,          /* Graceful disconnect */
     ML_CMD_UPDATE_ENDPOINTS,    /* Send endpoint update to control plane */
     ML_CMD_FORCE_RECONNECT,     /* Force reconnection (after DERP failure, etc.) */
+    ML_CMD_LOGOUT,              /* Log this node out of the control server, then stay idle */
 } ml_coord_cmd_t;
 
 /* Peer update (from coord to wg_mgr) */
@@ -520,6 +522,8 @@ struct microlink_s {
     bool reg_auth_loaded;
     uint8_t reg_state;              /* microlink_reg_state_t */
     bool registered_this_boot;      /* reconnects skip the RegisterRequest ... */
+    volatile bool logout_requested; /* next RegisterRequest logs out (Expiry in the past) */
+    volatile bool logout_ok;        /* the control server accepted the logout */
     bool force_register;            /* ... until a map exchange fails */
     bool renewing;                  /* node key renewed after expiry: send OldNodeKey */
     uint8_t old_node_key[32];

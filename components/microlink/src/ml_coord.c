@@ -1516,11 +1516,18 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
      * (ml_reg_auth.h). Presenting a used single-use key again at every
      * reconnect made the control server refuse a registered device. */
     bool have_key = ml->config.auth_key && ml->config.auth_key[0];
+    if (ml->logout_requested) {
+        /* Logout, as the reference client (`tailscale logout`): the same
+         * node key with an expiry in the past, never an auth key. */
+        cJSON_AddStringToObject(root, "Expiry", "1970-01-01T00:02:03Z");
+        have_key = false;
+        ESP_LOGW(TAG, "Logging this node out of the control server");
+    }
     if (!ml->reg_auth_loaded) {
         ml->reg_auth.registered = !ml->renewing && ml_identity_registered(ml);
         ml->reg_auth_loaded = true;
     }
-    if (ml->renewing) {
+    if (ml->renewing && !ml->logout_requested) {
         /* Renewal of an expired node key: the server links it to this device. */
         char old_hex[65], old_str[80];
         bytes_to_hex(ml->old_node_key, 32, old_hex);
@@ -1760,6 +1767,15 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     }
     parse_start[parse_len] = saved;
     free(resp_buf);
+
+    if (ml->logout_requested) {
+        /* The server answered the logout; only an explicit Error refuses it.
+         * Nothing else in this answer applies to a node that is leaving. */
+        cJSON *lerr = cJSON_GetObjectItem(resp_json, "Error");
+        int lrc = (cJSON_IsString(lerr) && lerr->valuestring[0]) ? -1 : 0;
+        cJSON_Delete(resp_json);
+        return lrc;
+    }
 
     /* Check the RegisterResponse status fields the reference client acts on.
      *
@@ -3935,7 +3951,15 @@ void ml_coord_task(void *arg) {
                 ml->state = ML_STATE_IDLE;
                 break;
             case ML_CMD_FORCE_RECONNECT:
-                state = COORD_RECONNECTING;
+                if (!ml->logout_requested) state = COORD_RECONNECTING;
+                break;
+            case ML_CMD_LOGOUT:
+                /* A fresh control connection whose RegisterRequest logs out;
+                 * the answer ends in COORD_IDLE (see COORD_REGISTER). */
+                ml->logout_requested = true;
+                ml->force_register = true;
+                ml_conn_close(ml);
+                state = COORD_TCP_CONNECT;
                 break;
             case ML_CMD_UPDATE_ENDPOINTS:
                 /* TODO: Send endpoint update on existing H2 connection */
@@ -4037,6 +4061,19 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Registering...");
             {
                 int reg = do_register(ml, &noise);
+                if (ml->logout_requested) {
+                    /* Logged out (or refused): tell microlink_logout() and stay
+                     * idle; the gateway erases this identity and restarts. */
+                    ml->logout_ok = reg >= 0;
+                    ml_policy_reset();
+                    ml_conn_close(ml);
+                    ml->state = ML_STATE_IDLE;
+                    state = COORD_IDLE;
+                    xEventGroupClearBits(ml->events, ML_EVT_COORD_REGISTERED);
+                    xEventGroupSetBits(ml->events, ML_EVT_LOGOUT_DONE);
+                    ESP_LOGW(TAG, "Logout %s by the control server", reg >= 0 ? "accepted" : "refused");
+                    break;
+                }
                 if (reg < 0) {
                     ESP_LOGE(TAG, "Registration failed");
                     note_ctrl_retry(ml, ml->reg_note ? ml->reg_note : "registration failed");

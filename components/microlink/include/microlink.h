@@ -194,6 +194,19 @@ esp_err_t microlink_stop(microlink_t *ml);
 esp_err_t microlink_rebind(microlink_t *ml);
 
 /**
+ * Log this node out of the control server, as `tailscale logout`: a
+ * RegisterRequest with an expiry in the past on a fresh control connection
+ * (the node key expires; ephemeral nodes are removed). The coordination task
+ * then stays idle (no reconnect) until the instance is stopped. Waits up to
+ * timeout_ms for the answer.
+ *
+ * @return ESP_OK when the server accepted it, ESP_ERR_TIMEOUT without an
+ *         answer, ESP_FAIL when it refused, ESP_ERR_INVALID_STATE when this
+ *         node was never registered (nothing to log out).
+ */
+esp_err_t microlink_logout(microlink_t *ml, uint32_t timeout_ms);
+
+/**
  * @brief Destroy MicroLink instance and free all resources
  * @param ml Handle (NULL-safe)
  */

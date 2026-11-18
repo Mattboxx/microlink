@@ -848,6 +848,19 @@ int64_t microlink_get_key_expiry(const microlink_t *ml) {
     return ml ? ml->key_expiry_epoch : 0;
 }
 
+esp_err_t microlink_logout(microlink_t *ml, uint32_t timeout_ms) {
+    if (!ml || !ml->coord_cmd_queue || !ml->events) return ESP_ERR_INVALID_ARG;
+    if (!ml->registered_this_boot && !ml_identity_registered(ml)) return ESP_ERR_INVALID_STATE;
+    xEventGroupClearBits(ml->events, ML_EVT_LOGOUT_DONE);
+    ml->logout_ok = false;
+    ml_coord_cmd_t cmd = ML_CMD_LOGOUT;
+    if (xQueueSend(ml->coord_cmd_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    EventBits_t bits = xEventGroupWaitBits(ml->events, ML_EVT_LOGOUT_DONE, pdTRUE, pdFALSE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    if (!(bits & ML_EVT_LOGOUT_DONE)) return ESP_ERR_TIMEOUT;
+    return ml->logout_ok ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t microlink_rebind(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
     if (ml->state == ML_STATE_IDLE) return ESP_ERR_INVALID_STATE;

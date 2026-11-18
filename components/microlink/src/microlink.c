@@ -333,8 +333,10 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_sock6 = -1;
     ml->derp.sockfd = -1;
 #if ML_DERP_AUX
-    ml->derp_aux.sockfd = -1;
-    ml->derp_aux.rx_parked = true;
+    for (int i = 0; i < ML_DERP_AUX_N; i++) {
+        ml->derp_aux[i].sockfd = -1;
+        ml->derp_aux[i].rx_parked = true;
+    }
 #endif
 
     /* Resolve timing (0 = use defaults from #defines) */
@@ -938,7 +940,8 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
     out->derp_home_region = ml->derp_home_region;
     out->derp_connected = ml->derp.connected;
 #if ML_DERP_AUX
-    out->derp_aux_region = ml->derp_aux.connected ? ml->derp_aux_region : 0;
+    out->derp_aux_region = ml->derp_aux[0].connected ? ml->derp_aux_region[0] : 0;
+    out->derp_aux_region2 = ml->derp_aux[1].connected ? ml->derp_aux_region[1] : 0;
     out->derp_aux_opens = ml->derp_aux_opens;
 #endif
     out->derp_region_default = ml->derp_region_default;

@@ -480,8 +480,10 @@ typedef struct {
  * peer missing). */
 #if defined(CONFIG_ML_DERP_AUX) && CONFIG_ML_DERP_AUX
 #define ML_DERP_AUX 1
+#define ML_DERP_AUX_N 2     /* auxiliary relays open at once (each only on demand) */
 #else
 #define ML_DERP_AUX 0
+#define ML_DERP_AUX_N 0
 #endif
 
 typedef struct {
@@ -625,12 +627,12 @@ struct microlink_s {
     /* Connection setup by coord task, then handed to DERP I/O task */
     ml_derp_conn_t derp;
 #if ML_DERP_AUX
-    /* Second relay connection, to the home region of a peer that our home
-     * relay reported absent (ml_derp.c). Opened on demand by the DERP writer,
-     * read by the DERP reader, closed after 60 s idle. */
-    ml_derp_conn_t derp_aux;
-    volatile uint16_t derp_aux_region;      /* region it is connected to (0 = none) */
-    volatile uint32_t derp_aux_used_s;      /* last packet either way, ml_get_time_ms()/1000 */
+    /* Extra relay connections, each to the home region of peers that our
+     * home relay reported absent (ml_derp.c). Opened on demand by the DERP
+     * writer, read by the DERP reader, closed after 60 s idle. */
+    ml_derp_conn_t derp_aux[ML_DERP_AUX_N];
+    volatile uint16_t derp_aux_region[ML_DERP_AUX_N];   /* region connected to (0 = none) */
+    volatile uint32_t derp_aux_used_s[ML_DERP_AUX_N];   /* last packet either way, ml_get_time_ms()/1000 */
     volatile uint32_t derp_aux_opens;       /* connections opened (diagnostics) */
 #endif
 

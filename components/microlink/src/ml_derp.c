@@ -121,6 +121,12 @@ static int ml_derp_bio_send(void *ctx, const unsigned char *buf, size_t len) {
 
 #if ML_DERP_AUX
 static void derp_away_note(const uint8_t *key, uint64_t now);
+/* Which auxiliary relay a connection is (-1: the home one). */
+static int derp_aux_slot(const microlink_t *ml, const ml_derp_conn_t *c)
+{
+    for (int i = 0; i < ML_DERP_AUX_N; i++) if (c == &ml->derp_aux[i]) return i;
+    return -1;
+}
 #endif
 
 /* DISCO magic bytes: "TS" + sparkles emoji UTF-8 */
@@ -349,7 +355,8 @@ static void dispatch_derp_frame(microlink_t *ml, ml_derp_conn_t *c, uint8_t fram
                      src_key[0], src_key[1], src_key[2], src_key[3],
                      payload_len > 0 ? payload[0] : 0xFF);
 #if ML_DERP_AUX
-            if (c != &ml->derp) ml->derp_aux_used_s = (uint32_t)(ml_get_time_ms() / 1000);
+            int slot = derp_aux_slot(ml, c);
+            if (slot >= 0) ml->derp_aux_used_s[slot] = (uint32_t)(ml_get_time_ms() / 1000);
 #endif
             route_derp_packet(ml, payload, payload_len, src_key);
             return;  /* payload ownership transferred */
@@ -602,10 +609,11 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * packet with PeerGone "not here"; the reference client writes to the peer's
  * home region over another connection (magicsock derpWriteChanForRegion) and
  * closes it after 60 s idle. Here a peer the home relay reported missing is
- * noted as away for a while; its packets go over one auxiliary connection to
- * its home region, opened on demand by the writer task and read by the reader
- * task. Peers on our own region are unaffected, and nothing is opened unless
- * the home relay reported a peer missing.
+ * noted as away for a while; its packets go over an auxiliary connection to
+ * its home region (up to ML_DERP_AUX_N regions at once), opened on demand by
+ * the writer task and read by the reader task. Peers on our own region are
+ * unaffected, and nothing is opened unless the home relay reported a peer
+ * missing.
  * ========================================================================== */
 #if ML_DERP_AUX
 
@@ -653,19 +661,25 @@ static bool derp_away(const uint8_t *key, uint64_t now)
     return away;
 }
 
-typedef enum { DERP_ROUTE_HOME, DERP_ROUTE_AUX, DERP_ROUTE_OPEN } derp_route_t;
-
-/* Where a packet for an away peer goes (pure). region: the peer's home
- * region (0 = unknown); aux_idle_ms: since the auxiliary relay last carried a
- * packet. HOME also covers "not possible now": the packet takes the old path. */
-static derp_route_t derp_route_pick(uint16_t region, uint16_t home, bool aux_up, uint16_t aux_region,
-                                    uint64_t aux_idle_ms, uint16_t failed_region, uint64_t since_fail_ms)
+/* Which auxiliary relay a packet for an away peer goes out on (pure).
+ * region: the peer's home region (0 = unknown); per slot: up, the region it
+ * is connected to, and how long since it last carried a packet. Returns the
+ * slot (*open: connect it to region first; a free slot, else the one idle
+ * longest, if idle for DERP_AUX_SWITCH_MS), or -1 for the home relay, which
+ * also covers "not possible now". */
+static int derp_route_pick(uint16_t region, uint16_t home, int slots, const bool up[], const uint16_t aux_region[],
+                           const uint64_t idle_ms[], uint16_t failed_region, uint64_t since_fail_ms, bool *open)
 {
-    if (!region || region == home) return DERP_ROUTE_HOME;
-    if (aux_up && aux_region == region) return DERP_ROUTE_AUX;
-    if (aux_up && aux_idle_ms < DERP_AUX_SWITCH_MS) return DERP_ROUTE_HOME;  /* busy with another region */
-    if (failed_region == region && since_fail_ms < DERP_AUX_RETRY_MS) return DERP_ROUTE_HOME;
-    return DERP_ROUTE_OPEN;
+    *open = false;
+    if (!region || region == home) return -1;
+    for (int i = 0; i < slots; i++) if (up[i] && aux_region[i] == region) return i;
+    if (failed_region == region && since_fail_ms < DERP_AUX_RETRY_MS) return -1;
+    int pick = -1;
+    for (int i = 0; i < slots && pick < 0; i++) if (!up[i]) pick = i;
+    for (int i = 0; i < slots && !(pick >= 0 && !up[pick]); i++)
+        if (idle_ms[i] >= DERP_AUX_SWITCH_MS && (pick < 0 || idle_ms[i] > idle_ms[pick])) pick = i;
+    *open = pick >= 0;
+    return pick;   /* -1: every relay busy with another region */
 }
 
 /* A peer's home region from the peer table (0 = unknown). Only for away
@@ -677,18 +691,18 @@ static uint16_t derp_peer_region(microlink_t *ml, const uint8_t *key)
     return 0;
 }
 
-static void derp_aux_close(microlink_t *ml, const char *why)
+static void derp_aux_close(microlink_t *ml, int slot, const char *why)
 {
-    ESP_LOGI(TAG, "Closing the relay of region %u (%s)", (unsigned)ml->derp_aux_region, why);
-    ml->derp_aux.connected = false;
-    for (int i = 0; i < 20 && !ml->derp_aux.rx_parked; i++) vTaskDelay(pdMS_TO_TICKS(10));
-    derp_conn_close(&ml->derp_aux);
-    ml->derp_aux_region = 0;
+    ESP_LOGI(TAG, "Closing the relay of region %u (%s)", (unsigned)ml->derp_aux_region[slot], why);
+    ml->derp_aux[slot].connected = false;
+    for (int i = 0; i < 20 && !ml->derp_aux[slot].rx_parked; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    derp_conn_close(&ml->derp_aux[slot]);
+    ml->derp_aux_region[slot] = 0;
 }
 
-/* Connect the auxiliary relay to a region: one node per attempt (the next
+/* Connect an auxiliary relay to a region: one node per attempt (the next
  * one after a failure), so the writer is held up by at most one connect. */
-static bool derp_aux_open(microlink_t *ml, uint16_t region)
+static bool derp_aux_open(microlink_t *ml, int slot, uint16_t region)
 {
     for (int i = 0; i < ml->derp_region_count; i++) {
         const ml_derp_region_t *r = &ml->derp_regions[i];
@@ -699,13 +713,13 @@ static bool derp_aux_open(microlink_t *ml, uint16_t region)
         for (int k = 0; k < r->node_count; k++) {
             const ml_derp_node_t *n = &r->nodes[k];
             if (n->stun_only || !n->hostname[0] || skip-- > 0) continue;
-            if (derp_open(ml, &ml->derp_aux, n->hostname, n->derp_port > 0 ? n->derp_port : ML_DERP_PORT,
+            if (derp_open(ml, &ml->derp_aux[slot], n->hostname, n->derp_port > 0 ? n->derp_port : ML_DERP_PORT,
                           n, region, false) != ESP_OK) {
                 s_aux_pick++;
                 return false;
             }
-            ml->derp_aux_region = region;
-            ml->derp_aux_used_s = (uint32_t)(ml_get_time_ms() / 1000);
+            ml->derp_aux_region[slot] = region;
+            ml->derp_aux_used_s[slot] = (uint32_t)(ml_get_time_ms() / 1000);
             ml->derp_aux_opens++;
             return true;
         }
@@ -720,39 +734,45 @@ static ml_derp_conn_t *derp_conn_for(microlink_t *ml, const uint8_t *key)
     uint64_t now = ml_get_time_ms();
     if (!derp_away(key, now)) return &ml->derp;
     uint16_t region = derp_peer_region(ml, key);
-    bool up = ml->derp_aux.connected;
-    uint64_t used = (uint64_t)ml->derp_aux_used_s * 1000u;
-    switch (derp_route_pick(region, ml->derp_home_region, up, ml->derp_aux_region,
-                            now > used ? now - used : 0, s_aux_failed_region, now - s_aux_failed_ms)) {
-    case DERP_ROUTE_AUX:
-        break;
-    case DERP_ROUTE_OPEN:
-        if (ml->derp_aux.sockfd >= 0) derp_aux_close(ml, up ? "another region needs it" : "broken");
-        if (!derp_aux_open(ml, region)) {
+    bool up[ML_DERP_AUX_N];
+    uint16_t regions[ML_DERP_AUX_N];
+    uint64_t idle[ML_DERP_AUX_N];
+    for (int i = 0; i < ML_DERP_AUX_N; i++) {
+        uint64_t used = (uint64_t)ml->derp_aux_used_s[i] * 1000u;
+        up[i] = ml->derp_aux[i].connected;
+        regions[i] = ml->derp_aux_region[i];
+        idle[i] = now > used ? now - used : 0;
+    }
+    bool open;
+    int slot = derp_route_pick(region, ml->derp_home_region, ML_DERP_AUX_N, up, regions, idle,
+                               s_aux_failed_region, now - s_aux_failed_ms, &open);
+    if (slot < 0) return &ml->derp;
+    if (open) {
+        if (ml->derp_aux[slot].sockfd >= 0) derp_aux_close(ml, slot, up[slot] ? "another region needs it" : "broken");
+        if (!derp_aux_open(ml, slot, region)) {
             s_aux_failed_region = region;
             s_aux_failed_ms = ml_get_time_ms();
             return &ml->derp;
         }
-        break;
-    default:
-        return &ml->derp;
     }
-    ml->derp_aux_used_s = (uint32_t)(ml_get_time_ms() / 1000);
-    return &ml->derp_aux;
+    ml->derp_aux_used_s[slot] = (uint32_t)(ml_get_time_ms() / 1000);
+    return &ml->derp_aux[slot];
 }
 
-/* Close the auxiliary relay when idle, silent, broken by the reader, or
+/* Close an auxiliary relay when idle, silent, broken by the reader, or
  * its region became our home (writer task). */
 static void derp_aux_maintain(microlink_t *ml, uint64_t now)
 {
-    ml_derp_conn_t *a = &ml->derp_aux;
-    if (a->sockfd < 0) return;
-    uint64_t used = (uint64_t)ml->derp_aux_used_s * 1000u;
-    if (!a->connected) derp_aux_close(ml, "connection lost");
-    else if (now > used && now - used > DERP_AUX_IDLE_MS) derp_aux_close(ml, "idle");
-    else if (a->last_recv_ms && now > a->last_recv_ms && now - a->last_recv_ms > ML_DERP_STALE_MS)
-        derp_aux_close(ml, "silent");
-    else if (ml->derp_aux_region == ml->derp_home_region) derp_aux_close(ml, "now the home region");
+    for (int i = 0; i < ML_DERP_AUX_N; i++) {
+        ml_derp_conn_t *a = &ml->derp_aux[i];
+        if (a->sockfd < 0) continue;
+        uint64_t used = (uint64_t)ml->derp_aux_used_s[i] * 1000u;
+        if (!a->connected) derp_aux_close(ml, i, "connection lost");
+        else if (now > used && now - used > DERP_AUX_IDLE_MS) derp_aux_close(ml, i, "idle");
+        else if (a->last_recv_ms && now > a->last_recv_ms && now - a->last_recv_ms > ML_DERP_STALE_MS)
+            derp_aux_close(ml, i, "silent");
+        else if (ml->derp_aux_region[i] == ml->derp_home_region) derp_aux_close(ml, i, "now the home region");
+    }
 }
 
 #endif /* ML_DERP_AUX */
@@ -760,14 +780,14 @@ static void derp_aux_maintain(microlink_t *ml, uint64_t now)
 /* Wait until a relay socket has bytes (bounded), for the reader task. */
 static int derp_wait_readable_any(microlink_t *ml, long us)
 {
-    int fds[2] = { ml->derp.connected ? ml->derp.sockfd : -1, -1 };
+    int fds[1 + ML_DERP_AUX_N] = { ml->derp.connected ? ml->derp.sockfd : -1 };
 #if ML_DERP_AUX
-    fds[1] = ml->derp_aux.connected ? ml->derp_aux.sockfd : -1;
+    for (int i = 0; i < ML_DERP_AUX_N; i++) fds[1 + i] = ml->derp_aux[i].connected ? ml->derp_aux[i].sockfd : -1;
 #endif
     fd_set rd;
     FD_ZERO(&rd);
     int maxfd = -1;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 1 + ML_DERP_AUX_N; i++) {
         if (fds[i] < 0) continue;
         FD_SET(fds[i], &rd);
         if (fds[i] > maxfd) maxfd = fds[i];
@@ -1006,7 +1026,7 @@ void ml_derp_tx_task(void *arg) {
                     ret = derp_write_frame(c, item.frame_type, item.data, item.len);
                 }
                 if (ret < 0 && c != &ml->derp) {
-                    ESP_LOGW(TAG, "DERP write failed on the relay of region %u", (unsigned)ml->derp_aux_region);
+                    ESP_LOGW(TAG, "DERP write failed on the relay of region %u", (unsigned)ml->derp_aux_region[derp_aux_slot(ml, c)]);
                     c->connected = false;      /* closed by derp_aux_maintain() */
                 } else if (ret < 0) {
                     ESP_LOGW(TAG, "DERP write failed");
@@ -1042,13 +1062,13 @@ void ml_derp_rx_task(void *arg) {
     uint64_t rx_busy_since = 0;
     bool readable_idle = false;   /* select() said readable, then nothing was read */
     ESP_LOGI(TAG, "DERP RX task started (Core %d)", xPortGetCoreID());
-    ml_derp_conn_t *conns[2] = { &ml->derp, NULL };
+    ml_derp_conn_t *conns[1 + ML_DERP_AUX_N] = { &ml->derp };
 #if ML_DERP_AUX
-    conns[1] = &ml->derp_aux;   /* the auxiliary relay, when the writer opened it */
+    for (int i = 0; i < ML_DERP_AUX_N; i++) conns[1 + i] = &ml->derp_aux[i];   /* when the writer opened them */
 #endif
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         bool got = false, any = false;
-        for (int k = 0; k < 2 && conns[k]; k++) {
+        for (int k = 0; k < 1 + ML_DERP_AUX_N && conns[k]; k++) {
             ml_derp_conn_t *c = conns[k];
             /* Unparked before the check: the writer clears connected first
              * and then waits for parked, so it never closes a session this
@@ -1075,7 +1095,7 @@ void ml_derp_rx_task(void *arg) {
                     break;
                 }
             }
-            if (k) c->rx_parked = true;     /* the auxiliary relay can be closed between passes */
+            if (k) c->rx_parked = true;     /* an auxiliary relay can be closed between passes */
         }
         if (!any) {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -1605,12 +1625,13 @@ void ml_derp_disconnect(microlink_t *ml) {
     xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECTED);
     derp_conn_close(&ml->derp);
 #if ML_DERP_AUX
-    /* The auxiliary relay goes with the home one (shutdown, reconnect). */
-    if (ml->derp_aux.sockfd >= 0) {
-        ml->derp_aux.connected = false;
-        for (int i = 0; i < 20 && !ml->derp_aux.rx_parked; i++) vTaskDelay(pdMS_TO_TICKS(10));
-        derp_conn_close(&ml->derp_aux);
-        ml->derp_aux_region = 0;
+    /* The auxiliary relays go with the home one (shutdown, reconnect). */
+    for (int s = 0; s < ML_DERP_AUX_N; s++) {
+        if (ml->derp_aux[s].sockfd < 0) continue;
+        ml->derp_aux[s].connected = false;
+        for (int i = 0; i < 20 && !ml->derp_aux[s].rx_parked; i++) vTaskDelay(pdMS_TO_TICKS(10));
+        derp_conn_close(&ml->derp_aux[s]);
+        ml->derp_aux_region[s] = 0;
     }
 #endif
 

@@ -17,6 +17,8 @@
 #include "lwip/pbuf.h"
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
+#include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"
 #include <string.h>
 
 static const char *TAG = "ml_udp";
@@ -148,6 +150,50 @@ static void udp_rx_task(void *arg) {
  * Public API
  * ========================================================================== */
 
+/* lwIP raw API calls run on the TCPIP thread (this lwIP has no core
+ * locking): each one below is a synchronous tcpip_api_call(). */
+typedef struct {
+    struct tcpip_api_call_data call;   /* first: tcpip_api_call() passes this */
+    microlink_udp_socket_t *sock;
+    struct netif *netif;
+    ip_addr_t ip;
+    uint16_t port;
+    struct pbuf *p;
+} udp_tcpip_call_t;
+
+static err_t udp_open_in_tcpip(struct tcpip_api_call_data *c)
+{
+    udp_tcpip_call_t *a = (udp_tcpip_call_t *)c;
+    struct udp_pcb *pcb = udp_new();
+    if (!pcb) return ERR_MEM;
+    if (a->netif) udp_bind_netif(pcb, a->netif);
+    err_t err = udp_bind(pcb, &a->ip, a->port);
+    if (err != ERR_OK) { udp_remove(pcb); return err; }
+    a->sock->pcb = pcb;
+    a->sock->local_port = pcb->local_port;
+    udp_recv(pcb, udp_recv_cb, a->sock);
+    return ERR_OK;
+}
+
+/* After this returns no receive callback runs any more (the TCPIP thread
+ * finished any one in progress before it ran this). */
+static err_t udp_close_in_tcpip(struct tcpip_api_call_data *c)
+{
+    udp_tcpip_call_t *a = (udp_tcpip_call_t *)c;
+    if (a->sock->pcb) {
+        udp_recv(a->sock->pcb, NULL, NULL);
+        udp_remove(a->sock->pcb);
+        a->sock->pcb = NULL;
+    }
+    return ERR_OK;
+}
+
+static err_t udp_send_in_tcpip(struct tcpip_api_call_data *c)
+{
+    udp_tcpip_call_t *a = (udp_tcpip_call_t *)c;
+    return a->sock->pcb ? udp_sendto(a->sock->pcb, a->p, &a->ip, a->port) : ERR_CLSD;
+}
+
 microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_port) {
     if (!ml) {
         ESP_LOGE(TAG, "NULL handle");
@@ -168,33 +214,16 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
         return NULL;
     }
 
-    sock->pcb = udp_new();
-    if (!sock->pcb) {
+    /* A PCB on the WG netif, bound to the VPN IP and port. */
+    udp_tcpip_call_t open = { .sock = sock, .netif = (struct netif *)ml->wg_netif, .port = local_port };
+    ip_to_lwip(ml->vpn_ip, &open.ip);
+    err_t err = tcpip_api_call(udp_open_in_tcpip, &open.call);
+    if (err != ERR_OK || !sock->pcb) {
+        ESP_LOGE(TAG, "UDP socket on port %u failed: %d", (unsigned)local_port, err);
         vSemaphoreDelete(sock->rx_sem);
         free(sock);
         return NULL;
     }
-
-    /* Bind to WG netif */
-    if (ml->wg_netif) {
-        udp_bind_netif(sock->pcb, (struct netif *)ml->wg_netif);
-    }
-
-    /* Bind to VPN IP + port */
-    ip_addr_t local_ip;
-    ip_to_lwip(ml->vpn_ip, &local_ip);
-
-    err_t err = udp_bind(sock->pcb, &local_ip, local_port);
-    if (err != ERR_OK) {
-        ESP_LOGE(TAG, "udp_bind failed: %d", err);
-        udp_remove(sock->pcb);
-        vSemaphoreDelete(sock->rx_sem);
-        free(sock);
-        return NULL;
-    }
-
-    sock->local_port = sock->pcb->local_port;
-    udp_recv(sock->pcb, udp_recv_cb, sock);
 
     /* Start RX task on Core 1 */
     sock->rx_running = true;
@@ -222,21 +251,16 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
 void microlink_udp_close(microlink_udp_socket_t *sock) {
     if (!sock) return;
 
-    /* Unregister lwIP callback FIRST to prevent use-after-free.
-     * The callback runs from tcpip thread and accesses sock->rx_sem,
-     * so it must be unregistered before we touch any sock fields. */
-    if (sock->pcb) {
-        udp_recv(sock->pcb, NULL, NULL);
-    }
+    /* Unregister the lwIP callback and remove the PCB FIRST, on the TCPIP
+     * thread: the callback uses sock->rx_sem, so no callback may run once
+     * we touch the socket's fields. */
+    udp_tcpip_call_t close_call = { .sock = sock };
+    if (sock->pcb) (void)tcpip_api_call(udp_close_in_tcpip, &close_call.call);
 
     if (sock->rx_running) {
         sock->rx_running = false;
         if (sock->rx_sem) xSemaphoreGive(sock->rx_sem);
         vTaskDelay(pdMS_TO_TICKS(150));
-    }
-
-    if (sock->pcb) {
-        udp_remove(sock->pcb);
     }
 
     if (sock->rx_sem) vSemaphoreDelete(sock->rx_sem);
@@ -249,15 +273,15 @@ esp_err_t microlink_udp_send(microlink_udp_socket_t *sock, uint32_t dest_ip,
     if (!sock || !sock->pcb || !data || len == 0) return ESP_ERR_INVALID_ARG;
     if (len > UDP_MAX_PKT_SIZE) return ESP_ERR_INVALID_SIZE;
 
-    ip_addr_t dest;
-    ip_to_lwip(dest_ip, &dest);
+    udp_tcpip_call_t send = { .sock = sock, .port = dest_port };
+    ip_to_lwip(dest_ip, &send.ip);
 
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    if (!p) return ESP_ERR_NO_MEM;
+    send.p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+    if (!send.p) return ESP_ERR_NO_MEM;
 
-    memcpy(p->payload, data, len);
-    err_t err = udp_sendto(sock->pcb, p, &dest, dest_port);
-    pbuf_free(p);
+    memcpy(send.p->payload, data, len);
+    err_t err = tcpip_api_call(udp_send_in_tcpip, &send.call);
+    pbuf_free(send.p);
 
     if (err != ERR_OK) {
         if (sock->ml) {

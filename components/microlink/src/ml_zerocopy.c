@@ -238,8 +238,9 @@ void ml_zerocopy_deinit(microlink_t *ml) {
     };
     if (!ctx.done) return;
 
-    tcpip_callback(zc_pcb_remove_in_tcpip, &ctx);
-    xSemaphoreTake(ctx.done, portMAX_DELAY);
+    /* Never wait for a callback that was not queued (out of messages). */
+    if (tcpip_callback(zc_pcb_remove_in_tcpip, &ctx) == ERR_OK) xSemaphoreTake(ctx.done, portMAX_DELAY);
+    else ESP_LOGE(TAG, "Zero-copy shutdown could not reach the TCPIP thread");
     vSemaphoreDelete(ctx.done);
 }
 
@@ -264,10 +265,12 @@ esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
     ip4_addr_set_u32(ip_2_ip4(&ctx->dest), htonl(dest_ip));
     ctx->port = dest_port;
 
+    /* Schedule the send in tcpip_thread; the slot is taken only when it was
+     * queued (a send that could not be queued used to keep its slot for
+     * ever, and the pool ran dry). The consumer touches only queued slots,
+     * so publishing the head after queueing is safe (single producer). */
+    if (tcpip_callback(zc_send_in_tcpip, ctx) != ERR_OK) return ESP_ERR_NO_MEM;
     __atomic_store_n(&ml->zc.tx_head, next, __ATOMIC_RELEASE);
-
-    /* Schedule send in tcpip_thread */
-    tcpip_callback(zc_send_in_tcpip, ctx);
     return ESP_OK;
 }
 

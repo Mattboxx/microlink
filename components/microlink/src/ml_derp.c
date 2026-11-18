@@ -863,7 +863,17 @@ void ml_derp_rx_task(void *arg) {
  * DERP Connection Management (called from coord task)
  * ========================================================================== */
 
+static esp_err_t derp_connect_once(microlink_t *ml);
+/* A failed connect tries the next node of the home region next time: a
+ * region's nodes forward to each other, so peers reach us on any of them.
+ * Without this, one unreachable node kept the relay down for good. */
 esp_err_t ml_derp_connect(microlink_t *ml) {
+    esp_err_t err = derp_connect_once(ml);
+    if (err != ESP_OK) ml->derp_node_pick++;
+    return err;
+}
+
+static esp_err_t derp_connect_once(microlink_t *ml) {
     /* Determine DERP host/port from DERPMap with node failover.
      * Always start from node 0 (the first/preferred node in the DERPMap).
      * Only rotate to a different node after a SUCCESSFUL connection drops,
@@ -876,11 +886,15 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     if (ml->derp_region_count > 0 && ml->derp_home_region > 0) {
         for (int i = 0; i < ml->derp_region_count; i++) {
             if (ml->derp_regions[i].region_id == ml->derp_home_region) {
-                /* Always use the first non-stun-only node (preferred node).
-                 * This ensures we connect to the same node as most peers. */
+                /* The first usable node (preferred), or the next ones after
+                 * failures (derp_node_pick, see ml_derp_connect). */
+                int usable = 0;
+                for (int k = 0; k < ml->derp_regions[i].node_count; k++)
+                    usable += !ml->derp_regions[i].nodes[k].stun_only && ml->derp_regions[i].nodes[k].hostname[0];
+                int skip = usable ? ml->derp_node_pick % usable : 0;
                 for (int attempt = 0; attempt < ml->derp_regions[i].node_count; attempt++) {
                     if (!ml->derp_regions[i].nodes[attempt].stun_only &&
-                        ml->derp_regions[i].nodes[attempt].hostname[0]) {
+                        ml->derp_regions[i].nodes[attempt].hostname[0] && skip-- <= 0) {
                         derp_host = ml->derp_regions[i].nodes[attempt].hostname;
                         derp_node = &ml->derp_regions[i].nodes[attempt];
                         if (ml->derp_regions[i].nodes[attempt].derp_port > 0) {
@@ -933,8 +947,15 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     snprintf(port_str, sizeof(port_str), "%d", derp_port);
 
     if (ml_getaddrinfo(derp_host, port_str, &hints, &res) != 0 || !res) {
-        ESP_LOGE(TAG, "DNS resolve failed for %s", derp_host);
-        return ESP_FAIL;
+        /* The DERPMap carries the node's address: use it when DNS fails
+         * (TLS below still verifies the certificate for the hostname). */
+        res = NULL;
+        if (!derp_node || !derp_node->ipv4[0]
+            || ml_getaddrinfo(derp_node->ipv4, port_str, &hints, &res) != 0 || !res) {
+            ESP_LOGE(TAG, "DNS resolve failed for %s", derp_host);
+            return ESP_FAIL;
+        }
+        ESP_LOGW(TAG, "DNS failed for %s: using its DERPMap address", derp_host);
     }
 
     int64_t t_derp_dns = esp_timer_get_time();

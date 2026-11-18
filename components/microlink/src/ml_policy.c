@@ -104,6 +104,9 @@ typedef struct {
 static policy *current;
 static uint32_t epoch;
 static bool suspended;
+/* Set before a MapRequest whose first response is the complete map (not
+ * OmitPeers); consumed by that map, cleared when the session ends. */
+static bool s_expect_full;
 static uint32_t suspended_at;
 #define RESUME_WINDOW_MS 30000u
 static uint8_t loss_mode = ML_POLICY_LOSS_KEEP;
@@ -242,7 +245,7 @@ static bool same_authority_data(const policy *a, const policy *b) {
         && !memcmp(a->pool, b->pool, a->pool_count * sizeof(ip_range));
 }
 void ml_policy_suspend(void) {
-    LOCK();if(!suspended){suspended=true;suspended_at=NOW();}UNLOCK();
+    LOCK();if(!suspended){suspended=true;suspended_at=NOW();}s_expect_full=false;UNLOCK();
 }
 
 static const cJSON *get(const cJSON *o, const char *key) {
@@ -454,8 +457,14 @@ static bool usable(const cJSON *node) {
     }
     return true;
 }
-static bool peer_updates(policy *p, const cJSON *map) {
+static bool peer_updates(policy *p, const cJSON *map, bool session_full) {
     const cJSON *full = get(map,"Peers"), *changed = get(map,"PeersChanged");
+    if (session_full && (!full || cJSON_IsNull(full))) {
+        /* First map of a session without Peers: Peers is omitempty, so an
+         * empty tailnet omits it. The complete list is empty. */
+        for (uint32_t i=0;i<p->peer_count;i++) p->peers[i].active=false;
+        p->peers_known=true;
+    }
     const cJSON *removed=get(map,"PeersRemoved"), *patches=get(map,"PeersChangedPatch");
     if (full && !cJSON_IsNull(full)) {
         if (!cJSON_IsArray(full)) REFUSE("peers-shape");
@@ -573,6 +582,11 @@ static bool group_apply(policy *p,const char *name,const cJSON *rules) {
             }
         }
         for (const cJSON *s=srcs->child;s;s=s->next) for (const cJSON *d=dsts->child;d;d=d->next) {
+            /* "cap:<name>" matches peers holding a node capability; this
+             * client does not track peer capabilities, so such a source
+             * admits nobody (never more than the policy allows), and the
+             * rest of the policy still applies. */
+            if (cJSON_IsString(s) && !strncmp(s->valuestring,"cap:",4)) continue;
             if (p->count>=p->entry_cap) REFUSE("filter-room");
             if (!cJSON_IsString(s)||!cJSON_IsObject(d)||!unique(d)) return false;
             for (const cJSON *f=d->child;f;f=f->next)
@@ -591,6 +605,7 @@ static bool group_apply(policy *p,const char *name,const cJSON *rules) {
 }
 /* Last rejection reason: a static code for diagnostics, never map content. */
 static const char *s_reject="none";
+void ml_policy_expect_full_map(void) {LOCK();s_expect_full=true;UNLOCK();}
 const char *ml_policy_last_reject(void) {return s_reject;}
 bool ml_policy_apply(const cJSON *map) {
     s_reject="none";
@@ -611,8 +626,9 @@ bool ml_policy_apply(const cJSON *map) {
     LOCK();bool resuming=suspended;uint32_t outage=NOW()-suspended_at;bool was_blocked=blocked();UNLOCK();
     /* Reconnects must not apply deltas to unseen stale authority. A complete
      * map is built from empty state, never the saved pre-outage filters. */
-    bool complete=cJSON_IsArray(get(map,"Peers")) && cJSON_IsObject(get(map,"Node"))
-        && (cJSON_IsArray(get(map,"PacketFilter")) || cJSON_IsObject(get(map,"PacketFilters")));
+    LOCK();bool session_full=s_expect_full && cJSON_IsObject(get(map,"Node"));if(session_full)s_expect_full=false;UNLOCK();
+    bool complete=session_full || (cJSON_IsArray(get(map,"Peers")) && cJSON_IsObject(get(map,"Node"))
+        && (cJSON_IsArray(get(map,"PacketFilter")) || cJSON_IsObject(get(map,"PacketFilters"))));
     /* Never apply a delta to unconfirmed authority. The reconnect asks for a
      * complete map, so a delta (or a malformed partial map) first is an anomaly
      * and fails closed in every control-loss mode. */
@@ -622,7 +638,7 @@ bool ml_policy_apply(const cJSON *map) {
     policy *next=old&&!resuming ? policy_canonical(old,room_peers,room_pool,room_entries) : policy_alloc(room_peers,room_pool,room_entries);
     if (!next) {s_reject="no-memory";release(old);ml_policy_reset();return false;}
     s_detail="";
-    bool valid=peer_updates(next,map);
+    bool valid=peer_updates(next,map,session_full);
     if(!valid)s_reject=*s_detail?s_detail:"peer-update";
     const cJSON *base=get(map,"PacketFilter"), *groups=get(map,"PacketFilters");
     bool replace_base=base && !cJSON_IsNull(base);
@@ -640,6 +656,11 @@ bool ml_policy_apply(const cJSON *map) {
      * Named deltas are unordered: a valid at-capacity replace must not depend
      * on whether JSON lists the new group before the removed one. */
     if (replace_base) {group_remove(next,group_find(next,"base"));next->filters_known=true;}
+    /* A complete map without any filter field: no rules (PacketFilter is
+     * omitempty; an empty list blocks everything). */
+    if (session_full && !replace_base && !(groups && !cJSON_IsNull(groups))) {
+        next->count=0;memset(next->groups,0,sizeof next->groups);next->filters_known=true;
+    }
     if (clear_all) {next->count=0;memset(next->groups,0,sizeof next->groups);next->filters_known=true;}
     if (groups && !cJSON_IsNull(groups)) {
         for (const cJSON *g=groups->child;valid && g;g=g->next) {

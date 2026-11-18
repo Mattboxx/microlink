@@ -41,6 +41,8 @@
 #include "ml_dns_config.h"
 #include <string.h>
 #include <errno.h>
+#include <sys/time.h>
+#include <time.h>
 
 static const char *TAG = "ml_coord";
 
@@ -777,9 +779,12 @@ static int do_tcp_connect(microlink_t *ml) {
     } else {
         strncpy(ml->ctrl_host_parsed, ML_CTRL_HOST, sizeof(ml->ctrl_host_parsed) - 1);
         ml->ctrl_host_parsed[sizeof(ml->ctrl_host_parsed) - 1] = '\0';
-        strncpy(ml->ctrl_port_str, "80", sizeof(ml->ctrl_port_str) - 1);
+        /* Port 80 (plain HTTP upgrade), or TLS on 443 where 80 is blocked
+         * or a transparent proxy breaks the upgrade, as the reference
+         * client falls back (controlhttp). */
+        strncpy(ml->ctrl_port_str, ml->ctrl_saas_tls ? "443" : "80", sizeof(ml->ctrl_port_str) - 1);
         ml->ctrl_port_str[sizeof(ml->ctrl_port_str) - 1] = '\0';
-        ml->use_tls = false;
+        ml->use_tls = ml->ctrl_saas_tls;
     }
 
     /* Build "Host:" / HTTP/2 :authority value.  Standard HTTP practice:
@@ -1385,6 +1390,8 @@ static cJSON *build_hostinfo(microlink_t *ml) {
     return hostinfo;
 }
 
+static uint32_t first_ipv4(const cJSON *addresses);   /* defined with the map parser */
+
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
 
@@ -1766,18 +1773,12 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     /* Extract our VPN IP from Node.Addresses */
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
     if (node) {
-        cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-        if (addresses && cJSON_GetArraySize(addresses) > 0) {
-            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-            if (addr) {
-                unsigned a, b, c, d;
-                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                    ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                    char ip_str[16];
-                    microlink_ip_to_str(ml->vpn_ip, ip_str);
-                    ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
-                }
-            }
+        uint32_t v4 = first_ipv4(cJSON_GetObjectItem(node, "Addresses"));
+        if (v4) {
+            ml->vpn_ip = v4;
+            char ip_str[16];
+            microlink_ip_to_str(ml->vpn_ip, ip_str);
+            ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
         }
         /* Parse self-node DERP region — try modern HomeDERP (int) first,
          * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
@@ -1830,6 +1831,41 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
 
 /* Defined below with the long-poll reader; both map paths share one framed stream. */
 static bool lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len);
+
+/* First IPv4 of an Addresses/AllowedIPs list (host order), 0 if none. The
+ * list order is not guaranteed IPv4-first (IPv6-first or IPv6-only nodes). */
+static uint32_t first_ipv4(const cJSON *addresses) {
+    const cJSON *v;
+    cJSON_ArrayForEach(v, addresses) {
+        unsigned a, b, c, d;
+        if (cJSON_IsString(v) && v->valuestring && !strchr(v->valuestring, ':')
+            && sscanf(v->valuestring, "%u.%u.%u.%u", &a, &b, &c, &d) == 4
+            && a < 256 && b < 256 && c < 256 && d < 256)
+            return (a << 24) | (b << 16) | (c << 8) | d;
+    }
+    return 0;
+}
+
+/* The control server's time (MapResponse.ControlTime, UTC RFC 3339) sets
+ * the clock while no other source has: node key expiry checks need a set
+ * clock, and networks that block NTP left the policy "pending" forever.
+ * The control server is already the authority for keys and policy. */
+static void clock_from_control(const cJSON *map) {
+    const cJSON *ct = cJSON_GetObjectItemCaseSensitive(map, "ControlTime");
+    if (!cJSON_IsString(ct) || !ct->valuestring || time(NULL) >= 1700000000) return;
+    int y, mo, d, h, mi, s;
+    if (sscanf(ct->valuestring, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &s) != 6
+        || y < 2023 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 60) return;
+    const char *z = ct->valuestring + 19;
+    while (*z == '.' || (*z >= '0' && *z <= '9')) z++;
+    if (*z != 'Z') return;   /* UTC only */
+    static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    long days = (y - 1970) * 365L + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400 + cum[mo - 1] + d - 1;
+    if (mo > 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) days++;
+    struct timeval tv = {.tv_sec = (time_t)(((days * 24 + h) * 60 + mi) * 60 + s), .tv_usec = 0};
+    if (settimeofday(&tv, NULL) == 0) ESP_LOGW(TAG, "Clock set from the control server (no NTP time yet)");
+}
+
 
 static bool parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"KeepAlive"))) return true;
@@ -1911,17 +1947,7 @@ static bool parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         }
 
         /* VPN IP from Addresses */
-        cJSON *addresses = cJSON_GetObjectItem(peer, "Addresses");
-        if (addresses && cJSON_GetArraySize(addresses) > 0) {
-            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-            if (addr) {
-                unsigned a, b, c, d;
-                /* Handle CIDR notation (e.g., "100.64.1.2/32") */
-                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                    update->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                }
-            }
-        }
+        update->vpn_ip = first_ipv4(cJSON_GetObjectItem(peer, "Addresses"));   /* CIDR "100.64.1.2/32" */
 
         /* DERP region — try modern HomeDERP (int) first, then legacy DERP string */
         cJSON *peer_home_derp = cJSON_GetObjectItem(peer, "HomeDERP");
@@ -2164,6 +2190,7 @@ static bool apply_peer_map(microlink_t *ml,cJSON *map) {
                                                   "this device does not verify node signatures itself");
         ml->tailnet_lock=on;
     }
+    clock_from_control(map);
     bool policy_ok=ml_policy_apply(map);
     bool peers_ok=policy_ok && parse_peers_from_map_response(ml,map);
     if (!peers_ok) {
@@ -2455,7 +2482,8 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);
     cJSON_AddStringToObject(root, "DiscoKey", key_str);
 
-    /* Stream=false for initial fetch */
+    /* Stream=false for initial fetch: its response is the complete map. */
+    ml_policy_expect_full_map();
     cJSON_AddBoolToObject(root, "Stream", false);
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");  /* Disable compression */
@@ -2866,18 +2894,11 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
         if (node) {
             /* Extract VPN IP if not already set */
             if (ml->vpn_ip == 0) {
-                cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-                if (addresses && cJSON_GetArraySize(addresses) > 0) {
-                    const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-                    if (addr) {
-                        unsigned a, b, c, d;
-                        if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                            ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                            char ip_str[16];
-                            microlink_ip_to_str(ml->vpn_ip, ip_str);
-                            ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
-                        }
-                    }
+                ml->vpn_ip = first_ipv4(cJSON_GetObjectItem(node, "Addresses"));
+                if (ml->vpn_ip) {
+                    char ip_str[16];
+                    microlink_ip_to_str(ml->vpn_ip, ip_str);
+                    ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
                 }
             }
             /* Parse self-node DERP region — try modern HomeDERP (int) first,
@@ -3018,7 +3039,9 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     /* Cached peers are not authority after a transport loss. If the initial
      * non-streaming response was empty, this stream must request a full map.
      * Otherwise OmitPeers can leave a live transport permanently suspended. */
-    cJSON_AddBoolToObject(root, "OmitPeers", ml_policy_authority_active());
+    bool omit_peers = ml_policy_authority_active();
+    cJSON_AddBoolToObject(root, "OmitPeers", omit_peers);
+    if (!omit_peers) ml_policy_expect_full_map();   /* the first stream message is complete */
 
     /* NOTE: With Version >= 68, the control plane IGNORES Endpoints and
      * Hostinfo in Stream=true MapRequests. Endpoints are sent via separate
@@ -3183,18 +3206,11 @@ static bool apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
     /* Update VPN IP if present */
     cJSON *node = cJSON_GetObjectItem(update_json, "Node");
     if (node) {
-        cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-        if (addresses && cJSON_GetArraySize(addresses) > 0) {
-            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-            if (addr) {
-                unsigned a, b, c, d;
-                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                    uint32_t new_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                    if (new_ip != ml->vpn_ip) {
-                        ml->vpn_ip = new_ip;
-                        ESP_LOGI(TAG, "VPN IP updated via long-poll");
-                    }
-                }
+        {
+            uint32_t new_ip = first_ipv4(cJSON_GetObjectItem(node, "Addresses"));
+            if (new_ip && new_ip != ml->vpn_ip) {
+                ml->vpn_ip = new_ip;
+                ESP_LOGI(TAG, "VPN IP updated via long-poll");
             }
         }
     }
@@ -3622,6 +3638,18 @@ static void note_ctrl_retry(microlink_t *ml, const char *why)
     ml->ctrl_retry_failures++;
 }
 
+/* Two failed control connections in a row on Tailscale's default server:
+ * switch between port 80 and TLS on 443. A custom login server keeps the
+ * address and scheme the user entered. */
+static void ctrl_transport_failed(microlink_t *ml)
+{
+    if (ml->ctrl_host[0] || ++ml->ctrl_transport_failures < 2) return;
+    ml->ctrl_transport_failures = 0;
+    ml->ctrl_saas_tls = !ml->ctrl_saas_tls;
+    ESP_LOGW(TAG, "Control server unreachable on port %s: trying port %s",
+             ml->ctrl_saas_tls ? "80" : "443", ml->ctrl_saas_tls ? "443 (TLS)" : "80");
+}
+
 void ml_coord_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     EventBits_t startup = xEventGroupWaitBits(ml->events,
@@ -3721,6 +3749,7 @@ void ml_coord_task(void *arg) {
             if (do_tcp_connect(ml) < 0) {
                 ESP_LOGE(TAG, "TCP connect failed, retrying...");
                     note_ctrl_retry(ml, "control-plane TCP connect failed");
+                ctrl_transport_failed(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -3735,6 +3764,7 @@ void ml_coord_task(void *arg) {
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
                     note_ctrl_retry(ml, "Noise handshake failed");
+                ctrl_transport_failed(ml);
                 ml_conn_close(ml);
                 state = COORD_RECONNECTING;
                 break;
@@ -3751,10 +3781,12 @@ void ml_coord_task(void *arg) {
             if (do_h2_preface(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "H2 preface failed");
                     note_ctrl_retry(ml, "HTTP/2 preface failed");
+                ctrl_transport_failed(ml);
                 ml_conn_close(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
+            ml->ctrl_transport_failures = 0;   /* this transport works: keep it */
             /* Registered this boot: a reconnect goes straight to the map, as
              * the reference client's map loop does. A failed map exchange
              * registers again (device deleted, key expired ...). */
@@ -4175,6 +4207,11 @@ void ml_coord_task(void *arg) {
                 ml_policy_suspend(); /* Block before backoff, not after it. */
                 uint32_t backoff_ms = 1000 << (reconnect_attempts > 4 ? 4 : reconnect_attempts);
                 if (backoff_ms > ML_CTRL_BACKOFF_MAX_MS) backoff_ms = ML_CTRL_BACKOFF_MAX_MS;
+                /* A new auth key (a restart) or a server-side change is needed:
+                 * retry every 5 minutes instead of every 30 s. */
+                if (ml->reg_state == ML_REG_STATE_NEED_NEW_KEY || ml->reg_state == ML_REG_STATE_NEED_KEY
+                    || ml->reg_state == ML_REG_STATE_REFUSED || ml->reg_state == ML_REG_STATE_KEY_EXPIRED)
+                    backoff_ms = 300000;
 
                 ESP_LOGI(TAG, "Reconnecting in %lu ms (attempt %d)",
                          (unsigned long)backoff_ms, reconnect_attempts + 1);

@@ -515,6 +515,9 @@ struct microlink_s {
     bool renewing;                  /* node key renewed after expiry: send OldNodeKey */
     uint8_t old_node_key[32];
     bool tailnet_lock;
+    bool ctrl_saas_tls;             /* Tailscale control over TLS 443 (port 80 failed) */
+    uint8_t derp_node_pick;         /* which node of the home DERP region (moves on failure) */
+    uint8_t ctrl_transport_failures;
     /* Why the last registration failed (static text), for ctrl_retry_reason. */
     const char *reg_note;
 

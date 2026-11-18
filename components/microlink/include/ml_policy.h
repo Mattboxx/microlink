@@ -31,6 +31,9 @@ void ml_policy_set_control_loss(uint8_t mode, uint32_t grace_s);
 void ml_policy_get_control_loss(uint8_t *mode, uint32_t *grace_s);
 /* Non-identifying diagnostic counts; readiness is NOT a port grant. */
 void ml_policy_get_status(ml_policy_status_t *out);
+/* The next map with a Node is the complete first map of a session (a
+ * MapRequest without OmitPeers): absent Peers/PacketFilter mean empty. */
+void ml_policy_expect_full_map(void);
 /* Age of the newest reply ADMITTED from remote ip:port (IPv4, network-order
  * bytes) on a flow this node sent, current epoch only. Evidence that the
  * service answered recently; never a grant and not per-LAN-client. */

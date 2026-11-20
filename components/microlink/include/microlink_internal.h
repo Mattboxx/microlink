@@ -655,10 +655,10 @@ struct microlink_s {
      * DERP sockets to, set by microlink_pin_wg_output_netif() in exit-node
      * mode. When an exit node is active main flips netif_default to the WG
      * tunnel; our self-origin control/DERP TCP must still egress the real
-     * uplink (else errno EHOSTUNREACH / MBEDTLS_ERR_NET_SEND_FAILED). NULL
+     * uplink (else errno EHOSTUNREACH / MBEDTLS_ERR_NET_SEND_FAILED). Zero
      * = exit-node off → netif_default is already the STA, no pin needed.
      * Mirrors tailscale Go's bindToDevice for the control + DERP dialers. */
-    void *upstream_netif;
+    uint8_t upstream_ifindex;
 
     /* Peers (owned exclusively by wg_mgr task) */
     ml_peer_t peers[ML_MAX_PEERS];
@@ -830,7 +830,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
 
 /* ml_coord.c */
 void ml_coord_task(void *arg);
-/* Pin a freshly-created BSD socket (control-plane or DERP) to ml->upstream_netif
+/* Pin a freshly-created BSD socket (control-plane or DERP) to the upstream
  * via SO_BINDTODEVICE so the ESP's own self-origin traffic always egresses the
  * physical uplink, never the exit-node WG tunnel. No-op when no upstream is
  * pinned (exit-node off). Defined in ml_coord.c, also called from ml_derp.c. */

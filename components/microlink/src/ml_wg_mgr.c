@@ -318,7 +318,9 @@ static struct udp_pcb *s_wg_output_pcb = NULL;
  * mode where netif_default is flipped to the WG netif. */
 static void pin_wg_output_cb(void *ctx)
 {
-    udp_bind_netif(s_wg_output_pcb, (const struct netif *)ctx);
+    u8_t index = (u8_t)(uintptr_t)ctx;
+    struct netif *upstream = index ? netif_get_by_index(index) : NULL;
+    if (s_wg_output_pcb && (!index || upstream)) udp_bind_netif(s_wg_output_pcb, upstream);
 }
 
 bool microlink_wg_has_peer_ip(struct netif *wg_netif, uint32_t ip_nbo)
@@ -330,12 +332,21 @@ bool microlink_wg_has_peer_ip(struct netif *wg_netif, uint32_t ip_nbo)
 
 esp_err_t microlink_pin_wg_output_netif(microlink_t *ml, struct netif *upstream)
 {
-    /* Remember the upstream (STA) netif so the coord + DERP tasks can pin
-     * their own self-origin sockets to it on (re)connect — see
-     * ml_bind_sock_to_upstream(). upstream == NULL (exit-node off) clears it. */
-    if (ml) ml->upstream_netif = (void *)upstream;
     if (!s_wg_output_pcb) return ESP_ERR_INVALID_STATE;
-    tcpip_callback_with_block(pin_wg_output_cb, (void *)upstream, 1);
+    uint8_t index = upstream ? netif_get_index(upstream) : 0;
+    if (tcpip_try_callback(pin_wg_output_cb, (void *)(uintptr_t)index) != ERR_OK)
+        return ESP_ERR_NO_MEM;
+    if (ml) __atomic_store_n(&ml->upstream_ifindex, index, __ATOMIC_RELEASE);
+    return ESP_OK;
+}
+
+esp_err_t microlink_pin_wg_output_netif_core(microlink_t *ml, struct netif *upstream)
+{
+    LWIP_ASSERT_CORE_LOCKED();
+    if (!ml || !s_wg_output_pcb) return ESP_ERR_INVALID_STATE;
+    udp_bind_netif(s_wg_output_pcb, upstream);
+    __atomic_store_n(&ml->upstream_ifindex, upstream ? netif_get_index(upstream) : 0,
+                     __ATOMIC_RELEASE);
     return ESP_OK;
 }
 

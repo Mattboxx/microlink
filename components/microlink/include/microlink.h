@@ -247,10 +247,13 @@ int64_t microlink_get_key_expiry(const microlink_t *ml);
  *
  * @param ml Handle
  * @param upstream The lwIP netif to bind to (pass NULL to clear)
- * @return ESP_OK on success
+ * @return ESP_OK when the pin request is queued
  */
 struct netif;
 esp_err_t microlink_pin_wg_output_netif(microlink_t *ml, struct netif *upstream);
+/* Apply the pin immediately in TCP/IP context (or with the core locked).
+ * The caller must keep the MicroLink instance alive for this call. */
+esp_err_t microlink_pin_wg_output_netif_core(microlink_t *ml, struct netif *upstream);
 
 /**
  * @brief Is this IPv4 address a tailnet peer programmed into the WireGuard netif?

@@ -34,6 +34,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/netif.h"
+#include "lwip/netifapi.h"
 #include "mbedtls/base64.h"
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
@@ -78,11 +79,12 @@ static void log_alloc_failure(const char *what, size_t size)
  * already). A bind error is non-fatal: it just leaves the prior routing. */
 void ml_bind_sock_to_upstream(microlink_t *ml, int fd)
 {
-    if (!ml || fd < 0 || !ml->upstream_netif) return;
-    struct netif *up = (struct netif *)ml->upstream_netif;
-    if (!netif_is_up(up) || !netif_is_link_up(up)) return;
+    if (!ml || fd < 0) return;
+    uint8_t index = __atomic_load_n(&ml->upstream_ifindex, __ATOMIC_ACQUIRE);
+    if (!index) return;
     struct ifreq ifr = {0};
-    netif_index_to_name(netif_get_index(up), ifr.ifr_name);
+    if (netifapi_netif_index_to_name(index, ifr.ifr_name) != ERR_OK) return;
+    if (__atomic_load_n(&ml->upstream_ifindex, __ATOMIC_ACQUIRE) != index) return;
     if (ml_setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) == 0) {
         ESP_LOGI(TAG, "self-origin sock %d pinned to upstream %s", fd, ifr.ifr_name);
     } else {

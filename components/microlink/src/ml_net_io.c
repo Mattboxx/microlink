@@ -19,9 +19,7 @@
 #include "lwip/netdb.h"
 #include <string.h>
 #include <errno.h>
-#if defined(TSR_PERF_PROFILE) && TSR_PERF_PROFILE
 #include "esp_timer.h"
-#endif
 
 static const char *TAG = "ml_net_io";
 
@@ -114,11 +112,26 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
 #define ML_NET_IO_DRAIN_BUDGET(fd) ML_NET_IO_DRAIN_MAX
 #endif
 
+static int direct_udp_fd(microlink_t *ml, int64_t *retry_at)
+{
+    int fd = atomic_load_explicit(&ml->disco_sock4, memory_order_acquire);
+    if (fd >= 0) return fd;
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    if (ml->zc.pcb) return -1;
+#endif
+    int64_t now = esp_timer_get_time();
+    if (now < *retry_at) return -1;
+    *retry_at = now + 5000000;
+    return ml_open_direct_udp(ml) ?
+           atomic_load_explicit(&ml->disco_sock4, memory_order_acquire) : -1;
+}
+
 void ml_net_io_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "Net I/O task started (Core %d)", xPortGetCoreID());
 
     uint8_t udp_buf[ML_MAX_PACKET_SIZE + 64];
+    int64_t direct_retry_at = esp_timer_get_time() + 5000000;
 
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
 
@@ -130,9 +143,10 @@ void ml_net_io_task(void *arg) {
         FD_ZERO(&read_fds);
 
         /* Add DISCO UDP socket */
-        if (ml->disco_sock4 >= 0) {
-            FD_SET(ml->disco_sock4, &read_fds);
-            if (ml->disco_sock4 > max_fd) max_fd = ml->disco_sock4;
+        int direct_fd = direct_udp_fd(ml, &direct_retry_at);
+        if (direct_fd >= 0) {
+            FD_SET(direct_fd, &read_fds);
+            max_fd = direct_fd;
         }
 
         /* Add STUN socket (IPv4) */
@@ -167,12 +181,12 @@ void ml_net_io_task(void *arg) {
          * drain what lwIP already queued (only CONFIG_LWIP_UDP_RECVMBOX_SIZE
          * datagrams per socket, the rest is dropped silently) instead of one
          * datagram per select(). AT (cellular) sockets keep one read. */
-        if (ml->disco_sock4 >= 0 && FD_ISSET(ml->disco_sock4, &read_fds)) {
-          int budget = ML_NET_IO_DRAIN_BUDGET(ml->disco_sock4);
+        if (direct_fd >= 0 && FD_ISSET(direct_fd, &read_fds)) {
+          int budget = ML_NET_IO_DRAIN_BUDGET(direct_fd);
           for (int drained = 0; drained < budget; drained++) {
             struct sockaddr_in src_addr;
             socklen_t addr_len = sizeof(src_addr);
-            int n = ml_recvfrom(ml->disco_sock4, udp_buf, sizeof(udp_buf), drained ? MSG_DONTWAIT : 0,
+            int n = ml_recvfrom(direct_fd, udp_buf, sizeof(udp_buf), drained ? MSG_DONTWAIT : 0,
                              (struct sockaddr *)&src_addr, &addr_len);
             if (n <= 0)
                 break;

@@ -514,6 +514,48 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     return ml;
 }
 
+/* Called before task creation and, on failure, retried by net_io alone. */
+bool ml_open_direct_udp(microlink_t *ml)
+{
+    int fd = ml_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) return false;
+    struct sockaddr_in local = {
+        .sin_family = AF_INET, .sin_port = htons(51820), .sin_addr.s_addr = INADDR_ANY,
+    };
+    if (ml_bind(fd, (struct sockaddr *)&local, sizeof local) < 0) {
+        local.sin_port = 0;
+        if (ml_bind(fd, (struct sockaddr *)&local, sizeof local) < 0) goto failed;
+    }
+    /* Preserve DSCP EF for direct datagrams and nonblocking receive. */
+    int tos = 0xB8;
+    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
+    int flags = ml_fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ml_fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) goto failed;
+    /* AT modem sockets have only the explicitly bound port. */
+#ifdef CONFIG_ML_ENABLE_CELLULAR
+    if (!ml_at_socket_is_at_fd(fd))
+#endif
+    {
+        socklen_t length = sizeof local;
+        if (getsockname(fd, (struct sockaddr *)&local, &length) != 0) goto failed;
+    }
+    uint16_t port = ntohs(local.sin_port);
+    if (!port) goto failed;
+    atomic_store_explicit(&ml->disco_local_port, port, memory_order_relaxed);
+    atomic_store_explicit(&ml->disco_sock4, fd, memory_order_release);
+    ESP_LOGI(TAG, "DISCO/magicsock UDP socket bound to port %u", (unsigned)port);
+    return true;
+
+failed:
+    ml_close_sock(fd);
+    return false;
+}
+
+void microlink_set_peer_api_port(microlink_t *ml, uint16_t port)
+{
+    if (ml) __atomic_store_n(&ml->config.peer_api_port, port, __ATOMIC_RELEASE);
+}
+
 esp_err_t microlink_start(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
     if (ml->state != ML_STATE_IDLE) {
@@ -552,38 +594,8 @@ bsd_socket_fallback:
      * This is the single socket for ALL direct UDP traffic: DISCO pings/pongs,
      * CallMeMaybe probes, and WireGuard encrypted data.
      * Matches v1 microlink_disco_init() and tailscale's pconn4. */
-    ml->disco_sock4 = ml_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ml->disco_sock4 >= 0) {
-        struct sockaddr_in bind_addr = {
-            .sin_family = AF_INET,
-            .sin_port = htons(51820),
-            .sin_addr.s_addr = INADDR_ANY,
-        };
-        if (ml_bind(ml->disco_sock4, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-            ESP_LOGW(TAG, "Failed to bind port 51820 (errno=%d), trying ephemeral", errno);
-            bind_addr.sin_port = 0;
-            ml_bind(ml->disco_sock4, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
-        }
-
-        /* Mark packets as DSCP 46 (Expedited Forwarding) → WMM AC_VO.
-         * WiFi APs with WMM use shorter contention windows for voice-priority
-         * traffic, reducing jitter on WireGuard/DISCO UDP packets. */
-        int tos = 0xB8;  /* DSCP 46 = EF, TOS byte = 46 << 2 = 184 */
-        setsockopt(ml->disco_sock4, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-
-        /* Set non-blocking for select() in net_io */
-        int flags = ml_fcntl(ml->disco_sock4, F_GETFL, 0);
-        ml_fcntl(ml->disco_sock4, F_SETFL, flags | O_NONBLOCK);
-
-        /* Record the actual bound port (getsockname not wrapped — AT sockets use stored port) */
-        struct sockaddr_in local_addr;
-        socklen_t addr_len = sizeof(local_addr);
-        getsockname(ml->disco_sock4, (struct sockaddr *)&local_addr, &addr_len);
-        ml->disco_local_port = ntohs(local_addr.sin_port);
-        ESP_LOGI(TAG, "DISCO/magicsock UDP socket bound to port %d", ml->disco_local_port);
-    } else {
-        ESP_LOGE(TAG, "Failed to create DISCO socket: errno=%d", errno);
-    }
+    if (!ml_open_direct_udp(ml))
+        ESP_LOGW(TAG, "Direct UDP unavailable at startup; retrying from network I/O");
 #ifdef CONFIG_ML_ZERO_COPY_WG
 skip_bsd_socket:
     ;

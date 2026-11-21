@@ -31,6 +31,9 @@
 #include "mbedtls/ctr_drbg.h"
 #endif
 #include "esp_heap_caps.h"
+#ifndef __cplusplus
+#include <stdatomic.h>
+#endif
 /* Forward-declare esp_tls_t so we can hold a pointer without pulling in
  * the full esp_tls.h header (esp-tls REQUIRES added in CMakeLists). */
 struct esp_tls;
@@ -637,10 +640,18 @@ struct microlink_s {
 #endif
 
     /* Sockets for net_io select() loop */
-    int disco_sock4;                    /* UDP socket for DISCO + direct WG */
+#ifdef __cplusplus
+    int disco_sock4;
+#else
+    _Atomic int disco_sock4;            /* published after bind and setup */
+#endif
     int disco_sock6;                    /* IPv6 UDP socket (-1 if unavailable) */
     int stun_sock;                      /* UDP socket for STUN */
-    uint16_t disco_local_port;          /* Bound port for disco_sock4 */
+#ifdef __cplusplus
+    uint16_t disco_local_port;
+#else
+    _Atomic uint16_t disco_local_port;  /* Bound port for disco_sock4 */
+#endif
 
     /* Coordination socket (owned exclusively by coord task) */
     int coord_sock;
@@ -813,6 +824,7 @@ struct microlink_s {
 
 /* ml_net_io.c */
 void ml_net_io_task(void *arg);
+bool ml_open_direct_udp(microlink_t *ml);
 
 /* ml_derp.c */
 void ml_derp_tx_task(void *arg);

@@ -221,6 +221,8 @@ microlink_state_t microlink_get_state(const microlink_t *ml);
  * @brief Check if connected and ready to send/receive
  */
 bool microlink_is_connected(const microlink_t *ml);
+/* Update the PeerAPI service in subsequent control-plane host information. */
+void microlink_set_peer_api_port(microlink_t *ml, uint16_t port);
 
 /**
  * @brief Get our assigned VPN IP

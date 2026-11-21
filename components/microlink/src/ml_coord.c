@@ -1562,7 +1562,8 @@ static cJSON *build_hostinfo(microlink_t *ml) {
         cJSON_AddItemToObject(hostinfo, "RoutableIPs",
                               build_routable_ips_array(ml->advertise_routes));
     }
-    if (ml->config.peer_api_port) {
+    uint16_t peer_api_port = __atomic_load_n(&ml->config.peer_api_port, __ATOMIC_ACQUIRE);
+    if (peer_api_port) {
         cJSON *services = cJSON_AddArrayToObject(hostinfo, "Services");
         cJSON *http = cJSON_CreateObject();
         cJSON *dns = cJSON_CreateObject();
@@ -1573,7 +1574,7 @@ static cJSON *build_hostinfo(microlink_t *ml) {
             return NULL;
         }
         cJSON_AddStringToObject(http, "Proto", "peerapi4");
-        cJSON_AddNumberToObject(http, "Port", ml->config.peer_api_port);
+        cJSON_AddNumberToObject(http, "Port", peer_api_port);
         cJSON_AddItemToArray(services, http);
         cJSON_AddStringToObject(dns, "Proto", "peerapi-dns-proxy");
         cJSON_AddNumberToObject(dns, "Port", 1);
@@ -4013,6 +4014,9 @@ void ml_coord_task(void *arg) {
     coord_state_t state = COORD_IDLE;
     ml_coord_cmd_t cmd;
     uint64_t last_activity_ms = ml_get_time_ms();
+    uint64_t peer_api_retry_at = 0;
+    uint16_t announced_peer_api_port = __atomic_load_n(&ml->config.peer_api_port, __ATOMIC_ACQUIRE);
+    int previous_direct_fd = atomic_load_explicit(&ml->disco_sock4, memory_order_acquire);
     int reconnect_attempts = 0;
 
     /* Noise protocol state - owned exclusively by this task */
@@ -4323,6 +4327,12 @@ void ml_coord_task(void *arg) {
         case COORD_LONG_POLL:
             {
                 uint64_t now = ml_get_time_ms();
+                uint16_t peer_port = __atomic_load_n(&ml->config.peer_api_port, __ATOMIC_ACQUIRE);
+                if (peer_port != announced_peer_api_port && now >= peer_api_retry_at) {
+                    peer_api_retry_at = now + 5000;
+                    if (do_send_endpoint_update(ml, &noise) == 0)
+                        announced_peer_api_port = peer_port;
+                }
 
                 /* Check control plane watchdog (120s) */
                 if (now - last_activity_ms > ml->t_ctrl_watchdog_ms) {
@@ -4458,7 +4468,10 @@ void ml_coord_task(void *arg) {
 
                 /* Periodic STUN re-probe (every 23s) — fresh probe sequence */
                 static uint64_t last_stun_ms = 0;
-                if (now - last_stun_ms > ml->t_stun_interval_ms) {
+                int direct_fd = atomic_load_explicit(&ml->disco_sock4, memory_order_acquire);
+                bool direct_recovered = direct_fd >= 0 && previous_direct_fd < 0;
+                previous_direct_fd = direct_fd;
+                if (direct_recovered || now - last_stun_ms > ml->t_stun_interval_ms) {
                     ml->stun_retry_count = 1;
                     ml->stun_using_fallback = false;
                     ml->stun_last_probe_ms = now;
